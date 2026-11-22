@@ -238,19 +238,22 @@ component NavStepItem inherits Rectangle {
         spacing: 12px;
         alignment: stretch;
         
-        Rectangle {
-            width: 32px;
-            height: 32px;
-            border-radius: 16px;
-            background: active ? Theme.accent : (Theme.dark ? #ffffff18 : #e2e8f0);
-            
-            Text {
-                text: root.step-num;
-                color: active ? #ffffff : Theme.muted;
-                font-size: 14px;
-                font-weight: 800;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 16px;
+                background: active ? Theme.accent : (Theme.dark ? #ffffff18 : #e2e8f0);
+
+                Text {
+                    text: root.step-num;
+                    color: active ? #ffffff : Theme.muted;
+                    font-size: 14px;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
             }
         }
         
@@ -2002,9 +2005,20 @@ export component MainWindow inherits Window {
                                 Field { text <=> root.vol-letter; placeholder: "대상 드라이브 문자 (예: E)"; width: 220px; }
                                 Btn { text: "드라이브 상태 확인"; clicked => { root.volume-check(root.vol-letter); } }
                             }
-                            Field { text <=> root.vol-phrase; placeholder: "③ 위에 표시된 확인 문구를 그대로 입력해야 실행됩니다"; }
+                            Hint { text: "③ 안전 확인: 드라이브를 고르면 아래에 입력할 확인 문구가 나타납니다. 그 문구를 그대로 입력해야 실행됩니다."; }
+                            if root.volume-text == "": Text { text: "아직 문구가 없습니다. 위 ②에서 드라이브를 먼저 고르세요."; color: Theme.muted; font-size: 12px; }
+                            if root.volume-text != "": Rectangle {
+                                background: Theme.warn.with-alpha(0.12);
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: Theme.warn;
+                                VerticalLayout {
+                                    padding: 12px;
+                                    Text { text: root.volume-text; color: Theme.warn; font-size: 13px; font-weight: 700; wrap: word-wrap; }
+                                }
+                            }
+                            Field { text <=> root.vol-phrase; placeholder: "위 상자의 확인 문구를 여기에 그대로 입력"; }
                             Btn { text: "⚠️ 드라이브 직접 복원 실행 (영구 파괴)"; kind: 2; clicked => { root.restore-volume(root.vol-img, root.vol-letter, root.vol-phrase); } }
-                            if root.volume-text != "": Text { text: root.volume-text; color: Theme.warn; font-size: 13px; wrap: word-wrap; }
                         }
                     }
 
