@@ -52,6 +52,29 @@ pub fn write(config_dir: &Path, level: &str, message: &str) {
     let _ = append_with_limits(config_dir, level, message, MAX_LOG_BYTES, MAX_BACKUPS);
 }
 
+/// 패닉이 나면 위치와 메시지를 로그 파일에 남긴다(릴리스는 `panic = "abort"` 라 이 훅이 유일한 흔적이다). 기존 훅은 그대로 이어서 부른다.
+pub fn install_panic_hook(config_dir: PathBuf, who: &'static str) {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "?".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(메시지 없음)".into());
+        write(
+            &config_dir,
+            "PANIC",
+            &format!("{who} 비정상 종료: {msg} @ {loc}"),
+        );
+        prev(info);
+    }));
+}
+
 fn rotate(path: &Path, max_backups: usize) {
     if max_backups == 0 {
         let _ = fs::remove_file(path);
@@ -94,6 +117,19 @@ pub fn collect_log_files(config_dir: &Path) -> Vec<(String, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_hook_records_location_and_message() {
+        let d = tempfile::tempdir().unwrap();
+        let old = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        install_panic_hook(d.path().to_path_buf(), "시험");
+        let _ = std::panic::catch_unwind(|| panic!("boom-xyz"));
+        let _ = std::panic::take_hook();
+        std::panic::set_hook(old);
+        let text = std::fs::read_to_string(log_path(d.path())).unwrap();
+        assert!(text.contains("PANIC") && text.contains("boom-xyz") && text.contains("applog.rs"));
+    }
 
     #[test]
     fn writes_and_rotates_logs_within_backup_limit() {

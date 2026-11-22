@@ -108,6 +108,12 @@ pub struct Settings {
     /// 정기 고아 블롭 정리(GC) 주기(일). 0이면 자동 정리 안 함.
     #[serde(default = "d_maint_days")]
     pub auto_gc_days: u32,
+    /// 복구 훈련(최근 스냅샷을 임시 폴더에 실제로 복원해 해시 확인) 자동 실행 주기(일). 0이면 자동 훈련 안 함.
+    #[serde(default = "d_maint_days")]
+    pub auto_drill_days: u32,
+    /// 이 일수 동안 백업 성공 기록이 없으면 경고 알림을 남긴다. 0이면 경고 안 함.
+    #[serde(default = "d_stale_days")]
+    pub stale_warn_days: u32,
     /// 저장소 검증 시 청크 존재 여부뿐 아니라 실제 복호화·해시 일치까지 검사(Deep Scrub).
     #[serde(default = "d_true")]
     pub verify_deep: bool,
@@ -149,6 +155,9 @@ fn d_prov() -> String {
 }
 fn d_maint_days() -> u32 {
     7
+}
+fn d_stale_days() -> u32 {
+    3
 }
 
 impl Default for Settings {

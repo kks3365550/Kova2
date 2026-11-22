@@ -326,6 +326,30 @@ impl Supervisor {
             if lock_busy_recently(&p, now_ts) {
                 continue;
             }
+            // 백업이 오래 성공하지 못하면 하루에 한 번 경고 알림을 남긴다(조용히 멈춘 백업을 놓치지 않도록)
+            if let Some(days) = kova_core::schedule::stale_days(&p, now, settings.stale_warn_days) {
+                let last_warn = p.extra.get("last_stale_alert_at").and_then(|v| v.as_f64());
+                if last_warn.is_none_or(|t| now_ts - t >= 86_400.0) {
+                    let _ = kova_core::alerts::AlertLog::new(&self.0.config_dir).push(
+                        kova_core::alerts::Alert {
+                            at: now_ts,
+                            profile_id: p.id.clone(),
+                            level: "warning".into(),
+                            message: format!(
+                                "{}: {days}일째 백업 성공 기록이 없습니다 → 조치: 홈 화면에서 지금 백업을 실행하고, 실패하면 저장소 드라이브·원본 경로를 확인하세요.",
+                                p.name
+                            ),
+                            acknowledged: false,
+                        },
+                    );
+                    if let Some(mut fresh) = self.0.store.get(&p.id) {
+                        fresh
+                            .extra
+                            .insert("last_stale_alert_at".into(), now_ts.into());
+                        let _ = self.0.store.upsert(fresh);
+                    }
+                }
+            }
             if should_run(&p, now) {
                 // 정기 회차가 오면 재시도 횟수를 0으로 되돌린다(성공 때만 되돌리면 한 번 한도를 다 쓴 뒤 다시는 재시도하지 않음)
                 if kova_core::schedule::retry_count(&p) > 0 && regular_slot_due(&p, now) {
@@ -374,6 +398,48 @@ impl Supervisor {
                         );
                         n += 1;
                     }
+                }
+                drop(q);
+                // 주기 복구 훈련: 최근 스냅샷을 임시 폴더에 실제로 복원해 보고 결과를 남긴다(실패하면 알림)
+                let last_drill = p.extra.get("last_drill_at").and_then(|v| v.as_f64());
+                let idle = !self.0.queue.lock().unwrap().is_profile_busy(&p.id);
+                if idle
+                    && should_run_maintenance(last_drill, p.last_run, settings.auto_drill_days, now)
+                {
+                    if let Some(mut fresh) = self.0.store.get(&p.id) {
+                        fresh.extra.insert("last_drill_at".into(), now_ts.into());
+                        let _ = self.0.store.upsert(fresh);
+                    }
+                    let me = self.clone();
+                    let prof = p.clone();
+                    std::thread::spawn(move || {
+                        let text = kova_core::drill::run(&prof, &std::env::temp_dir());
+                        let pass = text.contains("통과");
+                        let skipped =
+                            text.contains("건너뜁니다") || text.contains("훈련할 수 없습니다");
+                        kova_core::applog::write(
+                            &me.0.config_dir,
+                            if pass || skipped { "INFO" } else { "ERROR" },
+                            &format!("정기 복구 훈련: {text}"),
+                        );
+                        if let Some(mut fresh) = me.0.store.get(&prof.id) {
+                            fresh
+                                .extra
+                                .insert("last_drill_text".into(), text.clone().into());
+                            let _ = me.0.store.upsert(fresh);
+                        }
+                        if !pass && !skipped {
+                            let _ = kova_core::alerts::AlertLog::new(&me.0.config_dir).push(
+                                kova_core::alerts::Alert {
+                                    at: Local::now().timestamp() as f64,
+                                    profile_id: prof.id.clone(),
+                                    level: "error".into(),
+                                    message: kova_core::friendly::with_hint(&text),
+                                    acknowledged: false,
+                                },
+                            );
+                        }
+                    });
                 }
             }
         }
@@ -452,7 +518,7 @@ impl Supervisor {
                     at: Local::now().timestamp() as f64,
                     profile_id: job.profile_id.clone(),
                     level: if ok { "warning" } else { "error" }.into(),
-                    message: message.clone(),
+                    message: kova_core::friendly::with_hint(&message),
                     acknowledged: false,
                 },
             );
@@ -696,6 +762,10 @@ impl Supervisor {
                 prof.last_status = "success".into();
                 prof.last_snapshot_id = Some(s.session_id.clone());
                 prof.extra.insert("retry_count".into(), 0.into());
+                prof.extra.insert("last_success_at".into(), now.into());
+                prof.extra
+                    .entry("last_drill_at")
+                    .or_insert_with(|| now.into());
                 prof.extra
                     .entry("last_verify_at")
                     .or_insert_with(|| now.into());
@@ -1706,6 +1776,63 @@ mod tests {
         st.use_vss = false;
         store.save_settings(&st).unwrap();
         (d, Supervisor::new(cfg, 2))
+    }
+
+    #[test]
+    fn tick_warns_when_backup_is_stale_and_runs_periodic_drill() {
+        let (d, s) = setup(true);
+        assert_eq!(s.tick(Local::now()), 1);
+        wait_idle(&s);
+        let store = ConfigStore::new(d.path().join("cfg"));
+        let mut p = store.get("p1").unwrap();
+        assert!(p.extra.contains_key("last_success_at") && p.extra.contains_key("last_drill_at"));
+        p.auto_backup_enabled = false;
+        // 검증·GC 는 이 시험의 대상이 아니므로 이미 한 것으로 해 둔다(작업이 실제 시각을 기록해 가짜 미래 시각과 어긋나기 때문)
+        let later = Local::now() + chrono::Duration::days(10);
+        p.extra
+            .insert("last_verify_at".into(), (later.timestamp() as f64).into());
+        p.extra
+            .insert("last_gc_at".into(), (later.timestamp() as f64).into());
+        store.upsert(p).unwrap();
+        // 10일 뒤: 백업 성공 기록이 오래돼 경고가 남고, 주기 복구 훈련이 돈다
+        let t = Instant::now();
+        let later_ts = later.timestamp() as f64;
+        loop {
+            let p = store.get("p1").unwrap();
+            if let Some(txt) = p.extra.get("last_drill_text").and_then(|v| v.as_str()) {
+                assert!(txt.contains("통과"), "{txt}");
+                break;
+            }
+            // 같은 시점에 도래한 검증·GC 가 먼저 끝나야 훈련이 시작된다. 훈련이 시작된 뒤에는 다른 작업이 겹치지 않게 틱을 멈춘다
+            let started = p
+                .extra
+                .get("last_drill_at")
+                .and_then(|v| v.as_f64())
+                .is_some_and(|t| t >= later_ts - 1.0);
+            if !started {
+                s.tick(later);
+                wait_idle(&s);
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "drill timeout {:?} later={later_ts}",
+                p.extra
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let alerts = kova_core::alerts::AlertLog::new(&d.path().join("cfg")).list();
+        assert!(alerts
+            .iter()
+            .any(|a| a.message.contains("일째 백업 성공 기록이 없습니다")));
+        // 같은 날 다시 틱해도 경고가 중복되지 않는다
+        let n = alerts.len();
+        s.tick(later);
+        assert_eq!(
+            kova_core::alerts::AlertLog::new(&d.path().join("cfg"))
+                .list()
+                .len(),
+            n
+        );
     }
 
     #[test]

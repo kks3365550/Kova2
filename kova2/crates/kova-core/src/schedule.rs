@@ -212,6 +212,29 @@ pub fn should_run_maintenance(
     elapsed >= (interval_days as f64) * 86_400.0
 }
 
+/// 마지막으로 백업이 성공한 시각. 성공 시각을 따로 기록해 두었으면 그것을, 없으면 마지막 실행이 성공이었을 때의 그 시각을 쓴다.
+pub fn last_success_at(p: &Profile) -> Option<f64> {
+    p.extra
+        .get("last_success_at")
+        .and_then(|v| v.as_f64())
+        .or(if p.last_status == "success" {
+            p.last_run
+        } else {
+            None
+        })
+        .filter(|t| *t > 0.0)
+}
+
+/// 마지막 백업 성공 후 `warn_days` 일 넘게 지났으면 지난 일수를 돌려준다(성공 기록이 아직 없거나 `warn_days == 0` 이면 None).
+pub fn stale_days(p: &Profile, now: DateTime<Local>, warn_days: u32) -> Option<u64> {
+    if warn_days == 0 {
+        return None;
+    }
+    let t = last_success_at(p)?;
+    let days = ((now.timestamp() as f64 - t) / 86_400.0).floor();
+    (days >= warn_days as f64).then_some(days as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +412,27 @@ mod tests {
         assert!(should_run(&m, at(2026, 11, 18, 9, 0)));
         let m_done = prof("monthly", "15@02:30", Some(at(2026, 11, 15, 2, 35)));
         assert!(!should_run(&m_done, at(2026, 11, 18, 9, 0)));
+    }
+
+    #[test]
+    fn stale_days_uses_last_success_and_respects_threshold() {
+        let now = Local.with_ymd_and_hms(2026, 11, 22, 12, 0, 0).unwrap();
+        let day = 86_400.0;
+        let mut p = Profile::new("p", "P");
+        assert_eq!(stale_days(&p, now, 3), None);
+        p.last_status = "success".into();
+        p.last_run = Some(now.timestamp() as f64 - 2.0 * day);
+        assert_eq!(stale_days(&p, now, 3), None);
+        p.last_run = Some(now.timestamp() as f64 - 5.0 * day);
+        assert_eq!(stale_days(&p, now, 3), Some(5));
+        assert_eq!(stale_days(&p, now, 0), None);
+        // 최근 시도가 실패여도 마지막 성공 시각 기준으로 센다
+        p.last_status = "failed".into();
+        p.last_run = Some(now.timestamp() as f64 - 0.1 * day);
+        p.extra.insert(
+            "last_success_at".into(),
+            (now.timestamp() as f64 - 4.0 * day).into(),
+        );
+        assert_eq!(stale_days(&p, now, 3), Some(4));
     }
 }

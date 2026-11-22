@@ -11,6 +11,7 @@ pub mod drill;
 pub mod estimate;
 pub mod fetch;
 pub mod filter;
+pub mod friendly;
 pub mod gc;
 pub mod gdrive;
 pub mod health;

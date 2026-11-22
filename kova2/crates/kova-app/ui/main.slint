@@ -500,6 +500,9 @@ export component MainWindow inherits Window {
     in-out property <string> form-bw-limit: "0";
     in-out property <bool> form-pause-battery: false;
     callback save-ops-settings(string, string, string, bool);
+    in-out property <string> form-drill-days: "7";
+    in-out property <string> form-stale-days: "3";
+    callback save-watch-settings(string, string);
     callback test-webhook(string);
     in-out property <string> pe-iso-out: "";
     in-out property <string> pe-drivers-dir: "";
@@ -2181,6 +2184,29 @@ export component MainWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                                 Hint { text: "0은 자동/무제한. CPU 스레드(1~64)와 오프사이트 전송 속도(MB/s)를 제한해 작업 중 PC 부하를 줄입니다."; }
+                            }
+                        }
+
+                        if root.settings-tab == 0: Card {
+                            VerticalLayout {
+                                padding: 18px;
+                                spacing: 12px;
+                                Heading { text: "백업 안전 점검"; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Text { text: "복구 훈련 주기(일)"; color: Theme.text; font-size: 13px; width: 190px; vertical-alignment: center; }
+                                    Field { text <=> root.form-drill-days; width: 80px; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                Hint { text: "정해진 날마다 최근 백업을 임시 폴더에 실제로 복원해 보고, 실패하면 알립니다. 0이면 자동 훈련을 하지 않습니다."; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Text { text: "백업 중단 경고(일)"; color: Theme.text; font-size: 13px; width: 190px; vertical-alignment: center; }
+                                    Field { text <=> root.form-stale-days; width: 80px; }
+                                    Btn { text: "점검 설정 저장"; kind: 1; clicked => { root.save-watch-settings(root.form-drill-days, root.form-stale-days); } }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                Hint { text: "마지막 백업 성공 후 이 일수가 지나면 하루에 한 번 경고 알림을 남깁니다. 0이면 경고하지 않습니다."; }
                             }
                         }
 

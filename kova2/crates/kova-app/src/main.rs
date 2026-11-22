@@ -806,6 +806,33 @@ fn apply_ops_settings(
     Ok("운영 설정을 저장했습니다".into())
 }
 
+/// 안전 점검 설정(복구 훈련 주기·백업 중단 경고 일수)을 검증해 저장한다. 0이면 기능을 끈다.
+fn apply_watch_settings(
+    store: &kova_core::config::ConfigStore,
+    drill_days_str: &str,
+    stale_days_str: &str,
+) -> Result<String, String> {
+    let parse = |s: &str, name: &str| -> Result<u32, String> {
+        let v: u32 = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("{name}은 0 이상의 정수로 입력하세요"))?;
+        if v > 365 {
+            return Err(format!("{name}은 0~365 범위로 입력하세요"));
+        }
+        Ok(v)
+    };
+    let drill = parse(drill_days_str, "복구 훈련 주기")?;
+    let stale = parse(stale_days_str, "백업 중단 경고 일수")?;
+    let mut s = store.settings();
+    s.auto_drill_days = drill;
+    s.stale_warn_days = stale;
+    store
+        .save_settings(&s)
+        .map_err(|e| format!("점검 설정 저장 실패: {e}"))?;
+    Ok("점검 설정을 저장했습니다".into())
+}
+
 fn find_make_pe_script() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -2762,6 +2789,7 @@ fn single_instance() -> Option<isize> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    kova_core::applog::install_panic_hook(kova_service::default_config_dir(), "Kova 앱");
     // 앱은 키를 읽지 않는다(키 폴더는 SYSTEM·관리자 전용): 암호화 저장소의 목록·찾아보기는 평문 매니페스트로,
     // 내용(블롭)이 필요한 복원·복구 훈련은 서비스에 맡긴다
     kova_core::repocrypto::install_service_only_provider();
@@ -3168,6 +3196,8 @@ fn main() -> Result<(), slint::PlatformError> {
         w.set_form_max_threads(s.max_cpu_threads.to_string().into());
         w.set_form_bw_limit(s.offsite_bw_limit_mbps.to_string().into());
         w.set_form_pause_battery(s.pause_on_battery);
+        w.set_form_drill_days(s.auto_drill_days.to_string().into());
+        w.set_form_stale_days(s.stale_warn_days.to_string().into());
         w.set_lock_text(lock_status().into());
     }
     {
@@ -3295,6 +3325,20 @@ fn main() -> Result<(), slint::PlatformError> {
                 LOCKED_MSG.to_string()
             } else {
                 match apply_ops_settings(&store, &wh, &th, &bw, bat) {
+                    Ok(m) | Err(m) => m,
+                }
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_settings_text(msg.into());
+            }
+        });
+        let weak = w.as_weak();
+        w.on_save_watch_settings(move |dd, sd| {
+            let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
+            let msg = if app_locked() {
+                LOCKED_MSG.to_string()
+            } else {
+                match apply_watch_settings(&store, &dd, &sd) {
                     Ok(m) | Err(m) => m,
                 }
             };
@@ -4129,6 +4173,19 @@ mod tests {
         assert_eq!(after.offsite_remote_path, "keep");
         assert_eq!(after.extra.get("unknown_key"), Some(&7.into()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_watch_settings_validates_and_saves() {
+        let dir = std::env::temp_dir().join(format!("kova_watch_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = kova_core::config::ConfigStore::new(&dir);
+        assert!(apply_watch_settings(&store, "x", "3").is_err());
+        assert!(apply_watch_settings(&store, "7", "400").is_err());
+        assert!(apply_watch_settings(&store, "14", "0").is_ok());
+        let s = store.settings();
+        assert_eq!((s.auto_drill_days, s.stale_warn_days), (14, 0));
     }
 
     #[test]
