@@ -269,3 +269,48 @@ Type   : NVMe
         assert_eq!(m["confirm"], "ERASE DISK 1");
     }
 }
+
+/// 진행 한 줄: "12.3% 13.2/107.5 GB 210 MB/s ETA 7m 28s". total 이 0 이면 퍼센트·ETA 없이 처리량만.
+pub fn progress_line(done: u64, total: u64, elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let rate = done as f64 / secs;
+    let mut out = String::new();
+    if total > 0 {
+        let pct = (done as f64 / total as f64 * 100.0).min(100.0);
+        out.push_str(&format!(
+            "{pct:5.1}% {:.1}/{:.1} GB",
+            done as f64 / 1e9,
+            total as f64 / 1e9
+        ));
+    } else {
+        out.push_str(&format!("{:.1} GB", done as f64 / 1e9));
+    }
+    out.push_str(&format!(" {:.0} MB/s", rate / 1e6));
+    if total > done && rate > 0.0 {
+        let eta = ((total - done) as f64 / rate) as u64;
+        out.push_str(&format!(" ETA {}m {:02}s   ", eta / 60, eta % 60));
+    } else {
+        out.push_str("            ");
+    }
+    out
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::progress_line;
+    use std::time::Duration;
+
+    #[test]
+    fn shows_percent_and_eta() {
+        let s = progress_line(50_000_000_000, 100_000_000_000, Duration::from_secs(100));
+        assert!(s.contains(" 50.0%"), "{s}");
+        assert!(s.contains("500 MB/s"), "{s}");
+        assert!(s.contains("ETA 1m 40s"), "{s}");
+    }
+
+    #[test]
+    fn unknown_total() {
+        let s = progress_line(1_000_000_000, 0, Duration::from_secs(1));
+        assert!(!s.contains('%') && !s.contains("ETA"), "{s}");
+    }
+}

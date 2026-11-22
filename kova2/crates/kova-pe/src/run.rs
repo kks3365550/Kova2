@@ -1,6 +1,7 @@
 use crate::plan::*;
 use kova_image::verify;
 use kova_image::volume_restore::{confirmation_phrase, restore_image_to_volume, volume_info};
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -159,15 +160,29 @@ pub fn main() -> i32 {
     log.say(format!("Image: {}", image.display()));
 
     // 2) 이미지 검증 (디스크를 건드리기 전)
-    log.say("Verifying the whole image...");
+    log.say("Verifying the whole image (reads every byte; large images take several minutes)...");
+    let file_len = std::fs::metadata(&image).map(|m| m.len()).unwrap_or(0);
+    let vt = std::time::Instant::now();
+    let last = Cell::new(0u64);
     let verified = File::open(&image).map_err(|e| e.to_string()).and_then(|f| {
         verify(
             BufReader::with_capacity(8 << 20, f),
             &AtomicBool::new(false),
-            &|_| {},
+            &|s| {
+                let secs = vt.elapsed().as_secs();
+                if secs == last.get() {
+                    return;
+                }
+                last.set(secs);
+                eprint!(
+                    "\r  {}",
+                    progress_line(s.compressed_bytes, file_len, vt.elapsed())
+                );
+            },
         )
         .map_err(|e| e.to_string())
     });
+    eprintln!();
     let header = match verified {
         Ok((h, s)) => {
             log.say(format!(
@@ -302,6 +317,7 @@ exit
     };
     log.say(format!("Restore started -> {os}:"));
     let t = std::time::Instant::now();
+    let last = Cell::new(0u64);
     let res = restore_image_to_volume(
         &image,
         os,
@@ -309,9 +325,15 @@ exit
         &[],
         &AtomicBool::new(false),
         &|s| {
-            if s.chunks % 200 == 0 {
-                eprint!("\rchunks {} / {:.1} GB", s.chunks, s.raw_bytes as f64 / 1e9);
+            let secs = t.elapsed().as_secs();
+            if secs == last.get() {
+                return;
             }
+            last.set(secs);
+            eprint!(
+                "\r  {}",
+                progress_line(s.compressed_bytes, file_len, t.elapsed())
+            );
         },
     );
     println!();
