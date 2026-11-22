@@ -8,7 +8,7 @@ export struct OffsiteRow { id: string, name: string, dir: string }
 export struct AlertRow { when: string, level: string, message: string, full: string, ack: bool }
 export struct BrowseRow { name: string, path: string, is-dir: bool, info: string, selected: bool }
 export struct DriveRow { name: string, pct: int, used: string, free: string, repo: bool }
-export struct ImageRow { name: string, path: string, size: string, when: string }
+export struct ImageRow { name: string, path: string, size: string, when: string, verified: bool }
 export struct RunRow { id: int, name: string, pct: int, current: string, cancellable: bool, kind: string }
 export struct GlobalFileRow { filename: string, rel-path: string, repo: string, snapshot-id: string, versions: string, info: string }
 // '찾아보기' 결과 전달: 선택 창은 별도 스레드에서 열고, 끝나면 앱이 target 이 같은 PathField 에 값을 넣는다(seq 증가로 알림).
@@ -1899,6 +1899,7 @@ export component MainWindow inherits Window {
                                     Text { text: im.name; color: Theme.text; font-size: 13px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                                     Text { text: im.size; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
                                     Text { text: im.when; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+                                    Text { text: im.verified ? "✔ 검증됨" : "미검증"; color: im.verified ? Theme.accent : Theme.muted; font-size: 12px; font-weight: im.verified ? 700 : 400; vertical-alignment: center; }
                                     if root.confirm-del != im.path: VerticalLayout { alignment: center; Btn { text: "삭제"; kind: 2; height: 26px; clicked => { root.confirm-del = im.path; root.img-path = im.path; } } }
                                     if root.confirm-del == im.path: Text { text: "되돌릴 수 없음!"; color: Theme.danger; font-size: 12px; vertical-alignment: center; font-weight: 700; }
                                     if root.confirm-del == im.path: VerticalLayout { alignment: center; Btn { text: "정말 삭제"; kind: 2; height: 26px; clicked => { root.delete-image(im.path); root.confirm-del = ""; } } }

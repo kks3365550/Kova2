@@ -1169,6 +1169,40 @@ fn chrono_fmt(ts: f64) -> String {
     }
 }
 
+/// 무결성 검사 통과 표시 파일(`<이미지>.verified`). 이미지의 크기·수정시각이 그대로일 때만 "검증됨"으로 본다.
+fn verified_marker(img: &std::path::Path) -> std::path::PathBuf {
+    let mut n = img.as_os_str().to_os_string();
+    n.push(".verified");
+    std::path::PathBuf::from(n)
+}
+
+fn image_sig(img: &std::path::Path) -> Option<String> {
+    let md = std::fs::metadata(img).ok()?;
+    let secs = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(format!("{} {}", md.len(), secs))
+}
+
+fn mark_verified(img: &std::path::Path) {
+    if let Some(sig) = image_sig(img) {
+        let _ = std::fs::write(verified_marker(img), sig);
+    }
+}
+
+fn is_verified(img: &std::path::Path) -> bool {
+    match (
+        image_sig(img),
+        std::fs::read_to_string(verified_marker(img)),
+    ) {
+        (Some(a), Ok(b)) => a == b.trim(),
+        _ => false,
+    }
+}
+
 /// 백업 보관함의 images 폴더에서 저장된 디스크 이미지(.qblk)를 최신순으로 찾는다.
 fn image_rows() -> Vec<ImageRow> {
     let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
@@ -1199,6 +1233,7 @@ fn image_rows() -> Vec<ImageRow> {
                     path: path.to_string_lossy().to_string().into(),
                     size: format!("{:.1} GB", md.len() as f64 / 1_073_741_824.0).into(),
                     when: chrono_fmt(ts).into(),
+                    verified: is_verified(&path),
                 },
             ));
         }
@@ -1281,6 +1316,7 @@ fn convert_candidates() -> Vec<ImageRow> {
                     path: path.to_string_lossy().to_string().into(),
                     size: format!("{:.1} GB", md.len() as f64 / 1_073_741_824.0).into(),
                     when: "".into(),
+                    verified: false,
                 },
             ));
         }
@@ -1330,6 +1366,7 @@ fn delete_image_file(path: &str) -> Result<(), String> {
         }
         std::fs::remove_file(&canon).map_err(|e2| format!("지우지 못했습니다: {e2} ({e})"))?;
     }
+    let _ = std::fs::remove_file(verified_marker(&canon));
     Ok(())
 }
 
@@ -2230,6 +2267,7 @@ fn image_job(weak: slint::Weak<MainWindow>, image: String, target: Option<String
                         &progress,
                     )
                     .map_err(|e| e.to_string())?;
+                    mark_verified(img);
                     Ok(format!(
                         "검증 통과: 청크 {}개, 원본 {:.2}GB, 클러스터 {}/{}{}",
                         s.chunks,
@@ -2314,10 +2352,35 @@ fn capture_job(weak: slint::Weak<MainWindow>, source: String, out: String) {
             &cancel,
             &progress,
         ) {
-            Ok((h, s)) => format!(
-                "만들기 완료: {out} (전체 {}클러스터 중 사용 {}, 청크 {}개)",
-                h.total_clusters, h.used_clusters, s.chunks
-            ),
+            Ok((h, s)) => {
+                // 만든 직후 바로 한 번 읽어 검증하고, 통과하면 목록에 "검증됨"으로 표시한다
+                show(&weak, "만들기 완료, 무결성 검사 중…".into());
+                let ok = std::fs::File::open(&out)
+                    .ok()
+                    .and_then(|f| {
+                        kova_image::verify(
+                            std::io::BufReader::with_capacity(8 << 20, f),
+                            &cancel,
+                            &progress,
+                        )
+                        .ok()
+                    })
+                    .is_some();
+                if ok {
+                    mark_verified(std::path::Path::new(&out));
+                }
+                format!(
+                    "만들기 완료: {out} (전체 {}클러스터 중 사용 {}, 청크 {}개, 무결성 {})",
+                    h.total_clusters,
+                    h.used_clusters,
+                    s.chunks,
+                    if ok {
+                        "검증 통과"
+                    } else {
+                        "검증 실패 - 이미지를 다시 확인하세요"
+                    }
+                )
+            }
             Err(e) => format!("만들지 않음: {e}"),
         };
         show(&weak, text);
@@ -3930,6 +3993,19 @@ fn main() -> Result<(), slint::PlatformError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verified_marker_follows_image_changes() {
+        let img = std::env::temp_dir().join(format!("kova_vm_{}.qblk", std::process::id()));
+        std::fs::write(&img, b"abc").unwrap();
+        assert!(!is_verified(&img));
+        mark_verified(&img);
+        assert!(is_verified(&img));
+        std::fs::write(&img, b"abcd").unwrap();
+        assert!(!is_verified(&img));
+        let _ = std::fs::remove_file(&img);
+        let _ = std::fs::remove_file(verified_marker(&img));
+    }
+
     #[test]
     fn pick_plan_routes_result_to_target_and_keeps_on_cancel() {
         use super::{pick_plan, PickPlan};
