@@ -409,42 +409,49 @@ impl CasStorage {
     /// Loads all existing blob hashes into an in-memory HashSet using parallel directory scan.
     /// This eliminates hundreds of thousands of GetFileAttributesW disk syscalls during incremental checks.
     pub fn get_all_blob_hashes(&self) -> std::collections::HashSet<String> {
+        self.try_get_all_blob_hashes().unwrap_or_default()
+    }
+
+    /// 위와 같지만 폴더를 읽다 오류가 나면 불완전한 목록을 돌려주지 않고 오류로 알린다.
+    /// 목록이 불완전하면 증분 백업이 멀쩡한 파일을 "변경됨"으로 오판해 이상 징후 경고가 거짓으로 뜬다.
+    pub fn try_get_all_blob_hashes(&self) -> io::Result<std::collections::HashSet<String>> {
         use rayon::prelude::*;
 
         let blobs_dir = self.repo_root.join("blobs");
         let packed: Vec<String> = self.pack_index().keys().cloned().collect();
         if !blobs_dir.is_dir() {
-            return packed.into_iter().collect();
+            return Ok(packed.into_iter().collect());
         }
 
-        let prefix_dirs: Vec<PathBuf> = match fs::read_dir(&blobs_dir) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let mut prefix_dirs: Vec<PathBuf> = Vec::new();
+        for e in fs::read_dir(&blobs_dir)? {
+            let p = e?.path();
+            if p.is_dir() {
+                prefix_dirs.push(p);
+            }
+        }
 
-        let hashes: Vec<String> = prefix_dirs
+        let per_dir: Vec<io::Result<Vec<String>>> = prefix_dirs
             .par_iter()
-            .flat_map(|dir| {
+            .map(|dir| {
                 let mut dir_hashes = Vec::new();
-                if let Ok(rd) = fs::read_dir(dir) {
-                    for entry in rd.flatten() {
-                        let p = entry.path();
-                        if p.extension().is_some_and(|ext| ext == "blob") {
-                            if let Some(stem) = p.file_stem() {
-                                dir_hashes.push(stem.to_string_lossy().to_string());
-                            }
+                for entry in fs::read_dir(dir)? {
+                    let p = entry?.path();
+                    if p.extension().is_some_and(|ext| ext == "blob") {
+                        if let Some(stem) = p.file_stem() {
+                            dir_hashes.push(stem.to_string_lossy().to_string());
                         }
                     }
                 }
-                dir_hashes
+                Ok(dir_hashes)
             })
             .collect();
 
-        hashes.into_iter().chain(packed).collect()
+        let mut out: std::collections::HashSet<String> = packed.into_iter().collect();
+        for r in per_dir {
+            out.extend(r?);
+        }
+        Ok(out)
     }
 
     /// Stores compressed blob data atomically. Returns true if newly written, false if deduplicated.

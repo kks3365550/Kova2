@@ -289,7 +289,9 @@ fn run_backup_inner(
     let skipped: Mutex<Vec<String>> = Mutex::new(scan_errors);
 
     let blob_start = Instant::now();
-    let existing_blobs = cas.get_all_blob_hashes();
+    let existing_blobs = cas.try_get_all_blob_hashes().map_err(|e| {
+        EngineError::Msg(format!("저장소 블록 목록을 읽지 못해 백업을 중단합니다(불완전한 목록으로 변경 파일을 오판하지 않기 위함): {e}"))
+    })?;
     on_event(Event::Phase {
         phase: "indexing",
         message: format!(
