@@ -2101,7 +2101,12 @@ mod tests {
         // 화면이 읽는 스냅샷 기록에도 검증 결과가 남아야 한다
         let h = History::open(&d.path().join("repo")).unwrap();
         let recs = h.list_snapshots().unwrap();
-        assert!(!recs.is_empty() && recs.iter().all(|r| r.is_verified && r.verify_error_count == 0));
+        assert!(
+            !recs.is_empty()
+                && recs
+                    .iter()
+                    .all(|r| r.is_verified && r.verify_error_count == 0)
+        );
     }
 
     #[test]
