@@ -340,7 +340,36 @@ pub fn export_recovery_code(repo: &Path) -> Result<String, String> {
 /// `entries`: `(프로파일 이름, 저장소 경로, 복구 코드)`
 pub fn format_recovery_kit(entries: &[(String, String, String)]) -> String {
     let bitlocker_key = crate::health::bitlocker_recovery_key_c().ok();
-    format_recovery_kit_with_bitlocker(entries, bitlocker_key.as_deref())
+    let mut out = format_recovery_kit_with_bitlocker(entries, bitlocker_key.as_deref());
+    out.push_str(&format_license_memo(&crate::health::license_summary()));
+    out
+}
+
+/// Windows·Office 라이선스 메모(끝 5자리·상태, 하드웨어가 바뀌면 재인증이 필요하다는 안내, 직접 적는 칸).
+pub fn format_license_memo(items: &[crate::health::LicenseInfo]) -> String {
+    let mut out = String::new();
+    out.push_str("------------------------------------------------------------\r\n");
+    out.push_str("  [Windows·Office 라이선스 메모]\r\n");
+    out.push_str("------------------------------------------------------------\r\n");
+    out.push_str("- 백업 이미지를 다른 하드웨어(메인보드·PC 교체, 가상머신)에 복원하면 Windows·Office 인증이 풀려\r\n");
+    out.push_str(
+        "  재인증이 필요할 수 있습니다. 같은 PC에 복원한 경우는 아직 시험하지 않았습니다.\r\n",
+    );
+    out.push_str("- 이 문서에는 전체 제품 키를 적지 않습니다(끝 5자리만). 전체 키는 아래 칸에 직접 적어 보관하세요.\r\n");
+    if items.is_empty() {
+        out.push_str("조회된 인증 정보: 없음(조회 실패 또는 권한 부족)\r\n");
+    } else {
+        for it in items {
+            out.push_str(&format!(
+                "  * {} | 키 끝 5자리: {} | 상태: {}\r\n",
+                it.name, it.last5, it.status
+            ));
+        }
+    }
+    out.push_str("구매처·계정 : ______________________________\r\n");
+    out.push_str("정품 키 보관 위치 : ______________________________\r\n");
+    out.push_str("\r\n");
+    out
 }
 
 /// BitLocker 복구 키를 명시적으로 주입받아 복구 키트 문서를 생성한다.
@@ -736,6 +765,17 @@ mod tests {
         assert!(body.contains("BitLocker"));
     }
 
+    #[test]
+    fn license_memo_lists_last5_and_hardware_warning() {
+        let items = vec![crate::health::LicenseInfo {
+            name: "Windows(R), Professional edition".into(),
+            last5: "3V66T".into(),
+            status: "인증됨".into(),
+        }];
+        let m = format_license_memo(&items);
+        assert!(m.contains("3V66T") && m.contains("재인증"));
+        assert!(format_license_memo(&[]).contains("조회된 인증 정보: 없음"));
+    }
     #[test]
     fn recovery_kit_includes_bitlocker_key_when_provided() {
         let entries = vec![(

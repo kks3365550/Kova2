@@ -164,9 +164,77 @@ pub fn bitlocker_recovery_key_c() -> Result<String, String> {
     }
 }
 
+/// 정품 인증 정보 한 건(제품 이름, 키 끝 5자리, 인증 상태). 전체 제품 키는 다루지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LicenseInfo {
+    pub name: String,
+    pub last5: String,
+    pub status: String,
+}
+
+/// `이름|끝5자리|상태코드` 줄들을 읽는다. 형식이 맞지 않는 줄은 버린다.
+pub fn parse_license_lines(text: &str) -> Vec<LicenseInfo> {
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.trim().splitn(3, '|');
+            let name = it.next()?.trim();
+            let last5 = it.next()?.trim();
+            let code = it.next()?.trim();
+            if name.is_empty() || last5.chars().count() != 5 {
+                return None;
+            }
+            let status = match code {
+                "1" => "인증됨",
+                "0" => "인증 안 됨",
+                "5" => "알림 모드(재인증 필요)",
+                _ => "확인 필요",
+            };
+            Some(LicenseInfo {
+                name: name.to_string(),
+                last5: last5.to_string(),
+                status: status.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// 이 PC의 Windows·Office 정품 인증 정보(끝 5자리·상태)를 조회한다. 실패하면 빈 목록.
+pub fn license_summary() -> Vec<LicenseInfo> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;\
+            foreach($c in 'SoftwareLicensingProduct','OfficeSoftwareProtectionProduct'){\
+            Get-CimInstance $c -ErrorAction SilentlyContinue | Where-Object { $_.PartialProductKey } | \
+            ForEach-Object { '{0}|{1}|{2}' -f $_.Name,$_.PartialProductKey,$_.LicenseStatus }}";
+        match std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+        {
+            Ok(o) => parse_license_lines(&String::from_utf8_lossy(&o.stdout)),
+            Err(_) => Vec::new(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_license_lines_keeps_only_wellformed_rows() {
+        let v = parse_license_lines(
+            "Windows(R), Professional edition|3V66T|1\nOffice 21|GRBFX|5\n깨진 줄\n|ABCDE|1\nx|123|1\n",
+        );
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].last5, "3V66T");
+        assert_eq!(v[0].status, "인증됨");
+        assert_eq!(v[1].status, "알림 모드(재인증 필요)");
+    }
 
     #[test]
     fn report_has_both_sections_and_never_panics() {
