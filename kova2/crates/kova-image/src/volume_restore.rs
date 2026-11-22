@@ -127,11 +127,24 @@ pub fn restore_verified<W: Write + Seek, F: FnOnce(&Header) -> Result<W, VolumeE
     // 검증·복원에 같은 핸들을 쓴다: 검증 뒤 파일이 바뀌는 틈을 없애고, 이미지가 대상 볼륨에 있으면
     // 열린 핸들 때문에 잠금이 실패해(마운트 해제 전에) 중단된다.
     let mut f = File::open(image)?;
-    let (header, _) = verify(BufReader::with_capacity(8 << 20, &f), cancel, &|_| {})?;
+    // 진행 표시: 검증 단계는 total_raw_bytes 를 0 으로, 쓰기 단계는 예상 전체 바이트를 채워 보내 화면이 두 단계를 구분하게 한다
+    let (header, _) = verify(BufReader::with_capacity(8 << 20, &f), cancel, &|s| {
+        let mut t = s.clone();
+        t.total_raw_bytes = 0;
+        progress(&t)
+    })?;
     f.rewind()?;
     let mut dev = open(&header)?;
+    let expected = header
+        .used_clusters
+        .saturating_mul(header.cluster_size as u64)
+        .max(1);
     let src = BufReader::with_capacity(8 << 20, &f);
-    Ok(restore_to(src, &mut dev, cancel, progress)?)
+    Ok(restore_to(src, &mut dev, cancel, &|s| {
+        let mut t = s.clone();
+        t.total_raw_bytes = expected;
+        progress(&t)
+    })?)
 }
 
 /// `\\?\E:\x` → `E:\x`, `\\?\UNC\srv\s` → `\\srv\s` (canonicalize 결과를 드라이브 문자로 비교할 수 있게).
@@ -540,6 +553,42 @@ mod tests {
             }
         }
         assert!(written > 0);
+    }
+
+    #[test]
+    fn progress_tells_verify_phase_from_write_phase() {
+        use std::sync::Mutex;
+        let d = tempfile::tempdir().unwrap();
+        let img = d.path().join("p.qblk");
+        fs::write(&img, PY).unwrap();
+        let (h, _) = restore_image_to_file(
+            &img,
+            &d.path().join("w.img"),
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
+        let dev_path = d.path().join("dev.img");
+        fs::write(
+            &dev_path,
+            vec![0u8; (h.total_clusters * h.cluster_size as u64) as usize],
+        )
+        .unwrap();
+        let dev = fs::OpenOptions::new().write(true).open(&dev_path).unwrap();
+        let seen = Mutex::new(Vec::<u64>::new());
+        restore_verified(&img, |_| Ok(dev), &AtomicBool::new(false), &|s| {
+            seen.lock().unwrap().push(s.total_raw_bytes)
+        })
+        .unwrap();
+        let seen = seen.into_inner().unwrap();
+        // 검증 단계(0)가 먼저, 그다음 쓰기 단계(0 이 아닌 예상 전체 바이트)
+        assert_eq!(seen.first(), Some(&0));
+        let first_write = seen
+            .iter()
+            .position(|&t| t > 0)
+            .expect("쓰기 단계 진행 없음");
+        assert!(seen[..first_write].iter().all(|&t| t == 0));
+        assert!(seen[first_write..].iter().all(|&t| t > 0));
     }
 
     #[test]

@@ -2753,10 +2753,17 @@ fn restore_volume_job(weak: slint::Weak<MainWindow>, image: String, letter: Stri
             let mut l = last.lock().unwrap();
             if l.elapsed() >= std::time::Duration::from_secs(1) {
                 *l = std::time::Instant::now();
-                show_volume(
-                    &w2,
-                    format!("복원 중… {:.1}GB 기록", s.raw_bytes as f64 / 1e9),
-                );
+                let gb = s.raw_bytes as f64 / 1e9;
+                let text = if s.total_raw_bytes == 0 {
+                    format!("이미지 검증 중… {gb:.1}GB 확인 (이 단계는 볼륨에 쓰지 않습니다. 끝나면 복원이 시작됩니다)")
+                } else {
+                    let pct = (s.raw_bytes as f64 / s.total_raw_bytes as f64 * 100.0).min(100.0);
+                    format!(
+                        "복원 중… {gb:.1} / {:.1}GB 기록 ({pct:.0}%)",
+                        s.total_raw_bytes as f64 / 1e9
+                    )
+                };
+                show_volume(&w2, text);
             }
         };
         let r = kova_image::volume_restore::restore_image_to_volume(
