@@ -1855,12 +1855,14 @@ export component MainWindow inherits Window {
                             Heading { text: "1. 드라이브 전체 백업 생성"; }
                             Hint { text: "백업할 드라이브를 선택하세요. VSS 스냅샷으로 실행 중인 시스템도 안전하게 복제됩니다."; }
                             
+                            // 창 너비·드라이브 개수에 맞춰 카드가 같은 비율로 늘고 줄어든다(고정 너비면 드라이브가 많을 때 잘림)
                             HorizontalLayout {
                                 spacing: 10px;
-                                alignment: start;
                                 for d in root.drives: Rectangle {
                                     height: 56px;
-                                    width: 160px;
+                                    min-width: 96px;
+                                    max-width: 200px;
+                                    horizontal-stretch: 1;
                                     border-radius: 8px;
                                     border-width: 2px;
                                     border-color: root.eff-drive == d.name ? Theme.accent : Theme.line;
@@ -1868,8 +1870,8 @@ export component MainWindow inherits Window {
                                     VerticalLayout {
                                         alignment: center;
                                         spacing: 2px;
-                                        Text { text: d.name + (d.repo ? " [보관소]" : ""); color: Theme.text; font-size: 13px; font-weight: 700; horizontal-alignment: center; }
-                                        Text { text: "사용 " + d.used; color: Theme.muted; font-size: 11px; horizontal-alignment: center; }
+                                        Text { text: d.name + (d.repo ? " [보관소]" : ""); color: Theme.text; font-size: 13px; font-weight: 700; horizontal-alignment: center; overflow: elide; }
+                                        Text { text: "사용 " + d.used; color: Theme.muted; font-size: 11px; horizontal-alignment: center; overflow: elide; }
                                     }
                                     TouchArea { clicked => { root.sel-drive = d.name; } }
                                 }
@@ -1988,11 +1990,12 @@ export component MainWindow inherits Window {
                             Hint { text: "② 덮어쓸 드라이브를 고르세요. 선택하면 바로 상태를 확인하고, 아래에 입력할 확인 문구를 보여 줍니다. (백업 보관소 드라이브는 목록에서 제외)"; }
                             HorizontalLayout {
                                 spacing: 10px;
-                                alignment: start;
                                 for d in root.drives: Rectangle {
                                     visible: !d.repo;
                                     height: d.repo ? 0px : 44px;
-                                    width: d.repo ? 0px : 120px;
+                                    min-width: d.repo ? 0px : 70px;
+                                    max-width: d.repo ? 0px : 160px;
+                                    horizontal-stretch: d.repo ? 0 : 1;
                                     border-radius: 8px;
                                     border-width: 2px;
                                     border-color: root.vol-letter == d.name ? Theme.danger : Theme.line;
