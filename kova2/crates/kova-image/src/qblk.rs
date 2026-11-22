@@ -383,6 +383,35 @@ pub fn restore_to<R: Read, W: Write + Seek>(
     Ok((rd.header, st))
 }
 
+/// 압축·CRC 까지 끝낸 청크 하나(쓰기만 남은 상태)
+pub struct EncodedChunk {
+    pub lcn: u64,
+    pub count: u32,
+    pub raw_len: u32,
+    pub comp: Vec<u8>,
+    pub crc: u32,
+}
+
+/// 원본 구간을 검사하고 zstd 로 압축한다. 상태가 없어 여러 스레드에서 동시에 호출해도 된다.
+pub fn encode_chunk(
+    cluster_size: u32,
+    level: i32,
+    lcn: u64,
+    raw: &[u8],
+) -> Result<EncodedChunk, QblkError> {
+    let cs = cluster_size as usize;
+    if raw.is_empty() || !raw.len().is_multiple_of(cs) || raw.len() as u64 > MAX_CHUNK_BYTES {
+        return Err(QblkError::BadHeaderField("chunk length"));
+    }
+    Ok(EncodedChunk {
+        lcn,
+        count: (raw.len() / cs) as u32,
+        raw_len: raw.len() as u32,
+        comp: zstd::bulk::compress(raw, level)?,
+        crc: crc32fast::hash(raw),
+    })
+}
+
 pub struct Writer<W: Write> {
     w: W,
     cluster_size: u32,
@@ -401,19 +430,18 @@ impl<W: Write> Writer<W> {
         })
     }
     pub fn write_chunk(&mut self, lcn: u64, raw: &[u8]) -> Result<(), QblkError> {
-        let cs = self.cluster_size as usize;
-        if raw.is_empty() || !raw.len().is_multiple_of(cs) || raw.len() as u64 > MAX_CHUNK_BYTES {
-            return Err(QblkError::BadHeaderField("chunk length"));
-        }
-        let comp = zstd::bulk::compress(raw, self.level)?;
-        let count = (raw.len() / cs) as u32;
-        self.w.write_all(&lcn.to_le_bytes())?;
-        self.w.write_all(&count.to_le_bytes())?;
-        self.w.write_all(&(raw.len() as u32).to_le_bytes())?;
-        self.w.write_all(&(comp.len() as u32).to_le_bytes())?;
-        self.w.write_all(&crc32fast::hash(raw).to_le_bytes())?;
-        self.w.write_all(&comp)?;
-        self.clusters += count as u64;
+        let e = encode_chunk(self.cluster_size, self.level, lcn, raw)?;
+        self.write_encoded(&e)
+    }
+    /// 이미 압축·CRC 를 마친 청크를 쓴다(여러 스레드가 미리 압축해 둔 것을 순서대로 쓸 때).
+    pub fn write_encoded(&mut self, e: &EncodedChunk) -> Result<(), QblkError> {
+        self.w.write_all(&e.lcn.to_le_bytes())?;
+        self.w.write_all(&e.count.to_le_bytes())?;
+        self.w.write_all(&e.raw_len.to_le_bytes())?;
+        self.w.write_all(&(e.comp.len() as u32).to_le_bytes())?;
+        self.w.write_all(&e.crc.to_le_bytes())?;
+        self.w.write_all(&e.comp)?;
+        self.clusters += e.count as u64;
         Ok(())
     }
     /// 지금까지 쓴 클러스터 수(헤더의 used_clusters 와 같아야 한다)

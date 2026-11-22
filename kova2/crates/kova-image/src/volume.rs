@@ -3,18 +3,23 @@
 //! 끝나면 바로 삭제한다. 출력은 새 .qblk 파일 하나뿐이며 실패·취소 시 지운다.
 use crate::bitmap::{allocated_runs, RunParams};
 use crate::capture::check_output;
-use crate::qblk::{Header, QblkError, Stats, Writer};
+use crate::qblk::{encode_chunk, EncodedChunk, Header, QblkError, Stats, Writer};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, sync_channel};
+use std::sync::Mutex;
 
 fn io_err(m: impl Into<String>) -> QblkError {
     QblkError::Io(std::io::Error::other(m.into()))
 }
 
 /// 비트맵(할당 클러스터)과 읽기 소스로 이미지를 쓴다. 장치 접근과 분리해 메모리 소스로 시험할 수 있게 한 핵심 루프.
+/// 읽기(이 스레드) → 압축·CRC(여러 워커) → 순서대로 쓰기(전용 스레드)로 나눠 디스크와 CPU 가 동시에 일한다.
+/// 출력 파일 형식은 한 스레드로 쓸 때와 바이트까지 같다(청크는 항상 LCN 순서대로 기록).
 #[allow(clippy::too_many_arguments)]
-pub fn write_image<R: Read + Seek, W: Write + Seek>(
+pub fn write_image<R: Read + Seek, W: Write + Seek + Send>(
     src: &mut R,
     out: W,
     header: &mut Header,
@@ -32,7 +37,11 @@ pub fn write_image<R: Read + Seek, W: Write + Seek>(
             ..RunParams::default()
         },
     );
-    let mut w = Writer::new(std::io::BufWriter::new(out), header, level)?;
+    let writer = Writer::new(
+        std::io::BufWriter::with_capacity(8 << 20, out),
+        header,
+        level,
+    )?;
     let mut st = Stats {
         total_raw_bytes: runs
             .iter()
@@ -41,26 +50,122 @@ pub fn write_image<R: Read + Seek, W: Write + Seek>(
             .sum(),
         ..Stats::default()
     };
-    let mut buf: Vec<u8> = Vec::new();
-    for (lcn, count) in runs {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(QblkError::Cancelled);
+
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .clamp(2, 8);
+    // 읽기가 쓰기보다 이만큼(청크 수) 이상 앞서가지 않게 해 메모리를 묶는다
+    let window = (workers * 3) as u64;
+    let failed = AtomicBool::new(false);
+    let first_err: Mutex<Option<QblkError>> = Mutex::new(None);
+    let written = AtomicU64::new(0);
+    let fail = |e: QblkError| {
+        let mut g = first_err.lock().unwrap();
+        if g.is_none() {
+            *g = Some(e);
         }
-        if lcn >= total {
-            continue;
+        failed.store(true, Ordering::Relaxed);
+    };
+    let (fail, failed, written) = (&fail, &failed, &written);
+    let (job_tx, job_rx) = sync_channel::<(u64, u64, Vec<u8>)>(workers * 2);
+    let job_rx = Mutex::new(job_rx);
+    let job_rx = &job_rx;
+    let (res_tx, res_rx) = channel::<(u64, EncodedChunk)>();
+    let mut read_err: Option<QblkError> = None;
+
+    let writer = std::thread::scope(|sc| {
+        let wh = sc.spawn(move || {
+            let mut w = writer;
+            let mut next = 0u64;
+            let mut pending: BTreeMap<u64, EncodedChunk> = BTreeMap::new();
+            let mut ok = true;
+            for (seq, c) in res_rx {
+                if !ok {
+                    continue; // 실패 뒤에는 남은 결과를 버리며 비운다
+                }
+                pending.insert(seq, c);
+                while let Some(c) = pending.remove(&next) {
+                    if let Err(e) = w.write_encoded(&c) {
+                        fail(e);
+                        ok = false;
+                        break;
+                    }
+                    next += 1;
+                    written.store(next, Ordering::Relaxed);
+                }
+            }
+            w
+        });
+        for _ in 0..workers {
+            let tx = res_tx.clone();
+            sc.spawn(move || loop {
+                let job = job_rx.lock().unwrap().recv();
+                let Ok((seq, lcn, buf)) = job else { break };
+                if failed.load(Ordering::Relaxed) {
+                    continue; // 이미 실패했으면 받아서 버린다(읽기 쪽이 막히지 않게)
+                }
+                match encode_chunk(cs as u32, level, lcn, &buf) {
+                    Ok(c) => {
+                        let _ = tx.send((seq, c));
+                    }
+                    Err(e) => fail(e),
+                }
+            });
         }
-        let count = count.min(total - lcn);
-        buf.resize((count * cs) as usize, 0);
-        src.seek(SeekFrom::Start(lcn * cs))?;
-        src.read_exact(&mut buf)?;
-        w.write_chunk(lcn, &buf)?;
-        st.chunks += 1;
-        st.clusters += count;
-        st.raw_bytes += count * cs;
-        progress(&st);
+        drop(res_tx);
+
+        let mut seq = 0u64;
+        'runs: for (lcn, count) in runs {
+            if cancel.load(Ordering::Relaxed) {
+                read_err = Some(QblkError::Cancelled);
+                break;
+            }
+            if failed.load(Ordering::Relaxed) {
+                break;
+            }
+            if lcn >= total {
+                continue;
+            }
+            let count = count.min(total - lcn);
+            while seq - written.load(Ordering::Relaxed) >= window {
+                if failed.load(Ordering::Relaxed) {
+                    break 'runs;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    read_err = Some(QblkError::Cancelled);
+                    break 'runs;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut buf = vec![0u8; (count * cs) as usize];
+            let r = src
+                .seek(SeekFrom::Start(lcn * cs))
+                .and_then(|_| src.read_exact(&mut buf));
+            if let Err(e) = r {
+                read_err = Some(e.into());
+                break;
+            }
+            if job_tx.send((seq, lcn, buf)).is_err() {
+                break;
+            }
+            seq += 1;
+            st.chunks += 1;
+            st.clusters += count;
+            st.raw_bytes += count * cs;
+            progress(&st);
+        }
+        drop(job_tx);
+        wh.join().expect("이미지 쓰기 스레드 비정상 종료")
+    });
+
+    if let Some(e) = read_err {
+        return Err(e);
     }
-    header.used_clusters = w.clusters_written();
-    let bw = w.finish()?;
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    header.used_clusters = writer.clusters_written();
+    let bw = writer.finish()?;
     let mut f = bw.into_inner().map_err(|e| e.into_error())?;
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&header.to_bytes())?;
@@ -348,5 +453,81 @@ mod tests {
             &|_| {},
         );
         assert!(matches!(r, Err(QblkError::Cancelled)));
+    }
+
+    fn hdr(total: u64) -> Header {
+        Header {
+            version: crate::qblk::VERSION,
+            cluster_size: 4096,
+            total_clusters: total,
+            used_clusters: 0,
+            vsn: "0123456789ABCDEF".into(),
+            source_label: "C:".into(),
+        }
+    }
+
+    /// 청크가 아주 많아도(워커가 뒤섞여 끝나도) 한 스레드로 차례로 쓴 것과 바이트까지 같아야 한다.
+    #[test]
+    fn many_chunks_match_sequential_writer_byte_for_byte() {
+        let cs = 4096usize;
+        let total = 3000usize;
+        let mut img = vec![0u8; cs * total];
+        let mut x = 12345u32;
+        for b in img.iter_mut() {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = if (x >> 24).is_multiple_of(3) {
+                (x >> 16) as u8
+            } else {
+                7
+            };
+        }
+        // 3클러스터 쓰고 2클러스터 건너뛰는 식으로 600여 개 구간
+        let mut bitmap = vec![0u8; total.div_ceil(8)];
+        let mut runs = Vec::new();
+        let mut c = 0usize;
+        while c + 3 <= total {
+            for k in c..c + 3 {
+                bitmap[k / 8] |= 1 << (k % 8);
+            }
+            runs.push((c as u64, 3u64));
+            c += 5;
+        }
+        let mut h = hdr(total as u64);
+        let (_, out) = write_image(
+            &mut Cursor::new(img.clone()),
+            Cursor::new(Vec::new()),
+            &mut h,
+            &bitmap,
+            3,
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
+        let mut h2 = hdr(total as u64);
+        h2.used_clusters = h.used_clusters;
+        let mut w = Writer::new(Vec::new(), &h2, 3).unwrap();
+        for (lcn, n) in runs {
+            let (a, z) = (lcn as usize * cs, (lcn + n) as usize * cs);
+            w.write_chunk(lcn, &img[a..z]).unwrap();
+        }
+        assert_eq!(out.into_inner(), w.finish().unwrap());
+    }
+
+    /// 원본이 중간에 모자라 읽기가 실패하면 멈추지 않고 오류로 끝나야 한다.
+    #[test]
+    fn read_failure_returns_error_without_hanging() {
+        let total = 400u64;
+        let bitmap = vec![0xFFu8; 50];
+        let mut h = hdr(total);
+        let r = write_image(
+            &mut Cursor::new(vec![1u8; 4096 * 100]), // 100클러스터만 있음
+            Cursor::new(Vec::new()),
+            &mut h,
+            &bitmap,
+            3,
+            &AtomicBool::new(false),
+            &|_| {},
+        );
+        assert!(r.is_err());
     }
 }

@@ -1118,6 +1118,7 @@ impl Supervisor {
         let part = partial_dir.join(&name);
         let id = job.id;
         let last = Mutex::new(u64::MAX);
+        let started = std::time::Instant::now();
         self.mark_vss(job.id, &format!("볼륨 이미지 {drive}:"));
         let res =
             kova_image::volume::capture_volume(&format!("{drive}:"), &part, 3, cancel, &|s| {
@@ -1132,7 +1133,14 @@ impl Supervisor {
                     self.emit(SvcEvent::Progress {
                         job_id: id,
                         percent,
-                        current: format!("{gb}GB / {total_gb}GB 읽음"),
+                        current: format!(
+                            "{gb}GB / {total_gb}GB 읽음{}",
+                            speed_note(
+                                s.raw_bytes,
+                                s.total_raw_bytes,
+                                started.elapsed().as_secs_f64()
+                            )
+                        ),
                     });
                 }
             });
@@ -2842,5 +2850,40 @@ mod tests {
         }
         assert!(s.0.subs.lock().unwrap().is_empty());
         assert_eq!(rx.try_iter().count(), SUB_CAPACITY);
+    }
+}
+
+/// 진행 문구 뒤에 붙일 속도·남은 시간. 1초 미만이거나 읽은 양이 없으면 빈 문자열.
+fn speed_note(done: u64, total: u64, secs: f64) -> String {
+    if secs < 1.0 || done == 0 {
+        return String::new();
+    }
+    let bps = done as f64 / secs;
+    let mut s = if bps >= 1e9 {
+        format!(" · {:.1}GB/s", bps / 1e9)
+    } else {
+        format!(" · {:.0}MB/s", bps / 1e6)
+    };
+    if total > done {
+        let min = ((total - done) as f64 / bps / 60.0).ceil() as u64;
+        if min >= 60 {
+            s.push_str(&format!(" · 약 {}시간 {}분 남음", min / 60, min % 60));
+        } else {
+            s.push_str(&format!(" · 약 {}분 남음", min.max(1)));
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod speed_note_tests {
+    use super::speed_note;
+    #[test]
+    fn shows_speed_and_eta() {
+        assert_eq!(speed_note(0, 100, 5.0), "");
+        assert_eq!(speed_note(10, 100, 0.5), "");
+        let s = speed_note(600_000_000, 1_200_000_000, 2.0);
+        assert!(s.contains("300MB/s") && s.contains("약 1분 남음"), "{s}");
+        assert!(speed_note(4_000_000_000, 8_000_000_000, 2.0).contains("2.0GB/s"));
     }
 }
