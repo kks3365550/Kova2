@@ -1129,7 +1129,8 @@ impl Supervisor {
             percent: 50,
             current: format!("{mode} 수행 중..."),
         });
-        let res = match kova_core::verify::verify_repo(repo, deep) {
+        let verify_result = kova_core::verify::verify_repo(repo, deep);
+        let res = match &verify_result {
             Ok(r) if r.ok() => {
                 self.emit(SvcEvent::Progress {
                     job_id: job.id,
@@ -1156,6 +1157,38 @@ impl Supervisor {
             ),
             Err(e) => (false, e.to_string(), None),
         };
+        let now = Local::now().timestamp() as f64;
+        // 화면의 "검증됨/오류 있음" 표시는 스냅샷 기록(metadata.db)을 읽으므로 검증 결과를 거기에 남긴다
+        if let Ok(r) = &verify_result {
+            if let Ok(h) = History::open(repo) {
+                use std::collections::HashMap;
+                let mut bad: HashMap<String, i64> = HashMap::new();
+                for pr in &r.problems {
+                    match pr {
+                        kova_core::verify::Problem::MissingBlob { snapshot, .. } => {
+                            *bad.entry(snapshot.clone()).or_default() += 1;
+                        }
+                        kova_core::verify::Problem::BadManifest { file, .. } => {
+                            *bad.entry(file.trim_end_matches(".json").to_string())
+                                .or_default() += 1;
+                        }
+                        // 어느 스냅샷의 문제인지 알 수 없는 손상 청크는 개별 표시를 바꾸지 않는다
+                        kova_core::verify::Problem::CorruptBlob { .. } => {}
+                    }
+                }
+                for rec in h.list_snapshots().unwrap_or_default() {
+                    match bad.get(&rec.id) {
+                        Some(n) => {
+                            let _ = h.set_verification(&rec.id, false, *n, now);
+                        }
+                        None if r.ok() => {
+                            let _ = h.set_verification(&rec.id, true, 0, now);
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
         let now = Local::now().timestamp() as f64;
         if let Some(mut p) = self.0.store.get(&prof.id) {
             p.extra.insert("last_verify_at".into(), now.into());
@@ -2065,6 +2098,10 @@ mod tests {
         )));
         let log = fs::read_to_string(kova_core::applog::log_path(&d.path().join("cfg"))).unwrap();
         assert!(log.contains("작업 시작") && log.contains("작업 종료"));
+        // 화면이 읽는 스냅샷 기록에도 검증 결과가 남아야 한다
+        let h = History::open(&d.path().join("repo")).unwrap();
+        let recs = h.list_snapshots().unwrap();
+        assert!(!recs.is_empty() && recs.iter().all(|r| r.is_verified && r.verify_error_count == 0));
     }
 
     #[test]

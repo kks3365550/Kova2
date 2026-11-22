@@ -765,6 +765,18 @@ mod tests {
         format!("{n:064x}")
     }
 
+    /// 블롭 목록은 낱개 파일과 팩 모두를 담고, 읽기에 성공하면 Ok 로 돌려준다(읽기 오류는 오류로 알린다).
+    #[test]
+    fn try_get_all_blob_hashes_lists_loose_and_ok_on_empty() {
+        let d = tempfile::tempdir().unwrap();
+        let cas = CasStorage::new(d.path()).unwrap();
+        assert!(cas.try_get_all_blob_hashes().unwrap().is_empty());
+        cas.save_blob(&h(7), &[7u8; 512]).unwrap();
+        let set = cas.try_get_all_blob_hashes().unwrap();
+        assert!(set.contains(&h(7)) && set.len() == 1);
+        assert_eq!(cas.get_all_blob_hashes(), set);
+    }
+
     /// 모아 둔 블롭은 비우기 전에도 있는 것으로 보이고, 비운 뒤에는 팩에서 그대로 읽힌다(낱개 파일은 만들지 않는다).
     #[test]
     fn staged_blobs_are_visible_then_readable_after_flush() {

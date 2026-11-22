@@ -2664,6 +2664,40 @@ fn restore_volume_job(weak: slint::Weak<MainWindow>, image: String, letter: Stri
     });
 }
 
+/// 이름 있는 뮤텍스로 앱을 하나만 띄운다. 이미 있으면 기존 창을 앞으로 가져오고 None.
+#[cfg(windows)]
+fn single_instance() -> Option<isize> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(attrs: *const u8, initial: i32, name: *const u16) -> isize;
+        fn GetLastError() -> u32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+        fn ShowWindow(h: isize, cmd: i32) -> i32;
+        fn SetForegroundWindow(h: isize) -> i32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let name: Vec<u16> = "Local\\Kova2AppSingleInstance\0".encode_utf16().collect();
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if h != 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+        return Some(h); // 프로세스가 끝날 때까지 핸들을 쥐고 있는다
+    }
+    if h == 0 {
+        return Some(0); // 뮤텍스를 못 만들어도 앱은 띄운다
+    }
+    let title: Vec<u16> = "Kova\0".encode_utf16().collect();
+    unsafe {
+        let w = FindWindowW(std::ptr::null(), title.as_ptr());
+        if w != 0 {
+            ShowWindow(w, 9); // SW_RESTORE
+            SetForegroundWindow(w);
+        }
+    }
+    None
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     // 앱은 키를 읽지 않는다(키 폴더는 SYSTEM·관리자 전용): 암호화 저장소의 목록·찾아보기는 평문 매니페스트로,
     // 내용(블롭)이 필요한 복원·복구 훈련은 서비스에 맡긴다
@@ -2679,6 +2713,12 @@ fn main() -> Result<(), slint::PlatformError> {
         return Ok(());
     }
 
+    // 앱이 둘 뜨면 클릭이 엉키고 서비스 연결도 겹치므로, 이미 떠 있으면 그 창을 앞으로 가져오고 끝낸다
+    #[cfg(windows)]
+    let _single = match single_instance() {
+        Some(g) => g,
+        None => return Ok(()),
+    };
     let w = MainWindow::new()?;
     #[cfg(windows)]
     {
