@@ -1816,6 +1816,7 @@ export component MainWindow inherits Window {
 
                 // PAGE 4: DISK IMAGE / BARE METAL BACKUP (ADVANCED)
                 if root.page == 4: ScrollView {
+                    content-width: self.width;
                     VerticalLayout {
                         spacing: 14px;
                         
@@ -1955,13 +1956,47 @@ export component MainWindow inherits Window {
                             spacing: 10px;
                             Heading { text: "4. 물리 드라이브에 직접 덮어쓰기 복원 (고급/위험)"; }
                             Text { text: "경고: 대상 드라이브의 기존 데이터가 영구히 소멸됩니다. Kova가 관리자 권한으로 실행되어 있어야 합니다."; color: Theme.danger; font-size: 12px; wrap: word-wrap; }
-                            Field { text <=> root.vol-img; placeholder: "복원할 이미지 파일(.qblk) 전체 경로"; }
+                            Hint { text: "① 복원할 이미지를 고르세요 (2번 목록의 이미지)."; }
+                            if root.images.length == 0: Text { text: "보관함에 저장된 디스크 이미지가 없습니다. 아래 칸에 이미지 파일 경로를 직접 입력할 수 있습니다."; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                            for im in root.images: Rectangle {
+                                height: 36px;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: root.vol-img == im.path ? Theme.accent : Theme.line;
+                                background: root.vol-img == im.path ? Theme.accent.with-alpha(0.12) : Theme.card;
+                                TouchArea { clicked => { root.vol-img = im.path; } }
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 12px;
+                                    Text { text: im.name; color: Theme.text; font-size: 13px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                    Text { text: im.size; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+                                    Text { text: im.when; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+                                }
+                            }
+                            Field { text <=> root.vol-img; placeholder: "선택한 이미지 경로 (직접 입력도 가능)"; }
+                            Hint { text: "② 덮어쓸 드라이브를 고르세요. 선택하면 바로 상태를 확인하고, 아래에 입력할 확인 문구를 보여 줍니다. (백업 보관소 드라이브는 목록에서 제외)"; }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: start;
+                                for d in root.drives: Rectangle {
+                                    visible: !d.repo;
+                                    height: d.repo ? 0px : 44px;
+                                    width: d.repo ? 0px : 120px;
+                                    border-radius: 8px;
+                                    border-width: 2px;
+                                    border-color: root.vol-letter == d.name ? Theme.danger : Theme.line;
+                                    background: root.vol-letter == d.name ? Theme.danger.with-alpha(0.14) : Theme.card;
+                                    Text { text: d.name; color: Theme.text; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.vol-letter = d.name; root.volume-check(d.name); } }
+                                }
+                            }
                             HorizontalLayout {
                                 spacing: 8px;
                                 Field { text <=> root.vol-letter; placeholder: "대상 드라이브 문자 (예: E)"; width: 220px; }
                                 Btn { text: "드라이브 상태 확인"; clicked => { root.volume-check(root.vol-letter); } }
                             }
-                            Field { text <=> root.vol-phrase; placeholder: "확인 문구를 정확히 입력해야 잠금이 해제됩니다"; }
+                            Field { text <=> root.vol-phrase; placeholder: "③ 위에 표시된 확인 문구를 그대로 입력해야 실행됩니다"; }
                             Btn { text: "⚠️ 드라이브 직접 복원 실행 (영구 파괴)"; kind: 2; clicked => { root.restore-volume(root.vol-img, root.vol-letter, root.vol-phrase); } }
                             if root.volume-text != "": Text { text: root.volume-text; color: Theme.warn; font-size: 13px; wrap: word-wrap; }
                         }
