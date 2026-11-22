@@ -1899,13 +1899,14 @@ export component MainWindow inherits Window {
                                     Text { text: im.name; color: Theme.text; font-size: 13px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                                     Text { text: im.size; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
                                     Text { text: im.when; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
-                                    if root.confirm-del != im.path: Btn { text: "삭제"; kind: 2; height: 26px; clicked => { root.confirm-del = im.path; root.img-path = im.path; } }
+                                    if root.confirm-del != im.path: VerticalLayout { alignment: center; Btn { text: "삭제"; kind: 2; height: 26px; clicked => { root.confirm-del = im.path; root.img-path = im.path; } } }
                                     if root.confirm-del == im.path: Text { text: "되돌릴 수 없음!"; color: Theme.danger; font-size: 12px; vertical-alignment: center; font-weight: 700; }
-                                    if root.confirm-del == im.path: Btn { text: "정말 삭제"; kind: 2; height: 26px; clicked => { root.delete-image(im.path); root.confirm-del = ""; } }
-                                    if root.confirm-del == im.path: Btn { text: "취소"; height: 26px; clicked => { root.confirm-del = ""; } }
+                                    if root.confirm-del == im.path: VerticalLayout { alignment: center; Btn { text: "정말 삭제"; kind: 2; height: 26px; clicked => { root.delete-image(im.path); root.confirm-del = ""; } } }
+                                    if root.confirm-del == im.path: VerticalLayout { alignment: center; Btn { text: "취소"; height: 26px; clicked => { root.confirm-del = ""; } } }
                                 }
                             }
                             
+                            PathField { text <=> root.img-path; target: "img-path"; kind: "qblk-open"; placeholder: "목록에 없는 이미지는 '찾아보기'로 직접 선택 (.qblk)"; pick(k, t) => { root.browse(k, t); } }
                             HorizontalLayout {
                                 spacing: 8px;
                                 alignment: end;
@@ -1939,6 +1940,7 @@ export component MainWindow inherits Window {
                                 TouchArea { clicked => { root.conv-src = im.path; } }
                             }
                             
+                            PathField { text <=> root.conv-src; target: "conv-src"; kind: "img-open"; placeholder: "목록에 없는 이미지는 '찾아보기'로 직접 선택 (.img/.raw/.vhd)"; pick(k, t) => { root.browse(k, t); } }
                             HorizontalLayout {
                                 alignment: end;
                                 spacing: 8px;
@@ -1974,7 +1976,7 @@ export component MainWindow inherits Window {
                                     Text { text: im.when; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
                                 }
                             }
-                            Field { text <=> root.vol-img; placeholder: "선택한 이미지 경로 (직접 입력도 가능)"; }
+                            PathField { text <=> root.vol-img; target: "vol-img"; kind: "qblk-open"; placeholder: "선택한 이미지 경로 (목록에 없으면 '찾아보기')"; pick(k, t) => { root.browse(k, t); } }
                             Hint { text: "② 덮어쓸 드라이브를 고르세요. 선택하면 바로 상태를 확인하고, 아래에 입력할 확인 문구를 보여 줍니다. (백업 보관소 드라이브는 목록에서 제외)"; }
                             HorizontalLayout {
                                 spacing: 10px;
