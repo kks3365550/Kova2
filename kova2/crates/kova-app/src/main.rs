@@ -1522,9 +1522,12 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
                             );
                         }
                         if let Some(images) = images {
-                            if w.get_img_path().is_empty() {
-                                if let Some(f) = images.first() {
+                            if let Some(f) = images.first() {
+                                if w.get_img_path().is_empty() {
                                     w.set_img_path(f.path.clone());
+                                }
+                                if w.get_vol_img().is_empty() {
+                                    w.set_vol_img(f.path.clone());
                                 }
                             }
                             w.set_images(std::rc::Rc::new(slint::VecModel::from(images)).into());
@@ -2686,19 +2689,30 @@ fn protected_drive_letters() -> Vec<char> {
 /// 대상 볼륨을 조회해 사용자가 직접 입력해야 할 확인 문구를 보여 준다(아무것도 쓰지 않는다).
 #[cfg(windows)]
 fn volume_check(weak: &slint::Weak<MainWindow>, letter: &str) {
-    let text = match letter.trim().chars().next() {
-        None => "드라이브 문자를 입력하세요.".to_string(),
+    // 입력할 확인 문구는 별도 상자(volume-phrase)에, 오류·진행 메시지는 volume-text 에 둔다.
+    // 그래야 실행을 눌러 오류가 나도 확인 문구가 사라지지 않는다.
+    let (phrase, status) = match letter.trim().chars().next() {
+        None => (String::new(), "드라이브 문자를 입력하세요.".to_string()),
         Some(c) => match kova_image::volume_restore::volume_info(c) {
-            Ok(v) => format!(
-                "{}: 볼륨 '{}' 의 내용이 전부 덮어써집니다. 계속하려면 아래 칸에 그대로 입력하세요:\n{}",
-                v.letter,
-                v.label,
-                kova_image::volume_restore::confirmation_phrase(&v)
+            Ok(v) => (
+                format!(
+                    "{}: 볼륨 '{}' 의 내용이 전부 덮어써집니다. 계속하려면 아래 칸에 그대로 입력하세요:\n{}",
+                    v.letter,
+                    v.label,
+                    kova_image::volume_restore::confirmation_phrase(&v)
+                ),
+                String::new(),
             ),
-            Err(e) => format!("대상으로 사용할 수 없음: {e}"),
+            Err(e) => (String::new(), format!("대상으로 사용할 수 없음: {e}")),
         },
     };
-    show_volume(weak, text);
+    let w = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = w.upgrade() {
+            w.set_volume_phrase(phrase.into());
+            w.set_volume_text(status.into());
+        }
+    });
 }
 
 /// 볼륨 직접 복원: 검증·정책·확인 문구·잠금을 모두 통과해야 쓴다. 오래 걸리므로 별도 스레드에서 진행률을 흘린다.
@@ -2708,8 +2722,22 @@ fn restore_volume_job(weak: slint::Weak<MainWindow>, image: String, letter: Stri
         show_volume(&weak, LOCKED_MSG.into());
         return;
     }
+    if image.trim().trim_matches('"').is_empty() {
+        show_volume(
+            &weak,
+            "① 복원할 이미지를 먼저 고르세요 (위 목록에서 누르거나 '찾아보기').".into(),
+        );
+        return;
+    }
+    if !std::path::Path::new(image.trim().trim_matches('"')).is_file() {
+        show_volume(
+            &weak,
+            "선택한 이미지 파일을 찾을 수 없습니다. 다시 선택하세요.".into(),
+        );
+        return;
+    }
     let Some(c) = letter.trim().chars().next() else {
-        show_volume(&weak, "드라이브 문자를 입력하세요.".into());
+        show_volume(&weak, "② 덮어쓸 드라이브를 먼저 고르세요.".into());
         return;
     };
     show_volume(
