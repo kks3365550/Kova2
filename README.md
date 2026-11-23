@@ -1,5 +1,9 @@
 # Kova2
 
+<p align="center">
+  <img src="assets/kova2_banner.jpg" alt="Kova2" width="100%">
+</p>
+
 Windows용 백업·복구 프로그램입니다. Rust로 만들었고, 파일 백업과 디스크 통째 이미지 백업을 한 프로그램에서 쓸 수 있습니다.
 
 ## 주요 기능
