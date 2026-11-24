@@ -724,7 +724,7 @@ impl DriveClient {
             name: name.to_string(),
             local: local.to_path_buf(),
             size,
-            existing: existing.map(|e| e.id),
+            existing: existing.filter(|e| !e.folder).map(|e| e.id),
         }))
     }
 
@@ -811,6 +811,22 @@ impl DriveClient {
         Ok(ids)
     }
 
+    fn download_file(&self, id: &str) -> Result<Vec<u8>, String> {
+        let url = format!("{}/files/{id}", self.ep.api);
+        let resp = self.call(|a, t| {
+            a.get(&url)
+                .set("Authorization", &format!("Bearer {t}"))
+                .query("alt", "media")
+                .call()
+        })?;
+        let mut buf = Vec::new();
+        resp.into_reader()
+            .take(1024 * 1024)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("Drive 파일 읽기 실패({id}): {e}"))?;
+        Ok(buf)
+    }
+
     fn upload(
         &self,
         existing: Option<String>,
@@ -884,7 +900,8 @@ impl DriveClient {
                         .and_then(|r| r.trim().strip_prefix("bytes="))
                         .and_then(|r| r.split_once('-'))
                         .and_then(|(_, e)| e.trim().parse::<u64>().ok())
-                        .map_or(0, |e| e + 1);
+                        .and_then(|e| e.checked_add(1))
+                        .unwrap_or(0);
                     if got > size {
                         return Err(format!("업로드 응답 범위 오류: {got} > {size}"));
                     }
@@ -940,17 +957,22 @@ pub fn replicate_to_drive(
     // 암호화 표식(crypto.json)을 스냅샷보다 먼저 올린다. 없으면 드라이브 복제본만으로는 복호화할 수 없다.
     let marker = repo.join(kova_engine::codec::MARKER);
     if marker.is_file() {
-        let size = fs::metadata(&marker).map_err(|e| e.to_string())?.len();
+        let local_bytes = fs::read(&marker).map_err(|e| e.to_string())?;
         let parent = client.ensure_folder(folder)?;
-        if let Some(e) = client.list(&parent)?.get(kova_engine::codec::MARKER) {
-            if !e.folder && e.size != size {
+        let existing = client
+            .list(&parent)?
+            .get(kova_engine::codec::MARKER)
+            .filter(|e| !e.folder)
+            .cloned();
+        if let Some(e) = existing {
+            let remote_bytes = client.download_file(&e.id)?;
+            if remote_bytes != local_bytes {
                 return Err(
                     "드라이브 폴더의 암호화 표식이 이 저장소와 다릅니다(다른 저장소의 복제본)"
                         .into(),
                 );
             }
-        }
-        if let Some(n) = client.put_file(folder, kova_engine::codec::MARKER, &marker)? {
+        } else if let Some(n) = client.put_file(folder, kova_engine::codec::MARKER, &marker)? {
             rep.bytes_uploaded += n;
         }
     }
@@ -1248,6 +1270,26 @@ mod tests {
                     ));
                     let id = format!("f{}", m.files.len() - 1);
                     respond(&mut s, "200 OK", "", &format!(r#"{{"id":"{id}"}}"#));
+                } else if let Some(id) = path.strip_prefix("/api/files/") {
+                    if method == "GET" && q.get("alt").map(String::as_str) == Some("media") {
+                        if let Some(i) = id
+                            .strip_prefix('f')
+                            .and_then(|n| n.parse::<usize>().ok())
+                            .filter(|&i| i < m.files.len())
+                        {
+                            let data = &m.files[i].3;
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                data.len()
+                            );
+                            let _ = s.write_all(hdr.as_bytes());
+                            let _ = s.write_all(data);
+                        } else {
+                            respond(&mut s, "404 Not Found", "", "{}");
+                        }
+                    } else {
+                        respond(&mut s, "404 Not Found", "", "{}");
+                    }
                 } else if path.starts_with("/up/files") {
                     let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     let existing = path
@@ -1837,12 +1879,39 @@ mod tests {
                 .unwrap();
             assert!(mk < snap, "표식이 매니페스트보다 먼저 올라가야 함");
         }
-        // 다른 저장소(크기가 다른 표식)를 같은 폴더로 올리려 하면 거부
-        fs::write(repo.join(kova_engine::codec::MARKER), b"{}").unwrap();
-        let mut c2 = DriveClient::open(dir.path(), ep, creds()).unwrap();
-        let e = replicate_to_drive(
+        // 같은 내용의 표식으로 재실행하면 통과
+        let mut c_same = DriveClient::open(dir.path(), ep.clone(), creds()).unwrap();
+        c_same.retry_base = Duration::ZERO;
+        let r_same = replicate_to_drive(
+            &repo,
+            &mut c_same,
+            &["Kova2 Backup", "p1"],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            (r_same.snapshots_uploaded, r_same.snapshots_skipped),
+            (0, 1)
+        );
+        // 같은 크기지만 내용이 다른 표식(다른 저장소)도 바이트 비교로 거부해야 한다
+        let same_size_other = br#"{"version":1,"repo_id":"r2","key_check":"k"}"#;
+        assert_eq!(same_size_other.len(), marker.len());
+        fs::write(repo.join(kova_engine::codec::MARKER), same_size_other).unwrap();
+        let mut c2 = DriveClient::open(dir.path(), ep.clone(), creds()).unwrap();
+        let e_same_size = replicate_to_drive(
             &repo,
             &mut c2,
+            &["Kova2 Backup", "p1"],
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(e_same_size.contains("암호화 표식"), "{e_same_size}");
+        // 크기가 다른 표식도 거부
+        fs::write(repo.join(kova_engine::codec::MARKER), b"{}").unwrap();
+        let mut c3 = DriveClient::open(dir.path(), ep, creds()).unwrap();
+        let e = replicate_to_drive(
+            &repo,
+            &mut c3,
             &["Kova2 Backup", "p1"],
             &AtomicBool::new(false),
         )

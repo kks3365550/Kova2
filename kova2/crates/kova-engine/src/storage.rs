@@ -478,10 +478,16 @@ impl CasStorage {
             std::process::id(),
             TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        {
+        let write_res = (|| -> io::Result<()> {
             let mut file = File::create(&tmp_path)?;
             file.write_all(compressed_data)?;
             file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
         }
 
         if let Err(e) = fs::rename(&tmp_path, &target_path) {
@@ -608,6 +614,12 @@ impl CasStorage {
     }
 
     pub fn load_manifest(&self, session_id: &str) -> io::Result<SnapshotManifest> {
+        if !valid_session_id(session_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid session id: {session_id}"),
+            ));
+        }
         let target_path = self
             .repo_root
             .join("snapshots")
@@ -889,5 +901,14 @@ mod tests {
 
         let all = cas.get_recent_manifests_for_profile(10, None);
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn load_manifest_rejects_path_traversal_session_id() {
+        let d = tempfile::tempdir().unwrap();
+        let cas = CasStorage::new(d.path()).unwrap();
+        fs::write(d.path().join("crypto.json"), r#"{"id":"secret"}"#).unwrap();
+        let err = cas.load_manifest("../crypto").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

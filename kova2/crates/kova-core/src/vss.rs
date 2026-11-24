@@ -28,15 +28,11 @@ fn drive_of(p: &Path) -> Option<String> {
 fn join_device(device: &str, p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
     let s = s.strip_prefix("\\\\?\\").unwrap_or(&s);
-    let rest = &s[2..];
+    let rest = s[2..].replace('/', "\\");
     PathBuf::from(format!(
         "{}{}{}",
         device.trim_end_matches('\\'),
-        if rest.starts_with(['\\', '/']) {
-            ""
-        } else {
-            "\\"
-        },
+        if rest.starts_with('\\') { "" } else { "\\" },
         rest
     ))
 }
@@ -143,8 +139,14 @@ mod imp {
         let script = format!(
             "$r = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{{Volume='{drive}\\';Context='ClientAccessible'}}; \
              if ($r.ReturnValue -ne 0) {{ throw ('VSS create failed: ' + $r.ReturnValue) }}; \
-             $s = Get-CimInstance Win32_ShadowCopy -Filter (\"ID='\" + $r.ShadowID + \"'\"); \
-             Write-Output ($r.ShadowID + '|' + $s.DeviceObject)"
+             $id = $r.ShadowID; \
+             try {{ \
+                 $s = Get-CimInstance Win32_ShadowCopy -Filter \"ID='$id'\" -ErrorAction Stop; \
+                 Write-Output ($id + '|' + $s.DeviceObject) \
+             }} catch {{ \
+                 Get-CimInstance Win32_ShadowCopy -Filter \"ID='$id'\" -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue; \
+                 throw \
+             }}"
         );
         let out = ps(&script)?;
         let line = out.lines().last().unwrap_or("");
@@ -157,7 +159,11 @@ mod imp {
             && id
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() || matches!(c, '-' | '{' | '}'));
-        if !guid_ok || !device.starts_with("\\\\?\\GLOBALROOT\\Device\\") {
+        if !guid_ok {
+            return Err(format!("섀도 복사본 정보가 이상함: {line}"));
+        }
+        if !device.starts_with("\\\\?\\GLOBALROOT\\Device\\") {
+            delete(id);
             return Err(format!("섀도 복사본 정보가 이상함: {line}"));
         }
         Ok((id.to_string(), device.to_string()))
@@ -196,6 +202,13 @@ mod tests {
             join_device(dev, Path::new("C:")),
             PathBuf::from("\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy7\\")
         );
+        assert_eq!(
+            join_device(dev, Path::new("C:/data/sub/a.txt")),
+            PathBuf::from("\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy7\\data\\sub\\a.txt")
+        );
+        assert!(!join_device(dev, Path::new("C:/data/sub/a.txt"))
+            .to_string_lossy()
+            .contains('/'));
         let set = ShadowSet {
             shadows: vec![("C:".into(), "x".into(), dev.into())],
         };

@@ -726,10 +726,11 @@ fn source_label(idx: usize, root: &str) -> String {
 
 fn resolve_restore_path(base: &RestoreBase, entry: &FileEntry) -> Result<PathBuf, String> {
     let rel = Path::new(&entry.path);
-    // 매니페스트 경로가 상위 폴더(..)나 절대경로로 빠져나가는 것을 막는다
+    // 매니페스트 경로가 상위 폴더(..)나 절대경로로 빠져나가는 것, 그리고 일반 경로 구성요소가 없는 빈/현재경로("", ".", "./.")를 막는다
     if rel
         .components()
         .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        || !rel.components().any(|c| matches!(c, Component::Normal(_)))
     {
         return Err(format!("unsafe path in manifest: {}", entry.path));
     }
@@ -966,13 +967,19 @@ fn write_restored(
         Err(e) => return Err(format!("Cannot create file {}: {}", file_path.display(), e)),
     };
     // 청크가 여럿이고 길이 합이 파일 크기와 맞으면 청크를 묶음 단위로 병렬 복원한다(큰 파일 하나도 여러 코어 사용)
-    let total_len: u64 = entry.chunks.iter().map(|c| c.length as u64).sum();
+    let total_len: u64 = entry
+        .chunks
+        .iter()
+        .try_fold(0u64, |acc, c| acc.checked_add(c.length as u64))
+        .ok_or_else(|| format!("Chunk length overflow for {}", file_path.display()))?;
     if entry.chunks.len() >= 4 && total_len == entry.size && file.set_len(entry.size).is_ok() {
         let mut offs = Vec::with_capacity(entry.chunks.len());
         let mut off = 0u64;
         for c in &entry.chunks {
             offs.push(off);
-            off += c.length as u64;
+            off = off
+                .checked_add(c.length as u64)
+                .ok_or_else(|| format!("Chunk offset overflow for {}", file_path.display()))?;
         }
         // 묶음마다 끝나야 다음 묶음을 시작하므로 쓰기 위치가 크게 앞서 나가지 않는다
         // (파일 끝보다 멀리 쓰면 NTFS가 그 앞 구간을 0으로 채우느라 느려진다)
@@ -996,7 +1003,9 @@ fn write_restored(
             }
             file.write_all(&raw)
                 .map_err(|e| format!("Write failed for {}: {}", file_path.display(), e))?;
-            written += raw.len() as u64;
+            written = written
+                .checked_add(raw.len() as u64)
+                .ok_or_else(|| format!("Size overflow for {}", file_path.display()))?;
         }
         if written != entry.size {
             return Err(format!(
@@ -1471,6 +1480,16 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve_restore_path(&base, &e).is_err());
+        for empty in ["", ".", "./."] {
+            let e = FileEntry {
+                path: empty.into(),
+                ..Default::default()
+            };
+            assert!(
+                resolve_restore_path(&base, &e).is_err(),
+                "should reject path {empty:?}"
+            );
+        }
     }
 
     #[test]

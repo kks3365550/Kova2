@@ -134,8 +134,14 @@ pub(crate) mod dpapi {
                 "DPAPI 해제 실패(다른 PC에서 만든 키이거나 손상)".into()
             });
         }
-        let v = unsafe { std::slice::from_raw_parts(out.data, out.len as usize) }.to_vec();
-        unsafe { LocalFree(out.data as *mut c_void) };
+        let v = if out.len == 0 || out.data.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(out.data, out.len as usize) }.to_vec()
+        };
+        if !out.data.is_null() {
+            unsafe { LocalFree(out.data as *mut c_void) };
+        }
         Ok(v)
     }
     pub fn protect(d: &[u8]) -> Result<Vec<u8>, String> {
@@ -285,14 +291,35 @@ pub fn enable(repo: &Path) -> Result<Option<String>, String> {
 
 /// 표식 없이 암호화 머리표(ENC\x01)를 가진 블롭·팩이 하나라도 있는가.
 fn has_encrypted_blobs(repo: &Path) -> bool {
-    use std::io::Read;
-    let is_enc = |p: &Path| {
+    use std::io::{Read, Seek, SeekFrom};
+    let is_enc_at = |f: &mut fs::File, offset: u64| {
         let mut b = [0u8; 4];
-        fs::File::open(p)
-            .and_then(|mut f| f.read_exact(&mut b))
+        f.seek(SeekFrom::Start(offset))
+            .and_then(|_| f.read_exact(&mut b))
             .is_ok()
             && &b == b"ENC\x01"
     };
+    let is_enc = |p: &Path| fs::File::open(p).is_ok_and(|mut f| is_enc_at(&mut f, 0));
+    let mut checked_packs = std::collections::HashSet::new();
+    for id in kova_engine::pack::pack_ids(repo) {
+        checked_packs.insert(id.clone());
+        let p = kova_engine::pack::pack_file(repo, &id);
+        let Ok(mut f) = fs::File::open(&p) else {
+            continue;
+        };
+        match kova_engine::pack::read_idx(repo, &id) {
+            Some(entries) if !entries.is_empty() => {
+                if entries.iter().any(|(_, e)| is_enc_at(&mut f, e.offset)) {
+                    return true;
+                }
+            }
+            _ => {
+                if is_enc_at(&mut f, 0) {
+                    return true;
+                }
+            }
+        }
+    }
     let files = |d: PathBuf, ext: &'static str| {
         fs::read_dir(d)
             .into_iter()
@@ -301,7 +328,11 @@ fn has_encrypted_blobs(repo: &Path) -> bool {
             .map(|e| e.path())
             .filter(move |p| p.extension().is_some_and(|x| x == ext))
     };
-    if files(repo.join("packs"), "pack").any(|p| is_enc(&p)) {
+    if files(repo.join("packs"), "pack").any(|p| {
+        p.file_stem()
+            .is_none_or(|s| !checked_packs.contains(s.to_string_lossy().as_ref()))
+            && is_enc(&p)
+    }) {
         return true;
     }
     fs::read_dir(repo.join("blobs"))
@@ -787,5 +818,37 @@ mod tests {
         let body = format_recovery_kit_with_bitlocker(&entries, Some(fake_bl));
         assert!(body.contains(fake_bl));
         assert!(body.contains("manage-bde -unlock C: -RecoveryPassword"));
+    }
+
+    #[test]
+    fn has_encrypted_blobs_detects_encrypted_entry_inside_mixed_pack() {
+        let _g = TEST_KEY_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = tempfile::tempdir().unwrap();
+        std::env::set_var("KOVA2_KEY_DIR", keys.path());
+
+        let repo = tempfile::tempdir().unwrap();
+        let h1 = "aa".repeat(32);
+        let h2 = "bb".repeat(32);
+        // 팩 첫 번째 항목은 평문, 두 번째 항목은 암호문(ENC\x01)인 혼합 팩
+        kova_engine::pack::write_pack(
+            repo.path(),
+            &[
+                (h1.clone(), b"plain-blob-content".to_vec()),
+                (h2.clone(), b"ENC\x01encrypted-blob-content".to_vec()),
+            ],
+        )
+        .unwrap();
+        assert!(has_encrypted_blobs(repo.path()));
+        assert!(enable(repo.path()).unwrap_err().contains(MARKER));
+        assert!(!is_enabled(repo.path()));
+
+        // 모든 항목이 평문인 팩은 암호화 블롭 없음으로 판정
+        let plain_repo = tempfile::tempdir().unwrap();
+        kova_engine::pack::write_pack(
+            plain_repo.path(),
+            &[(h1, b"plain-1".to_vec()), (h2, b"plain-2".to_vec())],
+        )
+        .unwrap();
+        assert!(!has_encrypted_blobs(plain_repo.path()));
     }
 }

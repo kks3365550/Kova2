@@ -309,14 +309,19 @@ pub fn encrypt_file(
     cancel: &AtomicBool,
 ) -> Result<u64, ImageCryptoError> {
     let r = BufReader::with_capacity(DEFAULT_ENC_CHUNK, File::open(src_path)?);
-    let w = BufWriter::with_capacity(DEFAULT_ENC_CHUNK, create_new(dst_path)?);
-    match encrypt_stream(r, w, key, DEFAULT_ENC_CHUNK, cancel) {
-        Ok(n) => Ok(n),
-        Err(e) => {
-            let _ = fs::remove_file(dst_path);
-            Err(e)
-        }
+    let dst_file = create_new(dst_path)?;
+    let res = (|| -> Result<u64, ImageCryptoError> {
+        let mut w = BufWriter::with_capacity(DEFAULT_ENC_CHUNK, dst_file);
+        let n = encrypt_stream(r, &mut w, key, DEFAULT_ENC_CHUNK, cancel)?;
+        w.flush()?;
+        let f = w.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()?;
+        Ok(n)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(dst_path);
     }
+    res
 }
 
 /// 파일 단위 복호화. 실패·취소 시 불완전한 출력 파일을 삭제한다.
@@ -327,14 +332,19 @@ pub fn decrypt_file(
     cancel: &AtomicBool,
 ) -> Result<u64, ImageCryptoError> {
     let r = BufReader::with_capacity(DEFAULT_ENC_CHUNK, File::open(src_path)?);
-    let w = BufWriter::with_capacity(DEFAULT_ENC_CHUNK, create_new(dst_path)?);
-    match decrypt_stream(r, w, key, cancel) {
-        Ok(n) => Ok(n),
-        Err(e) => {
-            let _ = fs::remove_file(dst_path);
-            Err(e)
-        }
+    let dst_file = create_new(dst_path)?;
+    let res = (|| -> Result<u64, ImageCryptoError> {
+        let mut w = BufWriter::with_capacity(DEFAULT_ENC_CHUNK, dst_file);
+        let n = decrypt_stream(r, &mut w, key, cancel)?;
+        w.flush()?;
+        let f = w.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()?;
+        Ok(n)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(dst_path);
     }
+    res
 }
 
 fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {

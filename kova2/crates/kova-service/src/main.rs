@@ -85,12 +85,18 @@ fn service_main(_args: Vec<OsString>) {
         });
     };
     set(
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        1,
+        Duration::from_secs(10),
+    );
+    let (sup, stop) = start_core(&rt);
+    set(
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
         0,
         Duration::default(),
     );
-    let (sup, stop) = start_core(&rt);
     let _ = rx.recv();
     stop.store(true, Ordering::Relaxed);
     // 중지 중임을 알리고, 실행 중 작업을 취소시킨 뒤(섀도 복사본·잠금 정리) 끝날 때까지 기다린다
@@ -120,6 +126,7 @@ fn service_main(_args: Vec<OsString>) {
             ),
         );
     }
+    rt.shutdown_timeout(Duration::from_secs(2));
     set(
         ServiceState::Stopped,
         ServiceControlAccept::empty(),

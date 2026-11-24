@@ -60,14 +60,50 @@ fn rel_of(path: &Path, root: &Path) -> String {
 }
 
 fn glob_match(p: &[char], s: &[char]) -> bool {
-    if p.is_empty() {
-        return s.is_empty();
+    let (mut pi, mut si) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_si = 0usize;
+
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            while pi < p.len() && p[pi] == '*' {
+                pi += 1;
+            }
+            star_pi = Some(pi);
+            star_si = si;
+        } else if let Some(sp) = star_pi {
+            star_si += 1;
+            si = star_si;
+            pi = sp;
+        } else {
+            return false;
+        }
     }
-    match p[0] {
-        '*' => (0..=s.len()).any(|i| glob_match(&p[1..], &s[i..])),
-        '?' => !s.is_empty() && glob_match(&p[1..], &s[1..]),
-        c => !s.is_empty() && s[0] == c && glob_match(&p[1..], &s[1..]),
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
     }
+    pi == p.len()
+}
+
+fn is_reparse_or_symlink(ft: &fs::FileType, md: Option<&fs::Metadata>) -> bool {
+    if ft.is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if md.is_some_and(|m| (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = md;
+    false
 }
 
 impl ExcludeFilter {
@@ -151,27 +187,31 @@ pub fn scan_directory_report(
     filter: &ExcludeFilter,
 ) -> std::io::Result<(Vec<ScannedItem>, ScanReport)> {
     let mut report = ScanReport::default();
+    let root_meta = match fs::metadata(source_root) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), report)),
+        Err(e) => return Err(e),
+    };
     // A source that is a single file: use the file name as its relative path.
-    if source_root.is_file() {
+    if root_meta.is_file() {
         let name = match source_root.file_name() {
             Some(n) => n.to_string_lossy().to_string(),
             None => return Ok((Vec::new(), report)),
         };
-        let m = fs::symlink_metadata(source_root)?;
         return Ok((
             vec![ScannedItem {
                 path: source_root.to_path_buf(),
                 rel_path: name,
                 is_dir: false,
-                size: m.len(),
-                modified: mtime_ms(&m),
+                size: root_meta.len(),
+                modified: mtime_ms(&root_meta),
                 src: 0,
             }],
             report,
         ));
     }
 
-    if !source_root.is_dir() {
+    if !root_meta.is_dir() {
         return Ok((Vec::new(), report));
     }
 
@@ -200,6 +240,16 @@ pub fn scan_directory_report(
                 continue;
             }
         };
+        if is_reparse_or_symlink(&file_type, None) {
+            continue;
+        }
+        let meta_res = entry.metadata();
+        if meta_res
+            .as_ref()
+            .is_ok_and(|m| is_reparse_or_symlink(&file_type, Some(m)))
+        {
+            continue;
+        }
 
         if file_type.is_dir() {
             if is_default_excluded_dir(&name) {
@@ -209,7 +259,7 @@ pub fn scan_directory_report(
                 top_subdirs.push(path);
             }
         } else if !filter.is_file_excluded(&name) {
-            match entry.metadata() {
+            match meta_res {
                 Ok(metadata) => {
                     let rel_path = rel_of(&path, source_root);
                     if !rel_path.is_empty() {
@@ -262,8 +312,12 @@ pub fn scan_directory_report(
                     if e.depth() == 0 {
                         return true;
                     }
+                    let ft = e.file_type();
+                    if is_reparse_or_symlink(&ft, e.metadata().ok().as_ref()) {
+                        return false;
+                    }
                     let name = e.file_name().to_string_lossy();
-                    if e.file_type().is_dir() {
+                    if ft.is_dir() {
                         if is_default_excluded_dir(&name) {
                             excluded_here
                                 .borrow_mut()
@@ -303,6 +357,9 @@ pub fn scan_directory_report(
                             return None;
                         }
                     };
+                    if is_reparse_or_symlink(&entry.file_type(), Some(&metadata)) {
+                        return None;
+                    }
                     let is_dir = metadata.is_dir();
                     let size = if is_dir { 0 } else { metadata.len() };
                     let modified = mtime_ms(&metadata);
@@ -420,5 +477,22 @@ mod tests {
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].rel_path, "b.txt");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn glob_match_handles_pathological_wildcards_linearly() {
+        let pat: Vec<char> = "*a*b*c*d*e*f*z".chars().collect();
+        let text: Vec<char> = "abcdef".repeat(34).chars().take(200).collect();
+        let start = std::time::Instant::now();
+        assert!(!glob_match(&pat, &text));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+
+        let mut matching = text;
+        matching.push('z');
+        assert!(glob_match(&pat, &matching));
+        assert!(glob_match(
+            &"**foo**?ar**".chars().collect::<Vec<_>>(),
+            &"xxfooyybarzz".chars().collect::<Vec<_>>()
+        ));
     }
 }

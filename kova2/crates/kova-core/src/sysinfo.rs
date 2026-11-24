@@ -11,11 +11,11 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| format!("{program} 실행 실패: {e}"))?;
     if o.status.success() {
-        Ok(String::from_utf8_lossy(&o.stdout).to_string())
+        Ok(crate::health::decode_console_output(&o.stdout))
     } else {
         Err(format!(
             "{program}: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
+            crate::health::decode_console_output(&o.stderr).trim()
         ))
     }
 }
@@ -25,7 +25,7 @@ fn run(_p: &str, _a: &[&str]) -> Result<String, String> {
     Err("Windows에서만 지원합니다".into())
 }
 
-const APPS_SCRIPT: &str = "$k='HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | Sort-Object DisplayName | ForEach-Object { '{0} | {1} | {2}' -f $_.DisplayName, $_.DisplayVersion, $_.Publisher }";
+const APPS_SCRIPT: &str = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$k='HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'; Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | Sort-Object DisplayName | ForEach-Object { '{0} | {1} | {2}' -f $_.DisplayName, $_.DisplayVersion, $_.Publisher }";
 
 /// `dir` 안에 apps.txt, drivers.txt, user_env_and_run.reg 를 만든다. 일부가 실패해도 나머지는 만든다.
 pub fn export(dir: &Path) -> Result<String, String> {

@@ -17,10 +17,10 @@ pub fn parse_size(num: &str, unit: &str) -> Option<u64> {
         "TB" => 1 << 40,
         _ => return None,
     };
-    Some(n * mul)
+    n.checked_mul(mul)
 }
 
-/// `list disk` 출력에서 디스크 목록을 읽는다. (영문 diskpart 기준)
+/// `list disk` 출력에서 디스크 목록을 읽는다. (영문·한글 diskpart 및 공백 포함 상태 문자열 지원)
 pub fn parse_list_disk(out: &str) -> Vec<DiskEntry> {
     let mut v = Vec::new();
     for line in out.lines() {
@@ -28,13 +28,18 @@ pub fn parse_list_disk(out: &str) -> Vec<DiskEntry> {
             .trim_start_matches([' ', '*'])
             .split_whitespace()
             .collect();
-        if t.len() >= 5 && t[0].eq_ignore_ascii_case("disk") {
-            if let (Ok(num), Some(bytes)) = (t[1].parse::<u32>(), parse_size(t[3], t[4])) {
-                v.push(DiskEntry {
-                    num,
-                    status: t[2].to_string(),
-                    bytes,
-                });
+        if t.len() >= 5 && (t[0].eq_ignore_ascii_case("disk") || t[0] == "디스크") {
+            if let Ok(num) = t[1].parse::<u32>() {
+                for i in 3..t.len().saturating_sub(1) {
+                    if let Some(bytes) = parse_size(t[i], t[i + 1]) {
+                        v.push(DiskEntry {
+                            num,
+                            status: t[2..i].join(" "),
+                            bytes,
+                        });
+                        break;
+                    }
+                }
             }
         }
     }
@@ -49,7 +54,7 @@ pub fn parse_detail_volume_disks(out: &str) -> Vec<u32> {
             .trim_start_matches([' ', '*'])
             .split_whitespace()
             .collect();
-        if t.len() >= 2 && t[0].eq_ignore_ascii_case("disk") {
+        if t.len() >= 2 && (t[0].eq_ignore_ascii_case("disk") || t[0] == "디스크") {
             if let Ok(n) = t[1].parse::<u32>() {
                 v.push(n);
             }
@@ -76,11 +81,11 @@ pub fn disk_selected_ok(
             disk.num
         ));
     }
-    if !disk.status.eq_ignore_ascii_case("online") {
+    if !(disk.status.eq_ignore_ascii_case("online") || disk.status == "온라인") {
         return Err(format!("disk {} is not online ({})", disk.num, disk.status));
     }
     // EFI 260MB + MSR 16MB + 여유 = 512MB
-    let need = image_bytes + (512 << 20);
+    let need = image_bytes.saturating_add(512 << 20);
     if disk.bytes < need {
         return Err(format!(
             "disk {} size ({} MB) is smaller than image ({} MB) + boot area",
@@ -107,12 +112,12 @@ pub fn confirm_phrase_mb(mb: u64) -> String {
     format!("ERASE DISK {mb} MB")
 }
 
-/// `detail disk` 출력에서 디스크 고유 ID(GPT GUID 또는 MBR 서명)를 읽는다. (영문 diskpart 기준)
+/// `detail disk` 출력에서 디스크 고유 ID(GPT GUID 또는 MBR 서명)를 읽는다. (영문·한글 diskpart 지원)
 pub fn parse_disk_id(out: &str) -> Option<String> {
     out.lines().find_map(|l| {
         let (k, v) = l.split_once(':')?;
-        k.trim()
-            .eq_ignore_ascii_case("disk id")
+        let key = k.trim();
+        (key.eq_ignore_ascii_case("disk id") || key == "디스크 ID" || key == "디스크 id")
             .then(|| v.trim().trim_matches(['{', '}']).to_uppercase())
             .filter(|s| !s.is_empty())
     })
@@ -463,5 +468,48 @@ Type   : NVMe
             find_collected_drivers(tmp.path()),
             Some(tmp.path().to_path_buf())
         );
+    }
+
+    #[test]
+    fn korean_and_multiword_diskpart_outputs_are_parsed() {
+        let ko_list = "\n  디스크 ###  상태           크기     사용 가능  Dyn  Gpt\n  ----------  -------------  -------  ---------  ---  ---\n  디스크 0    온라인          931 GB  1024 KB        *\n* 디스크 1    오프라인         60 GB      0 B        *\n  디스크 2    미디어 없음         0 B      0 B\n";
+        let d = parse_list_disk(ko_list);
+        assert_eq!(d.len(), 3);
+        assert_eq!(
+            d[0],
+            DiskEntry {
+                num: 0,
+                status: "온라인".into(),
+                bytes: 931 << 30
+            }
+        );
+        assert_eq!(d[1].status, "오프라인");
+        assert_eq!(d[2].status, "미디어 없음");
+        assert_eq!(d[2].bytes, 0);
+
+        let en_multi = "\n  Disk 0    Online (Errors)  500 GB      0 B\n  Disk 1    No Media           0 B      0 B\n";
+        let dm = parse_list_disk(en_multi);
+        assert_eq!(dm.len(), 2);
+        assert_eq!(dm[0].status, "Online (Errors)");
+        assert_eq!(dm[0].bytes, 500 << 30);
+        assert_eq!(dm[1].status, "No Media");
+        assert_eq!(dm[1].bytes, 0);
+
+        let ko_vol =
+            "볼륨 3\n\n  디스크 ###  상태     크기\n  ----------  -------\n* 디스크 2    온라인\n";
+        assert_eq!(parse_detail_volume_disks(ko_vol), vec![2]);
+
+        let ko_id =
+            "Samsung SSD 980\n디스크 ID: {919F469D-68F8-4433-9D35-34531B929926}\n유형   : NVMe\n";
+        assert_eq!(
+            parse_disk_id(ko_id).as_deref(),
+            Some("919F469D-68F8-4433-9D35-34531B929926")
+        );
+
+        assert!(disk_selected_ok(&d[0], &[1], 100 << 30).is_ok());
+        assert!(disk_selected_ok(&d[1], &[0], 1 << 30).is_err());
+        assert!(disk_selected_ok(&dm[0], &[1], 1 << 30).is_err());
+        assert_eq!(parse_size("99999999999999999", "TB"), None);
+        assert!(disk_selected_ok(&d[0], &[1], u64::MAX).is_err());
     }
 }

@@ -36,7 +36,7 @@ impl From<QblkError> for RestoreError {
 
 /// NTFS 희소 파일로 표시한다(안 하면 LCN 사이 빈 구간이 실제로 0으로 채워져 볼륨 전체 크기만큼 쓰게 된다). 실패해도 복원은 계속된다.
 #[cfg(windows)]
-fn mark_sparse(f: &File) {
+pub(crate) fn mark_sparse(f: &File) {
     use std::os::windows::io::AsRawHandle;
     extern "system" {
         fn DeviceIoControl(
@@ -66,7 +66,7 @@ fn mark_sparse(f: &File) {
     }
 }
 #[cfg(not(windows))]
-fn mark_sparse(_f: &File) {}
+pub(crate) fn mark_sparse(_f: &File) {}
 
 /// 대상 경로 검사: 장치 네임스페이스·드라이브 루트·UNC 루트·이미 존재하는 항목을 거부한다.
 pub fn check_target(target: &Path) -> Result<(), RestoreError> {
@@ -96,7 +96,7 @@ pub fn check_target(target: &Path) -> Result<(), RestoreError> {
 }
 
 /// 첫 섹터가 NTFS 부트 섹터면 볼륨 전체 바이트 수((전체 섹터+1) × 섹터 크기)를 돌려준다.
-fn ntfs_volume_len(path: &Path) -> Option<u64> {
+pub(crate) fn ntfs_volume_len(path: &Path) -> Option<u64> {
     use std::io::Read;
     let mut b = [0u8; 512];
     File::open(path).ok()?.read_exact(&mut b).ok()?;
@@ -105,7 +105,10 @@ fn ntfs_volume_len(path: &Path) -> Option<u64> {
     }
     let bps = u16::from_le_bytes([b[11], b[12]]) as u64;
     let sectors = u64::from_le_bytes(b[40..48].try_into().ok()?);
-    (bps >= 512 && bps.is_power_of_two()).then(|| (sectors + 1) * bps)
+    if bps < 512 || !bps.is_power_of_two() {
+        return None;
+    }
+    sectors.checked_add(1)?.checked_mul(bps)
 }
 
 /// image 를 target(새 파일)로 푼다. 실패·취소 시 불완전한 대상 파일은 지운다. 읽는 쪽은 읽기 전용으로만 연다.
@@ -122,30 +125,32 @@ pub fn restore_image_to_file(
         .write(true)
         .create_new(true)
         .open(target)?;
-    mark_sparse(&f);
-    let mut out = BufWriter::with_capacity(8 << 20, f);
-    match restore_to(src, &mut out, cancel, progress) {
-        Ok(r) => {
-            use std::io::Write;
-            out.flush()?;
-            // 마지막 클러스터들이 비어 있어도 파일 크기는 볼륨 전체 크기로 맞춘다(안 그러면 NTFS 가 RAW 로 보인다)
-            let mut full = r.0.total_clusters * r.0.cluster_size as u64;
-            let f = out.into_inner().map_err(|e| e.into_error())?;
-            // NTFS 는 클러스터 수 밖에 백업 부트 섹터 자리(마지막 섹터)까지 볼륨으로 센다 — 짧으면 RAW 로 보인다
-            if let Some(n) = ntfs_volume_len(target) {
-                full = full.max(n);
-            }
-            if f.metadata()?.len() < full {
-                f.set_len(full)?;
-            }
-            Ok(r)
+    let res = (|| -> Result<(Header, Stats), RestoreError> {
+        use std::io::Write;
+        mark_sparse(&f);
+        let mut out = BufWriter::with_capacity(8 << 20, f);
+        let r = restore_to(src, &mut out, cancel, progress)?;
+        out.flush()?;
+        // 마지막 클러스터들이 비어 있어도 파일 크기는 볼륨 전체 크기로 맞춘다(안 그러면 NTFS 가 RAW 로 보인다)
+        let mut full =
+            r.0.total_clusters
+                .checked_mul(r.0.cluster_size as u64)
+                .ok_or(QblkError::BadHeaderField("volume size overflow"))?;
+        let f = out.into_inner().map_err(|e| e.into_error())?;
+        // NTFS 는 클러스터 수 밖에 백업 부트 섹터 자리(마지막 섹터)까지 볼륨으로 센다 — 짧으면 RAW 로 보인다
+        if let Some(n) = ntfs_volume_len(target) {
+            full = full.max(n);
         }
-        Err(e) => {
-            drop(out);
-            let _ = fs::remove_file(target);
-            Err(e.into())
+        if f.metadata()?.len() < full {
+            f.set_len(full)?;
         }
+        f.sync_all()?;
+        Ok(r)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(target);
     }
+    res
 }
 
 #[cfg(test)]
@@ -165,6 +170,13 @@ mod tests {
         fs::write(&p, &b).unwrap();
         assert_eq!(ntfs_volume_len(&p), Some(234_436_608 * 512));
         fs::write(&p, vec![0u8; 512]).unwrap();
+        assert_eq!(ntfs_volume_len(&p), None);
+        // 손상된 부트 섹터(sectors == u64::MAX 또는 곱셈 오버플로)는 패닉 없이 None
+        b[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        fs::write(&p, &b).unwrap();
+        assert_eq!(ntfs_volume_len(&p), None);
+        b[40..48].copy_from_slice(&(u64::MAX / 512).to_le_bytes());
+        fs::write(&p, &b).unwrap();
         assert_eq!(ntfs_volume_len(&p), None);
     }
 

@@ -115,6 +115,8 @@ pub struct SearchFileEntry {
     pub blob_id: Option<String>,
     #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub src: Option<u32>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -165,6 +167,28 @@ impl SearchManifest {
             }
             Some(v) => v.to_string(),
             None => String::new(),
+        }
+    }
+
+    pub fn source_roots(&self) -> Vec<String> {
+        match &self.sources {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect(),
+            Some(serde_json::Value::String(s)) => s
+                .split(';')
+                .filter(|x| !x.trim().is_empty())
+                .map(|x| x.to_string())
+                .collect(),
+            _ => self
+                .source_root
+                .as_deref()
+                .unwrap_or("")
+                .split(';')
+                .filter(|x| !x.trim().is_empty())
+                .map(|x| x.to_string())
+                .collect(),
         }
     }
 
@@ -248,18 +272,7 @@ pub fn search_snapshots(
     }
 
     let q_lower = q_clean.to_lowercase();
-    #[allow(clippy::if_same_then_else)]
-    let query_chosung = if enable_chosung && is_chosung_query(q_clean) {
-        Some(q_clean)
-    } else if enable_chosung
-        && q_clean
-            .chars()
-            .any(|c| (0xAC00..=0xD7A3).contains(&(c as u32)))
-    {
-        Some(q_clean)
-    } else {
-        None
-    };
+    let query_chosung = (enable_chosung && is_chosung_query(q_clean)).then_some(q_clean);
 
     let snapshots_dir = repo_dir.join("snapshots");
     if !snapshots_dir.is_dir() || max_snapshots == 0 {
@@ -349,6 +362,7 @@ pub fn search_snapshots(
         });
 
         let s_root = manifest.source_root();
+        let s_roots = manifest.source_roots();
 
         let files = manifest.take_files();
 
@@ -371,14 +385,19 @@ pub fn search_snapshots(
                 continue;
             }
 
-            // Clean full path: do not concatenate if s_root contains multiple roots separated by ';'
-            let full_path = if s_root.is_empty() || s_root.contains(';') {
+            let entry_root = s_roots
+                .get(entry.src.unwrap_or(0) as usize)
+                .map(String::as_str)
+                .unwrap_or(s_root.as_str());
+
+            // Clean full path: do not concatenate if entry_root contains multiple roots separated by ';'
+            let full_path = if entry_root.is_empty() || entry_root.contains(';') {
                 rel_path.clone()
             } else {
                 format!(
                     "{}\\{}",
-                    s_root.trim_end_matches('\\'),
-                    rel_path.trim_start_matches('\\')
+                    entry_root.trim_end_matches(['\\', '/']),
+                    rel_path.trim_start_matches(['\\', '/'])
                 )
             };
 
@@ -411,7 +430,7 @@ pub fn search_snapshots(
                         filename,
                         path: full_path,
                         rel_path,
-                        source_root: s_root.clone(),
+                        source_root: entry_root.to_string(),
                         relevance: score,
                         version_count: 1,
                         latest_snapshot_id: sid.clone(),
@@ -495,5 +514,30 @@ mod tests {
 
         let score_path = calculate_score("data.csv", "documents/reports/data.csv", "reports", None);
         assert_eq!(score_path, 30);
+    }
+
+    #[test]
+    fn search_keeps_same_rel_path_from_different_source_roots_distinct() {
+        let d = tempfile::tempdir().unwrap();
+        let snaps = d.path().join("snapshots");
+        std::fs::create_dir_all(&snaps).unwrap();
+        let manifest = r#"{
+            "id": "s1",
+            "created_at": "2026-11-24T10:00:00+09:00",
+            "source_root": "C:\\RootA;D:\\RootB",
+            "sources": ["C:\\RootA", "D:\\RootB"],
+            "files": [
+                {"path": "docs/report.xlsx", "size": 100, "modified": 1700000000000, "src": 0},
+                {"path": "docs/report.xlsx", "size": 200, "modified": 1700000001000, "src": 1}
+            ]
+        }"#;
+        std::fs::write(snaps.join("s1.json"), manifest).unwrap();
+
+        let results = search_snapshots(d.path(), "report", 10, 50, true).unwrap();
+        assert_eq!(results.len(), 2);
+        let mut roots: Vec<String> = results.iter().map(|r| r.source_root.clone()).collect();
+        roots.sort();
+        assert_eq!(roots, vec!["C:\\RootA", "D:\\RootB"]);
+        assert!(results.iter().all(|r| r.version_count == 1));
     }
 }

@@ -184,6 +184,9 @@ impl CryptoEngine {
         plain_hash: &str,
         level: i32,
     ) -> Result<(PathBuf, bool), CryptoError> {
+        if !crate::offsite::valid_hash(plain_hash) {
+            return Err(CryptoError::Corrupt(format!("잘못된 해시: {plain_hash:?}")));
+        }
         let dir = repo.join("blobs").join(&plain_hash[..2]);
         let path = dir.join(format!("{plain_hash}.blob"));
         if fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
@@ -313,5 +316,20 @@ mod tests {
         let blob = unhex("454e430196f322604aeda5195cbc4c7360ae23da47e27ad43253f44bf528723ef79a6e33bb13bd5580caf7c835805fee0c5951e5c6f9f80c831f5e1fef4609588048").unwrap();
         let plain = CryptoEngine::new(&key).decrypt_blob(&blob, h).unwrap();
         assert_eq!(plain, "호환성 시험 ".repeat(50).into_bytes());
+    }
+
+    #[test]
+    fn save_blob_atomic_rejects_invalid_hashes_without_panicking() {
+        let d = tempfile::tempdir().unwrap();
+        let e = CryptoEngine::new(&[3u8; 32]);
+        for bad in ["", "a", "../evil", "한글", "zz01"] {
+            assert!(
+                matches!(
+                    e.save_blob_atomic(d.path(), b"data", bad, 1),
+                    Err(CryptoError::Corrupt(_))
+                ),
+                "{bad:?}"
+            );
+        }
     }
 }

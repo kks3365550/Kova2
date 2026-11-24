@@ -166,6 +166,12 @@ impl Default for Settings {
     }
 }
 
+fn grant_users_modify(path: &Path) {
+    if cfg!(windows) {
+        let _ = crate::worm::icacls(path, &["/grant", "*S-1-5-32-545:(M)", "/q"]);
+    }
+}
+
 /// 서비스(SYSTEM)와 일반 사용자 앱이 함께 쓰는 설정 파일에 Users 수정 권한을 준다(비밀 파일에는 쓰지 않는다).
 /// 서비스가 새로 만든 파일은 폴더 상속(Users 읽기만)을 받아 앱이 저장하지 못하게 되기 때문이다.
 /// 프로세스마다 경로별로 한 번만 시도한다(이후 저장은 ACL 을 보존하는 교체로 유지된다).
@@ -181,14 +187,12 @@ pub(crate) fn grant_users_modify_once(path: &Path) {
         return;
     }
     drop(g);
-    if cfg!(windows) {
-        let _ = crate::worm::icacls(path, &["/grant", "*S-1-5-32-545:(M)", "/q"]);
-    }
+    grant_users_modify(path);
 }
 
-/// `replacement` 로 `target` 을 바꾼다. 기존 파일이 있으면 ReplaceFileW 로 기존 파일의 ACL·속성을 유지하고,
-/// 실패하거나 없으면 rename 한다.
-fn replace_preserving_acl(replacement: &Path, target: &Path) -> io::Result<()> {
+/// `replacement` 로 `target` 을 바꾼다. 기존 파일이 있으면 ReplaceFileW 로 기존 파일의 ACL·속성을 유지하고(`Ok(true)`),
+/// 실패하거나 없으면 rename 한다(`Ok(false)`).
+fn replace_preserving_acl(replacement: &Path, target: &Path) -> io::Result<bool> {
     #[cfg(windows)]
     if target.exists() {
         use std::os::windows::ffi::OsStrExt;
@@ -216,10 +220,11 @@ fn replace_preserving_acl(replacement: &Path, target: &Path) -> io::Result<()> {
             )
         };
         if ok != 0 {
-            return Ok(());
+            return Ok(true);
         }
     }
-    fs::rename(replacement, target)
+    fs::rename(replacement, target)?;
+    Ok(false)
 }
 
 /// 공유 설정 파일의 원자적 저장: 고유한 임시 이름에 쓰고 디스크에 내려쓴 뒤 교체한다(동시 저장끼리 임시 파일을 밟지 않게).
@@ -249,8 +254,12 @@ pub(crate) fn atomic_write_shared(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if r.is_err() {
         let _ = fs::remove_file(&tmp);
     }
-    r?;
-    grant_users_modify_once(path);
+    let preserved = r?;
+    if preserved {
+        grant_users_modify_once(path);
+    } else {
+        grant_users_modify(path);
+    }
     Ok(())
 }
 
@@ -275,14 +284,13 @@ pub(crate) fn lock_shared(lock_path: &Path) -> Option<fs::File> {
 
 /// 손상 파일을 `.json.bak` 으로 보존한다. 이미 다른 내용의 .bak 이 있으면 시각을 붙인 이름으로 남긴다.
 fn preserve_corrupt(path: &Path, raw: &[u8]) -> PathBuf {
-    let mut bak: PathBuf = path.into();
-    bak.set_extension("json.bak");
+    let mut bak = path.with_extension("json.bak");
     if fs::read(&bak).is_ok_and(|b| b != raw) {
         let t = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        bak.set_extension(format!("json.bak.{t}"));
+        bak = path.with_extension(format!("json.bak.{t}"));
     }
     let _ = fs::write(&bak, raw);
     bak
@@ -523,5 +531,22 @@ mod tests {
         assert_eq!(s.server_port, 8765);
         st.save_settings(&s).unwrap();
         assert_eq!(st.settings(), s);
+    }
+
+    #[test]
+    fn preserve_corrupt_timestamp_fallback_does_not_duplicate_json_extension() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("profiles.json");
+        let bak1 = preserve_corrupt(&p, b"{broken1");
+        assert_eq!(
+            bak1.file_name().unwrap().to_string_lossy(),
+            "profiles.json.bak"
+        );
+        let bak2 = preserve_corrupt(&p, b"{broken2");
+        let name2 = bak2.file_name().unwrap().to_string_lossy();
+        assert!(name2.starts_with("profiles.json.bak."), "{name2}");
+        assert!(!name2.contains(".json.json."), "{name2}");
+        assert_eq!(fs::read(&bak1).unwrap(), b"{broken1");
+        assert_eq!(fs::read(&bak2).unwrap(), b"{broken2");
     }
 }

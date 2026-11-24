@@ -1,17 +1,73 @@
 //! 디스크 건강·BitLocker 점검(읽기 전용). 결과는 그대로 문장으로 돌려주며, 실패해도 진단을 막지 않는다.
 
+/// 콘솔 명령 출력 바이트를 문자열로 복호화한다.
+/// 유효한 UTF-8 이면 그대로 쓰고, 아니면 Windows 에서는 현재 OEM 코드페이지(CP949 등)로 변환한다.
+pub(crate) fn decode_console_output(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    #[cfg(windows)]
+    if let Some(s) = decode_oem_cp(bytes) {
+        return s;
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn decode_oem_cp(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let in_len = i32::try_from(bytes.len()).ok()?;
+    const CP_OEMCP: u32 = 1;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            dw_flags: u32,
+            lp_multi_byte_str: *const u8,
+            cb_multi_byte: i32,
+            lp_wide_char_str: *mut u16,
+            cch_wide_char: i32,
+        ) -> i32;
+    }
+    let needed = unsafe {
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), in_len, std::ptr::null_mut(), 0)
+    };
+    if needed <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; needed as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            CP_OEMCP,
+            0,
+            bytes.as_ptr(),
+            in_len,
+            wide.as_mut_ptr(),
+            needed,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+    wide.truncate(written as usize);
+    Some(String::from_utf16_lossy(&wide))
+}
+
 #[cfg(windows)]
 fn ps(script: &str) -> String {
     use std::os::windows::process::CommandExt;
+    let full = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8;{script}");
     let out = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &full])
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output();
     match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) if o.status.success() => decode_console_output(&o.stdout).trim().to_string(),
         Ok(o) => format!(
             "(조회 실패: {})",
-            String::from_utf8_lossy(&o.stderr)
+            decode_console_output(&o.stderr)
                 .trim()
                 .lines()
                 .next()
@@ -129,8 +185,8 @@ pub fn bitlocker_recovery_key_c() -> Result<String, String> {
             .output()
             .map_err(|e| format!("manage-bde 실행 실패: {e}"))?;
 
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = decode_console_output(&out.stdout);
+        let stderr = decode_console_output(&out.stderr);
 
         if let Some(key) = parse_bitlocker_recovery_key(&stdout) {
             return Ok(key);
@@ -342,5 +398,17 @@ BitLocker 드라이브 암호화: 구성 도구 버전 10.0.26100
             "평문 키 대신 [REDACTED] 마스킹이 적용되어야 합니다"
         );
         assert!(debug_str.contains("11223344-5566-7788-9900-aabbccddeeff"));
+    }
+
+    #[test]
+    fn decode_console_output_preserves_utf8_and_handles_non_utf8() {
+        assert_eq!(
+            decode_console_output("한글 출력 테스트".as_bytes()),
+            "한글 출력 테스트"
+        );
+        assert_eq!(decode_console_output(b""), "");
+        // 비-UTF8 바이트(CP949 "거부": 0xB0 0xC5 0xBA 0xCE)도 패닉 없이 복호화한다
+        let decoded = decode_console_output(&[0xB0, 0xC5, 0xBA, 0xCE]);
+        assert!(!decoded.is_empty());
     }
 }

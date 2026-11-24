@@ -119,12 +119,17 @@ pub fn harden(path: &Path) -> Result<(), String> {
 /// 비밀 파일 쓰기: 빈 임시 파일을 먼저 잠근 뒤 내용을 쓰고 이름을 바꾼다(잠기기 전 내용이 보이는 틈이 없다).
 pub fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
-    let _ = fs::remove_file(&tmp);
+    let tmp = path.with_file_name(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let write = || -> Result<(), String> {
         fs::OpenOptions::new()
             .write(true)

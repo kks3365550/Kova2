@@ -177,7 +177,7 @@ pub fn assess_manifest(manifest_path: &Path, cfg: &AnomalyConfig) -> Option<Anom
     )
     .map(|r| r.reasons)
     .unwrap_or_default();
-    if d.had_previous && d.previous_files >= cfg.min_files_for_ratio {
+    if d.had_previous && d.previous_files > 0 && d.previous_files >= cfg.min_files_for_ratio {
         let pct = ((d.deleted_files as u64) * 100 / (d.previous_files as u64)) as u32;
         if pct >= cfg.delete_ratio_percent {
             reasons.push(format!(
@@ -205,7 +205,7 @@ pub fn detect(
             "랜섬웨어 의심 확장자 파일 {suspect_ext_count}개 감지"
         ));
     }
-    if had_previous && total_files >= cfg.min_files_for_ratio {
+    if had_previous && total_files > 0 && total_files >= cfg.min_files_for_ratio {
         let changed = new_files.saturating_add(modified_files);
         let pct = ((changed as u64) * 100 / (total_files as u64)) as u32;
         if pct >= cfg.change_ratio_percent {
@@ -343,5 +343,18 @@ mod tests {
         assert!(is_suspect_extension("invoice.pdf.lockbit"));
         assert!(!is_suspect_extension("C:\\docs\\report.xlsx"));
         assert!(!is_suspect_extension("C:\\docs\\archive.zip"));
+    }
+
+    #[test]
+    fn zero_min_files_and_zero_totals_do_not_divide_by_zero() {
+        let cfg = AnomalyConfig {
+            min_files_for_ratio: 0,
+            ..AnomalyConfig::default()
+        };
+        assert!(detect(0, 0, 0, 0, true, &cfg).is_none());
+        let d = tempfile::tempdir().unwrap();
+        write_manifest(d.path(), "s1", Some("p"), &[], 0);
+        let p2 = write_manifest(d.path(), "s2", Some("p"), &[], 0);
+        assert!(assess_manifest(&p2, &cfg).is_none());
     }
 }

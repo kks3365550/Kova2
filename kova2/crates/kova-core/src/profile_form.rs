@@ -42,18 +42,17 @@ pub fn build(
     }
     let srcs: Vec<String> = sources
         .split(';')
-        .map(|s| s.trim().trim_matches('"').trim().to_string())
+        .map(|s| s.trim().trim_matches('"').trim().replace('/', "\\"))
         .filter(|s| !s.is_empty())
         .collect();
     if srcs.is_empty() {
         return Err("백업할 폴더를 입력하세요 (여러 개는 ; 로 구분)".into());
     }
     for s in &srcs {
-        let s = s.replace('/', "\\");
-        if !abs_ok(&s) {
+        if !abs_ok(s) {
             return Err(format!("백업 대상은 전체 경로여야 합니다: {s}"));
         }
-        if !Path::new(&s).exists() {
+        if !Path::new(s).exists() {
             return Err(format!("백업 대상이 없습니다: {s}"));
         }
     }
@@ -160,6 +159,14 @@ pub fn schedule_text(p: &Profile) -> String {
     }
     match p.schedule_type.as_str() {
         "daily" => format!("매일 {}", p.schedule_value),
+        "weekly" => match p.schedule_value.split_once('@') {
+            Some((d, t)) => format!("매주 {d} {t}"),
+            None => format!("매주 {}", p.schedule_value),
+        },
+        "monthly" => match p.schedule_value.split_once('@') {
+            Some((d, t)) => format!("매월 {d}일 {t}"),
+            None => format!("매월 {}", p.schedule_value),
+        },
         _ => format!("{}시간마다", p.schedule_value),
     }
 }
@@ -258,5 +265,29 @@ mod tests {
         assert_eq!(a.extra["keep_monthly"], 0);
         assert!(apply_keep(p.clone(), "x", "0").is_err());
         assert!(apply_keep(p, "0", "9999").is_err());
+    }
+
+    #[test]
+    fn build_normalizes_source_slashes_and_schedule_text_handles_weekly_monthly() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let src_slash = src.to_str().unwrap().replace('\\', "/");
+        let repo = d.path().join("repo").to_str().unwrap().to_string();
+        let p = build(None, "n1", "정규화", &src_slash, &repo, "10", "30", &[]).unwrap();
+        assert!(!p.sources[0].contains('/'), "{:?}", p.sources);
+        assert_eq!(p.sources[0], src.to_str().unwrap());
+
+        let mut w = Profile::new("w", "W");
+        w.auto_backup_enabled = true;
+        w.schedule_type = "weekly".into();
+        w.schedule_value = "MON,WED@03:00".into();
+        assert_eq!(schedule_text(&w), "매주 MON,WED 03:00");
+
+        let mut m = Profile::new("m", "M");
+        m.auto_backup_enabled = true;
+        m.schedule_type = "monthly".into();
+        m.schedule_value = "15@02:30".into();
+        assert_eq!(schedule_text(&m), "매월 15일 02:30");
     }
 }

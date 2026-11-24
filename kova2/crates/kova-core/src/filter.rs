@@ -106,48 +106,77 @@ const VOLATILE_DIRS: &[&str] = &[
 ];
 
 /// 파이썬 fnmatch 호환 글롭(`*`, `?`, `[seq]`, `[!seq]`). 입력은 이미 소문자.
+/// 반복적 투포인터 구현으로 최악의 와일드카드 조합에서도 O(n * m) 안에 끝난다.
 pub fn fnmatch(text: &str, pat: &str) -> bool {
-    fn go(t: &[char], p: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') => (0..=t.len()).any(|i| go(&t[i..], &p[1..])),
-            Some('?') => !t.is_empty() && go(&t[1..], &p[1..]),
-            Some('[') => {
-                if let Some(end) = p.iter().skip(2).position(|&c| c == ']').map(|i| i + 2) {
-                    if t.is_empty() {
-                        return false;
-                    }
-                    let (neg, set) = if p[1] == '!' {
-                        (true, &p[2..end])
-                    } else {
-                        (false, &p[1..end])
-                    };
-                    let mut hit = false;
-                    let mut i = 0;
-                    while i < set.len() {
-                        if i + 2 < set.len() && set[i + 1] == '-' {
-                            if set[i] <= t[0] && t[0] <= set[i + 2] {
-                                hit = true;
-                            }
-                            i += 3;
-                        } else {
-                            if set[i] == t[0] {
-                                hit = true;
-                            }
-                            i += 1;
-                        }
-                    }
-                    hit != neg && go(&t[1..], &p[end + 1..])
-                } else {
-                    !t.is_empty() && t[0] == '[' && go(&t[1..], &p[1..])
-                }
-            }
-            Some(&c) => !t.is_empty() && t[0] == c && go(&t[1..], &p[1..]),
-        }
-    }
     let t: Vec<char> = text.chars().collect();
     let p: Vec<char> = pat.chars().collect();
-    go(&t, &p)
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            while pi < p.len() && p[pi] == '*' {
+                pi += 1;
+            }
+            star_pi = Some(pi);
+            star_ti = ti;
+            continue;
+        }
+        if pi < p.len() {
+            if let Some(next_pi) = match_one(t[ti], &p, pi) {
+                ti += 1;
+                pi = next_pi;
+                continue;
+            }
+        }
+        if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn match_one(ch: char, p: &[char], pi: usize) -> Option<usize> {
+    match p[pi] {
+        '?' => Some(pi + 1),
+        '[' => {
+            if let Some(rel_end) = p[pi..].iter().skip(2).position(|&c| c == ']') {
+                let end = pi + 2 + rel_end;
+                let (neg, set) = if p[pi + 1] == '!' {
+                    (true, &p[pi + 2..end])
+                } else {
+                    (false, &p[pi + 1..end])
+                };
+                let mut hit = false;
+                let mut i = 0;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        if set[i] <= ch && ch <= set[i + 2] {
+                            hit = true;
+                        }
+                        i += 3;
+                    } else {
+                        if set[i] == ch {
+                            hit = true;
+                        }
+                        i += 1;
+                    }
+                }
+                (hit != neg).then_some(end + 1)
+            } else {
+                (ch == '[').then_some(pi + 1)
+            }
+        }
+        c => (ch == c).then_some(pi + 1),
+    }
 }
 
 fn norm(p: &str) -> String {
@@ -199,7 +228,7 @@ impl PathFilter {
                 continue;
             }
             let has_wild = |s: &str| s.contains(['*', '?', '[']);
-            if p.starts_with("*.") {
+            if p.starts_with("*.") && !has_wild(&p[2..]) && !p[2..].contains('.') {
                 exts.insert(p[1..].to_string());
             } else if p.starts_with('*')
                 && p.ends_with('*')
@@ -222,6 +251,14 @@ impl PathFilter {
         }
     }
 
+    fn protected_match(&self, np: &str) -> Option<&str> {
+        self.protected.iter().map(String::as_str).find(|p| {
+            let p = p.trim_end_matches('/');
+            !p.is_empty()
+                && (np == p || np.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
+        })
+    }
+
     fn matches_common(&self, name: &str) -> bool {
         self.exact.contains(name)
             || self.substrs.iter().any(|s| name.contains(s.as_str()))
@@ -236,7 +273,7 @@ impl PathFilter {
         let dn = dirname.to_lowercase();
         if let Some(fp) = full_path {
             let nf = norm(fp);
-            if self.protected.iter().any(|p| nf.starts_with(p.as_str())) {
+            if self.protected_match(&nf).is_some() {
                 // 보호 구역 안에서는 순수 휘발성 캐시만 제외 (venv, node_modules 등은 통과)
                 return VOLATILE_DIRS.contains(&dn.as_str()) || dn == "__pycache__";
             }
@@ -272,6 +309,21 @@ impl PathFilter {
             return true;
         }
         let np = norm(path);
+        if let Some(pref) = self.protected_match(&np) {
+            let rel = np
+                .strip_prefix(pref.trim_end_matches('/'))
+                .unwrap_or("")
+                .trim_start_matches('/');
+            let dirs = if is_dir {
+                rel
+            } else {
+                rel.rsplit_once('/').map_or("", |(parent, _)| parent)
+            };
+            return dirs
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .any(|part| VOLATILE_DIRS.contains(&part) || part == "__pycache__");
+        }
         if np.split('/').any(|part| self.exact.contains(part)) {
             return true;
         }
@@ -329,5 +381,35 @@ mod tests {
         let f = PathFilter::new(&[], true, &[r"C:\ai\runtime".to_string()]);
         assert!(!f.is_dir_excluded("node_modules", Some(r"C:\ai\runtime\node_modules")));
         assert!(f.is_dir_excluded("cache", Some(r"C:\ai\runtime\cache")));
+        // is_excluded 도 보호 구역을 존중해야 한다
+        assert!(!f.is_excluded(r"C:\ai\runtime\node_modules", true));
+        assert!(!f.is_excluded(r"C:\ai\runtime\node_modules\pkg\index.js", false));
+        assert!(!f.is_excluded(r"C:\ai\runtime\venv\lib\site.py", false));
+        assert!(f.is_excluded(r"C:\ai\runtime\cache", true));
+        assert!(f.is_excluded(r"C:\ai\runtime\cache\item.dat", false));
+        assert!(f.is_excluded(r"C:\ai\runtime\venv\__pycache__\a.dat", false));
+        // 보호 구역 바깥의 비슷한 접두어 경로는 보호하지 않는다
+        assert!(f.is_excluded(r"C:\ai\runtime2\node_modules\a.js", false));
+    }
+
+    #[test]
+    fn compound_extension_and_wildcard_extension_patterns_match() {
+        let f = PathFilter::new(&["*.tar.gz".to_string(), "*.log*".to_string()], false, &[]);
+        assert!(f.is_file_excluded("backup.tar.gz"));
+        assert!(!f.is_file_excluded("backup.gz"));
+        assert!(f.is_file_excluded("app.log"));
+        assert!(f.is_file_excluded("app.log.1"));
+        assert!(!f.is_file_excluded("app.txt"));
+    }
+
+    #[test]
+    fn fnmatch_handles_pathological_wildcards_quickly() {
+        let text = "a".repeat(80);
+        let pat = format!("{}b", "*a".repeat(20));
+        assert!(!fnmatch(&text, &pat));
+        assert!(fnmatch(&format!("{text}b"), &pat));
+        assert!(fnmatch("axbxb", "a**b"));
+        assert!(fnmatch("a", "a***"));
+        assert!(fnmatch("", "***"));
     }
 }

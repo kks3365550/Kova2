@@ -73,25 +73,6 @@ fn is_healthy(path: &Path) -> bool {
     }
 }
 
-fn ts_of(v: &Value) -> f64 {
-    match v {
-        Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        Value::String(s) => {
-            if let Ok(f) = s.parse::<f64>() {
-                return f;
-            }
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|d| d.timestamp() as f64)
-                .or_else(|_| {
-                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-                        .map(|d| d.and_utc().timestamp() as f64)
-                })
-                .unwrap_or(0.0)
-        }
-        _ => 0.0,
-    }
-}
-
 impl History {
     /// 저장소의 metadata.db 를 연다. 손상되었으면 `.corrupt_<ms>` 로 격리하고 새로 만든다.
     pub fn open(repo: &Path) -> rusqlite::Result<Self> {
@@ -126,7 +107,11 @@ impl History {
             .and_then(Value::as_array);
         SnapshotRow {
             id: id.to_string(),
-            created_at: v.get("created_at").map(ts_of).unwrap_or(mtime),
+            created_at: v
+                .get("created_at")
+                .map(crate::retention::parse_timestamp)
+                .filter(|t| *t > 0.0)
+                .unwrap_or(mtime),
             profile_id: s("profile_id"),
             profile_name: s("profile_name"),
             total_files: v
@@ -438,5 +423,35 @@ mod tests {
         assert_eq!(h.rebuild_blobs_summary(1.0).unwrap(), (1, 5));
         assert_eq!(h.blobs_summary().unwrap(), Some((1, 5)));
         assert!(h.checkpoint());
+    }
+
+    #[test]
+    fn created_at_handles_milliseconds_and_null_fallback_to_mtime() {
+        let d = tempfile::tempdir().unwrap();
+        manifest(
+            d.path(),
+            "ms",
+            r#"{"created_at":1700000000000,"total_files":1}"#,
+        );
+        manifest(
+            d.path(),
+            "null_ts",
+            r#"{"created_at":null,"total_files":1}"#,
+        );
+        manifest(
+            d.path(),
+            "bad_ts",
+            r#"{"created_at":"not-a-date","total_files":1}"#,
+        );
+        let mut h = History::open(d.path()).unwrap();
+        h.sync_snapshots().unwrap();
+        let ms = h.get_snapshot("ms").unwrap().unwrap();
+        assert_eq!(ms.created_at, 1_700_000_000.0);
+        let null_ts = h.get_snapshot("null_ts").unwrap().unwrap();
+        assert!(null_ts.created_at > 1_000_000_000.0);
+        assert!((null_ts.created_at - null_ts.file_mtime).abs() < 1e-6);
+        let bad_ts = h.get_snapshot("bad_ts").unwrap().unwrap();
+        assert!(bad_ts.created_at > 1_000_000_000.0);
+        assert!((bad_ts.created_at - bad_ts.file_mtime).abs() < 1e-6);
     }
 }

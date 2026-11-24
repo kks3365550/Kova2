@@ -488,11 +488,30 @@ fn open_url(url: &str) {
 }
 
 /// 오프사이트 제공자를 바꾼다(서비스가 gdrive 일 때만 드라이브로 복제).
-fn set_offsite_provider(p: &str) {
-    let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
+fn set_offsite_provider_in(store: &kova_core::config::ConfigStore, p: &str) {
     let mut s = store.settings();
     s.offsite_provider = p.into();
+    s.offsite_enabled = p == "gdrive";
     let _ = store.save_settings(&s);
+}
+
+fn set_offsite_provider(p: &str) {
+    let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
+    set_offsite_provider_in(&store, p);
+}
+
+/// 설정 저장·작업 결과 문구와 오류 여부를 화면에 반영한다.
+fn set_settings_msg(w: &MainWindow, res: Result<String, String>) {
+    match res {
+        Ok(m) => {
+            w.set_settings_err(false);
+            w.set_settings_text(m.into());
+        }
+        Err(m) => {
+            w.set_settings_err(true);
+            w.set_settings_text(m.into());
+        }
+    }
 }
 
 /// 홈 화면의 "진행 중" 목록 한 줄(서비스 이벤트로 갱신).
@@ -861,15 +880,17 @@ fn build_pe_ps_args(
     pe_exe: &std::path::Path,
     drivers_dir: &str,
 ) -> String {
-    let q = |s: &str| s.replace('\'', "''");
+    // PowerShell `-File`은 CommandLineToArgvW 규칙으로 인자를 파싱하므로 큰따옴표("...")를 쓰고,
+    // 바깥 PowerShell 단일 인용 문자열('...')에 안전하게 들어가도록 ' 는 '' 로 이스케이프한다.
+    let q = |s: &str| s.replace('"', "\\\"").replace('\'', "''");
     let mut args = format!(
-        "-NoProfile -ExecutionPolicy Bypass -File '{}' -Out '{}' -Exe '{}'",
+        "-NoProfile -ExecutionPolicy Bypass -File \"{}\" -Out \"{}\" -Exe \"{}\"",
         q(&script.to_string_lossy()),
         q(&out_iso.to_string_lossy()),
         q(&pe_exe.to_string_lossy()),
     );
     if !drivers_dir.trim().is_empty() {
-        args.push_str(&format!(" -DriversDir '{}'", q(drivers_dir.trim())));
+        args.push_str(&format!(" -DriversDir \"{}\"", q(drivers_dir.trim())));
     }
     args
 }
@@ -907,10 +928,8 @@ fn run_build_pe_iso(iso_out: &str, drivers_dir: &str) -> String {
         return format!("추가 드라이버 폴더를 찾을 수 없습니다: {effective_drivers_dir}");
     }
     let inner_args = build_pe_ps_args(&script, &out_iso, &pe_exe, &effective_drivers_dir);
-    let q = |s: &str| s.replace('\'', "''");
     let cmd = format!(
-        "Start-Process -FilePath 'powershell.exe' -ArgumentList '{}' -Verb RunAs -Wait",
-        q(&inner_args)
+        "$ErrorActionPreference = 'Stop'; $p = Start-Process -FilePath 'powershell.exe' -ArgumentList '{inner_args}' -Verb RunAs -PassThru -Wait; exit $p.ExitCode"
     );
     use std::os::windows::process::CommandExt;
     match std::process::Command::new("powershell.exe")
@@ -936,14 +955,17 @@ fn run_build_pe_iso(iso_out: &str, drivers_dir: &str) -> String {
 }
 
 /// 현재 PC의 서드파티(NVMe, 네트워크) 드라이버를 자동 수집(덤프)한다.
-fn run_export_drivers(dest_override: Option<&std::path::Path>) -> String {
+fn run_export_drivers(dest_override: Option<&std::path::Path>) -> Result<String, String> {
     let dest = dest_override
         .map(std::path::PathBuf::from)
         .unwrap_or_else(kova_pe::plan::default_driver_export_dir);
-    match kova_pe::plan::export_drivers(&dest) {
-        Ok(msg) => msg,
-        Err(e) => format!("드라이버 수집 실패: {e}"),
-    }
+    kova_pe::plan::export_drivers(&dest).map_err(|e| {
+        if e.starts_with("드라이버 수집 실패") {
+            e
+        } else {
+            format!("드라이버 수집 실패: {e}")
+        }
+    })
 }
 
 /// 모든 프로파일의 저장소를 가로질러 파일명/초성으로 통합 검색하고 시점별 버전 수를 집계한다.
@@ -1148,6 +1170,33 @@ fn snaps() -> Vec<SnapRow> {
     all.into_iter().take(50).map(|x| x.1).collect()
 }
 
+/// 현재 Windows 시스템 드라이브 문자(기본 'C').
+fn system_drive_letter() -> char {
+    std::env::var("SystemDrive")
+        .ok()
+        .and_then(|s| s.chars().next())
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('C')
+}
+
+/// 저장소 경로가 놓인 드라이브의 여유 공간 문구와 사용률(%)을 구한다.
+fn repo_drive_usage(main_repo: &str) -> (String, i32) {
+    let trimmed = main_repo.trim();
+    if trimmed.is_empty() {
+        return (String::new(), 0);
+    }
+    let path = std::path::Path::new(trimmed);
+    let target = path.ancestors().find(|p| p.exists()).unwrap_or(path);
+    let Some((total, avail)) = kova_core::diskspace::usage(target) else {
+        return (String::new(), 0);
+    };
+    let used = total.saturating_sub(avail);
+    let pct = ((used as f64 * 100.0 / total as f64).round() as i32).clamp(0, 100);
+    let free = format!("{:.1} GB 여유", avail as f64 / 1_073_741_824.0);
+    (free, pct)
+}
+
 /// 홈 화면의 "내 드라이브와 백업 보관함": 존재하는 드라이브별 사용률. 백업 저장소가 있는 드라이브를 표시한다.
 fn drive_rows() -> Vec<DriveRow> {
     let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
@@ -1156,6 +1205,7 @@ fn drive_rows() -> Vec<DriveRow> {
         .iter()
         .map(|p| p.repo_dir.to_uppercase())
         .collect();
+    let sys_letter = system_drive_letter();
     let gb = |b: u64| format!("{:.1} GB", b as f64 / 1_073_741_824.0);
     let mut v = Vec::new();
     for l in b'C'..=b'Z' {
@@ -1167,14 +1217,14 @@ fn drive_rows() -> Vec<DriveRow> {
             continue;
         };
         let used = total.saturating_sub(avail);
+        let ch = l as char;
         v.push(DriveRow {
-            name: format!("{}:", l as char).into(),
+            name: format!("{ch}:").into(),
             pct: (used as f64 * 100.0 / total as f64).round() as i32,
             used: gb(used).into(),
             free: gb(avail).into(),
-            repo: repos
-                .iter()
-                .any(|r| r.starts_with(&format!("{}:", l as char))),
+            repo: repos.iter().any(|r| r.starts_with(&format!("{ch}:"))),
+            sys: ch.eq_ignore_ascii_case(&sys_letter),
         });
     }
     v
@@ -1383,17 +1433,17 @@ fn delete_image_file(path: &str) -> Result<(), String> {
         return Err("백업 보관함의 images 폴더 밖 파일은 지우지 않습니다".into());
     }
     if let Err(e) = std::fs::remove_file(&canon) {
-        // 읽기 전용(랜섬웨어 보호)이면 속성을 풀고 한 번 더 시도
-        if let Ok(md) = std::fs::metadata(&canon) {
-            let mut perm = md.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            // 윈도우 전용 앱: 읽기 전용 속성만 푼다
-            perm.set_readonly(false);
-            let _ = std::fs::set_permissions(&canon, perm);
+        if let Err(e2) = kova_core::worm::remove_protected(&canon) {
+            if e2.kind() == std::io::ErrorKind::PermissionDenied {
+                return Err(
+                    "랜섬웨어 보호(WORM)로 잠긴 이미지입니다. 관리자 권한으로 앱을 실행해 삭제해 주세요"
+                        .into(),
+                );
+            }
+            return Err(format!("지우지 못했습니다: {e2} ({e})"));
         }
-        std::fs::remove_file(&canon).map_err(|e2| format!("지우지 못했습니다: {e2} ({e})"))?;
     }
-    let _ = std::fs::remove_file(verified_marker(&canon));
+    let _ = kova_core::worm::remove_protected(&verified_marker(&canon));
     Ok(())
 }
 
@@ -1426,8 +1476,26 @@ fn changed_only<T: PartialEq + Clone>(last: &mut Option<Vec<T>>, new: Vec<T>) ->
     }
 }
 
+/// 서비스가 유휴(running == 0)로 응답했고 그사이 새 작업 이벤트가 오지 않았을 때만 공유 running 목록을 비운다.
+fn try_clear_idle_running(
+    running: &std::sync::Mutex<Vec<RunInfo>>,
+    event_seq: &std::sync::atomic::AtomicU64,
+    seq_before: u64,
+) -> bool {
+    let mut r = running.lock().unwrap();
+    if event_seq.load(std::sync::atomic::Ordering::SeqCst) == seq_before {
+        r.clear();
+        true
+    } else {
+        false
+    }
+}
+
 /// 서비스와 통신하는 백그라운드 스레드: 상태 폴링 + 이벤트 구독. 화면 갱신은 이벤트 루프로 넘긴다.
-fn spawn_ipc(weak: slint::Weak<MainWindow>) {
+fn spawn_ipc(
+    weak: slint::Weak<MainWindow>,
+    banner_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
     let rt = std::sync::Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1435,7 +1503,12 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
             .build()
             .unwrap(),
     );
-    let (w1, rt1) = (weak.clone(), rt.clone());
+    let running: std::sync::Arc<std::sync::Mutex<Vec<RunInfo>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let event_seq: std::sync::Arc<std::sync::atomic::AtomicU64> =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (w1, rt1, running_poll, seq_poll) =
+        (weak.clone(), rt.clone(), running.clone(), event_seq.clone());
     std::thread::spawn(move || {
         rt1.block_on(async move {
             let mut last_off: Option<Vec<(String, String, String)>> = None;
@@ -1446,6 +1519,7 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
             let mut last_alerts: Option<Vec<AlertRow>> = None;
             let mut last_lines: Option<Vec<slint::SharedString>> = None;
             loop {
+                let seq_before = seq_poll.load(std::sync::atomic::Ordering::SeqCst);
                 let status_res =
                     kova_ipc::request(kova_ipc::PIPE_NAME, &kova_ipc::Request::Status).await;
                 let is_svc_idle = match &status_res {
@@ -1484,6 +1558,7 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
                         .map(|p| p.repo_dir.clone())
                         .unwrap_or_default()
                         .into();
+                let (repo_drive_free, repo_drive_pct) = repo_drive_usage(main_repo.as_str());
                 // 입력 중인 칸이 2초마다 초기화되지 않도록, 내용이 바뀐 때만 모델을 교체한다
                 let key: Vec<(String, String, String)> = off
                     .iter()
@@ -1508,15 +1583,27 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
                 } else {
                     String::new()
                 };
+                let should_clear_running =
+                    is_svc_idle && try_clear_idle_running(&running_poll, &seq_poll, seq_before);
+                let seq_ui = seq_poll.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = w.upgrade() {
                         if w.get_main_repo() != main_repo {
                             w.set_main_repo(main_repo);
                         }
+                        if w.get_repo_drive_free() != repo_drive_free.as_str() {
+                            w.set_repo_drive_free(repo_drive_free.into());
+                        }
+                        if w.get_repo_drive_pct() != repo_drive_pct {
+                            w.set_repo_drive_pct(repo_drive_pct);
+                        }
                         w.set_service_ok(text.starts_with("서비스 연결됨"));
                         w.set_service_status(text.into());
                         w.set_alert_text(alert.into());
-                        if is_svc_idle && w.get_running().row_count() > 0 {
+                        if should_clear_running
+                            && seq_ui.load(std::sync::atomic::Ordering::SeqCst) == seq_before
+                            && w.get_running().row_count() > 0
+                        {
                             w.set_running(
                                 std::rc::Rc::new(slint::VecModel::<RunRow>::default()).into(),
                             );
@@ -1564,12 +1651,19 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
     });
     std::thread::spawn(move || {
         rt.block_on(async move {
-            let running: std::sync::Mutex<Vec<RunInfo>> = std::sync::Mutex::new(vec![]);
             loop {
                 let w = weak.clone();
                 let _ = kova_ipc::stream(kova_ipc::PIPE_NAME, &kova_ipc::Request::Subscribe, |e| {
                     let (run_rows, finished_info) = {
                         let mut r = running.lock().unwrap();
+                        if matches!(
+                            e,
+                            kova_ipc::Event::JobStarted { .. }
+                                | kova_ipc::Event::Progress { .. }
+                                | kova_ipc::Event::JobFinished { .. }
+                        ) {
+                            event_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                         let fin = update_running(&mut r, &e, &profile_name);
                         let rows: Vec<RunRow> = r
                             .iter()
@@ -1580,6 +1674,7 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
                                 current: x.current.clone().into(),
                                 cancellable: x.cancellable,
                                 kind: x.kind.clone().into(),
+                                label: format!("{} 진행 중", kind_label(&x.kind)).into(),
                             })
                             .collect();
                         (rows, fin)
@@ -1598,6 +1693,7 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
                         });
                     }
                     if let kova_ipc::Event::JobStarted { .. } = e {
+                        banner_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let w_start = w.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(w) = w_start.upgrade() {
@@ -1612,6 +1708,8 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
                         ..
                     } = e
                     {
+                        let my_gen =
+                            banner_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         let p_name = profile_name(profile_id);
                         let action = kind_label(&finished_kind);
                         let title = if ok {
@@ -1657,13 +1755,20 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
                         });
                         if is_ok {
                             let w_auto = w.clone();
+                            let gen_ref = banner_gen.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-                                let _ = slint::invoke_from_event_loop(move || {
-                                    if let Some(w) = w_auto.upgrade() {
-                                        w.set_job_completed_show(false);
-                                    }
-                                });
+                                if gen_ref.load(std::sync::atomic::Ordering::SeqCst) == my_gen {
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if gen_ref.load(std::sync::atomic::Ordering::SeqCst)
+                                            == my_gen
+                                        {
+                                            if let Some(w) = w_auto.upgrade() {
+                                                w.set_job_completed_show(false);
+                                            }
+                                        }
+                                    });
+                                }
                             });
                         }
                     }
@@ -1706,7 +1811,11 @@ fn spawn_ipc(weak: slint::Weak<MainWindow>) {
                 })
                 .await;
                 // 연결이 끊기면 진행 중 표시를 비운다(서비스가 죽었는데 취소 버튼이 남지 않도록)
-                running.lock().unwrap().clear();
+                {
+                    let mut r = running.lock().unwrap();
+                    event_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    r.clear();
+                }
                 let w = weak.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = w.upgrade() {
@@ -1880,6 +1989,14 @@ fn apply_pick(w: &MainWindow, plan: PickPlan) {
 #[derive(Clone, Default)]
 struct BusyGate(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
+struct GateGuard(BusyGate);
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
 impl BusyGate {
     /// 비어 있으면 진행 중으로 바꾸고 true, 이미 진행 중이면 false.
     fn try_begin(&self) -> bool {
@@ -1888,6 +2005,10 @@ impl BusyGate {
     }
     fn end(&self) {
         self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// 비어 있으면 진행 중으로 바꾸고 자동 해제 가드를 돌려준다.
+    fn lock(&self) -> Option<GateGuard> {
+        self.try_begin().then(|| GateGuard(self.clone()))
     }
 }
 
@@ -2039,31 +2160,34 @@ fn ipc_done(req: &kova_ipc::Request) -> Result<String, String> {
         .ok_or_else(|| "서비스가 응답하지 않았습니다(서비스를 최신 버전으로 업데이트하세요)".into())
 }
 
+/// 서비스에 작업을 요청한다(호출자 스레드에서 동기 실행). 요청이 거절되거나 서비스에 닿지 못하면 화면의 완료 카드에 실패를 띄운다.
+fn send_sync(weak: slint::Weak<MainWindow>, kind: String, id: String) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let res = rt.block_on(kova_ipc::request(
+        kova_ipc::PIPE_NAME,
+        &kova_ipc::Request::RunNow {
+            profile_id: id,
+            kind: kind.clone(),
+        },
+    ));
+    if let Some(why) = send_failure(&res) {
+        let title = format!("{} 요청 실패", kind_label(&kind));
+        let _ = weak.upgrade_in_event_loop(move |w| {
+            w.set_job_completed_ok(false);
+            w.set_job_completed_title(title.into());
+            w.set_job_completed_msg(why.into());
+            w.set_job_completed_show(true);
+        });
+    }
+}
+
 /// 서비스에 작업을 요청한다. 요청이 거절되거나 서비스에 닿지 못하면 화면의 완료 카드에 실패를 띄운다.
 fn send(weak: slint::Weak<MainWindow>, kind: impl Into<String>, id: String) {
     let kind: String = kind.into();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let res = rt.block_on(kova_ipc::request(
-            kova_ipc::PIPE_NAME,
-            &kova_ipc::Request::RunNow {
-                profile_id: id,
-                kind: kind.clone(),
-            },
-        ));
-        if let Some(why) = send_failure(&res) {
-            let title = format!("{} 요청 실패", kind_label(&kind));
-            let _ = weak.upgrade_in_event_loop(move |w| {
-                w.set_job_completed_ok(false);
-                w.set_job_completed_title(title.into());
-                w.set_job_completed_msg(why.into());
-                w.set_job_completed_show(true);
-            });
-        }
-    });
+    std::thread::spawn(move || send_sync(weak, kind, id));
 }
 
 const UPDATE_BASE: &str = "https://github.com";
@@ -2199,9 +2323,19 @@ fn decode_install_result(raw: &str) -> (bool, String) {
 /// 사용자가 "업데이트 설치"를 눌렀을 때만 실행. 설치 폴더 쓰기에 관리자 권한이 필요하므로
 /// 자기 자신을 관리자 권한(UAC 승인)으로 `--install-update <결과파일>` 모드로 다시 실행해 결과를 받는다.
 /// 패키지에 kova-app.exe 가 없으면(예: 파이썬판 릴리즈) 설치하지 않는다.
-fn install_update(weak: slint::Weak<MainWindow>) {
+fn install_update(weak: slint::Weak<MainWindow>, gate: BusyGate) {
+    let Some(guard) = gate.lock() else {
+        if let Some(w) = weak.upgrade() {
+            w.set_update_text("이미 업데이트 설치가 진행 중입니다.".into());
+        }
+        return;
+    };
+    if let Some(w) = weak.upgrade() {
+        w.set_update_text("업데이트 확인 및 설치 준비 중…".into());
+    }
     let exe_path = std::env::current_exe().unwrap_or_default();
     std::thread::spawn(move || {
+        let _guard = guard;
         let run = || -> Result<(bool, String), String> {
             use std::os::windows::process::CommandExt;
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -2229,9 +2363,10 @@ fn install_update(weak: slint::Weak<MainWindow>) {
         let (installed, mut text) =
             run().unwrap_or_else(|e| (false, format!("설치하지 않음: {e}")));
         // 설치가 끝났으면 새 앱을 띄운다(설치 전에 알아 둔 경로 사용: 교체 후 current_exe 는 옛 파일을 가리킬 수 있다).
-        // 새 앱이 살아 있는 것을 확인한 뒤에만 이 앱을 닫아, 새 앱이 죽으면 앱이 통째로 사라지지 않게 한다.
+        // 새 앱이 single_instance 뮤텍스에 막히지 않도록 실행 직전에 뮤텍스·이벤트 핸들을 해제한다.
         let mut restarted = false;
         if installed {
+            release_single_instance();
             use std::os::windows::process::CommandExt;
             match std::process::Command::new(&exe_path)
                 .creation_flags(0x0800_0000)
@@ -2262,8 +2397,15 @@ fn install_update(weak: slint::Weak<MainWindow>) {
 }
 
 /// 이미지 검증/복원: 오래 걸리므로 별도 스레드에서 돌리고 진행률을 화면에 흘린다. 읽기 전용으로 열며 복원은 새 파일에만 쓴다.
-fn image_job(weak: slint::Weak<MainWindow>, image: String, target: Option<String>) {
+fn image_job(weak: slint::Weak<MainWindow>, image: String, target: Option<String>, gate: BusyGate) {
+    let Some(guard) = gate.lock() else {
+        if let Some(w) = weak.upgrade() {
+            w.set_image_text("이미 이미지 작업이 진행 중입니다.".into());
+        }
+        return;
+    };
     std::thread::spawn(move || {
+        let _guard = guard;
         let show = |w: &slint::Weak<MainWindow>, t: String| {
             let w = w.clone();
             let _ = slint::invoke_from_event_loop(move || {
@@ -2335,8 +2477,15 @@ fn image_job(weak: slint::Weak<MainWindow>, image: String, target: Option<String
 }
 
 /// 파일 원본을 .qblk 로 만든다(읽기 전용 원본, 새 파일만 출력). 오래 걸리므로 별도 스레드에서 진행률을 흘린다.
-fn capture_job(weak: slint::Weak<MainWindow>, source: String, out: String) {
+fn capture_job(weak: slint::Weak<MainWindow>, source: String, out: String, gate: BusyGate) {
+    let Some(guard) = gate.lock() else {
+        if let Some(w) = weak.upgrade() {
+            w.set_image_text("이미 이미지 작업이 진행 중입니다.".into());
+        }
+        return;
+    };
     std::thread::spawn(move || {
+        let _guard = guard;
         let show = |w: &slint::Weak<MainWindow>, t: String| {
             let w = w.clone();
             let _ = slint::invoke_from_event_loop(move || {
@@ -2385,13 +2534,27 @@ fn capture_job(weak: slint::Weak<MainWindow>, source: String, out: String) {
             Ok((h, s)) => {
                 // 만든 직후 바로 한 번 읽어 검증하고, 통과하면 목록에 "검증됨"으로 표시한다
                 show(&weak, "만들기 완료, 무결성 검사 중…".into());
+                let last_verify = std::sync::Mutex::new(
+                    std::time::Instant::now() - std::time::Duration::from_secs(5),
+                );
+                let w3 = weak.clone();
+                let verify_progress = |vs: &kova_image::Stats| {
+                    let mut l = last_verify.lock().unwrap();
+                    if l.elapsed() >= std::time::Duration::from_secs(1) {
+                        *l = std::time::Instant::now();
+                        show(
+                            &w3,
+                            format!("무결성 검사 중… {:.2}GB 확인", vs.raw_bytes as f64 / 1e9),
+                        );
+                    }
+                };
                 let ok = std::fs::File::open(&out)
                     .ok()
                     .and_then(|f| {
                         kova_image::verify(
                             std::io::BufReader::with_capacity(8 << 20, f),
                             &cancel,
-                            &progress,
+                            &verify_progress,
                         )
                         .ok()
                     })
@@ -2691,45 +2854,72 @@ fn protected_drive_letters() -> Vec<char> {
 fn volume_check(weak: &slint::Weak<MainWindow>, letter: &str) {
     // 입력할 확인 문구는 별도 상자(volume-phrase)에, 오류·진행 메시지는 volume-text 에 둔다.
     // 그래야 실행을 눌러 오류가 나도 확인 문구가 사라지지 않는다.
-    let (phrase, status) = match letter.trim().chars().next() {
-        None => (String::new(), "드라이브 문자를 입력하세요.".to_string()),
-        Some(c) => match kova_image::volume_restore::volume_info(c) {
-            Ok(v) => (
-                format!(
-                    "{}: 볼륨 '{}' 의 내용이 전부 덮어써집니다. 계속하려면 아래 칸에 그대로 입력하세요:\n{}",
-                    v.letter,
-                    v.label,
-                    kova_image::volume_restore::confirmation_phrase(&v)
-                ),
-                String::new(),
-            ),
-            Err(e) => (String::new(), format!("대상으로 사용할 수 없음: {e}")),
-        },
-    };
-    let w = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(w) = w.upgrade() {
-            w.set_volume_phrase(phrase.into());
-            w.set_volume_text(status.into());
-        }
+    let letter = letter.trim().to_string();
+    let weak = weak.clone();
+    std::thread::spawn(move || {
+        let (phrase, status) = match letter.chars().next() {
+            None => (String::new(), "드라이브 문자를 입력하세요.".to_string()),
+            Some(c) => {
+                let sys = system_drive_letter();
+                let protected = protected_drive_letters();
+                match kova_image::volume_restore::check_letter(c, sys, &protected)
+                    .and_then(|()| kova_image::volume_restore::volume_info(c))
+                {
+                    Ok(v) => (
+                        format!(
+                            "{}: 볼륨 '{}' 의 내용이 전부 덮어써집니다. 계속하려면 아래 칸에 그대로 입력하세요:\n{}",
+                            v.letter,
+                            v.label,
+                            kova_image::volume_restore::confirmation_phrase(&v)
+                        ),
+                        String::new(),
+                    ),
+                    Err(e) => (String::new(), format!("대상으로 사용할 수 없음: {e}")),
+                }
+            }
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_volume_phrase(phrase.into());
+                w.set_volume_text(status.into());
+            }
+        });
     });
+}
+
+/// 경로의 드라이브 문자(대문자)를 뽑는다(`\\?\` 접두어 허용).
+#[cfg(windows)]
+fn path_drive_letter(p: &std::path::Path) -> Option<char> {
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = real.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let b = s.as_bytes();
+    (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic())
+        .then(|| (b[0] as char).to_ascii_uppercase())
 }
 
 /// 볼륨 직접 복원: 검증·정책·확인 문구·잠금을 모두 통과해야 쓴다. 오래 걸리므로 별도 스레드에서 진행률을 흘린다.
 #[cfg(windows)]
-fn restore_volume_job(weak: slint::Weak<MainWindow>, image: String, letter: String, typed: String) {
+fn restore_volume_job(
+    weak: slint::Weak<MainWindow>,
+    image: String,
+    letter: String,
+    typed: String,
+    gate: BusyGate,
+) {
     if app_locked() {
         show_volume(&weak, LOCKED_MSG.into());
         return;
     }
-    if image.trim().trim_matches('"').is_empty() {
+    let clean_image = image.trim().trim_matches('"').to_string();
+    if clean_image.is_empty() {
         show_volume(
             &weak,
             "① 복원할 이미지를 먼저 고르세요 (위 목록에서 누르거나 '찾아보기').".into(),
         );
         return;
     }
-    if !std::path::Path::new(image.trim().trim_matches('"')).is_file() {
+    if !std::path::Path::new(&clean_image).is_file() {
         show_volume(
             &weak,
             "선택한 이미지 파일을 찾을 수 없습니다. 다시 선택하세요.".into(),
@@ -2740,11 +2930,31 @@ fn restore_volume_job(weak: slint::Weak<MainWindow>, image: String, letter: Stri
         show_volume(&weak, "② 덮어쓸 드라이브를 먼저 고르세요.".into());
         return;
     };
-    show_volume(
-        &weak,
-        "이미지 검증 중… (검증이 끝나기 전에는 볼륨에 쓰지 않습니다)".into(),
-    );
+    let Some(guard) = gate.lock() else {
+        show_volume(&weak, "이미 볼륨 복원이 진행 중입니다.".into());
+        return;
+    };
     std::thread::spawn(move || {
+        let _guard = guard;
+        let protected = protected_drive_letters();
+        let mut pre_prot = protected.clone();
+        pre_prot.extend(path_drive_letter(std::path::Path::new(&clean_image)));
+        if let Ok(exe) = std::env::current_exe() {
+            pre_prot.extend(path_drive_letter(&exe));
+        }
+        // 다중 GB 이미지 검증에 들어가기 전에 대상 드라이브·확인 문구를 먼저 검사해 잘못된 입력을 즉시 거부한다.
+        let precheck =
+            kova_image::volume_restore::check_letter(c, system_drive_letter(), &pre_prot)
+                .and_then(|()| kova_image::volume_restore::volume_info(c))
+                .and_then(|v| kova_image::volume_restore::check_confirmation(&v, &typed));
+        if let Err(e) = precheck {
+            show_volume(&weak, format!("복원하지 않음: {e}"));
+            return;
+        }
+        show_volume(
+            &weak,
+            "이미지 검증 중… (검증이 끝나기 전에는 볼륨에 쓰지 않습니다)".into(),
+        );
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let last =
             std::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(5));
@@ -2767,10 +2977,10 @@ fn restore_volume_job(weak: slint::Weak<MainWindow>, image: String, letter: Stri
             }
         };
         let r = kova_image::volume_restore::restore_image_to_volume(
-            std::path::Path::new(image.trim().trim_matches('"')),
+            std::path::Path::new(&clean_image),
             c,
             &typed,
-            &protected_drive_letters(),
+            &protected,
             &cancel,
             &progress,
         );
@@ -2789,12 +2999,67 @@ fn restore_volume_job(weak: slint::Weak<MainWindow>, image: String, letter: Stri
     });
 }
 
-/// 이름 있는 뮤텍스로 앱을 하나만 띄운다. 이미 있으면 기존 창을 앞으로 가져오고 None.
 #[cfg(windows)]
-fn single_instance() -> Option<isize> {
+static SINGLE_MUTEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(windows)]
+static SHOW_EVENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 업데이트 재시작 직전 등 새 인스턴스를 허용해야 할 때 단일 인스턴스 뮤텍스·표시 이벤트 핸들을 닫는다.
+#[cfg(windows)]
+fn release_single_instance() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CloseHandle(h: isize) -> i32;
+    }
+    let m = SINGLE_MUTEX.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if m != 0 {
+        unsafe {
+            CloseHandle(m as isize);
+        }
+    }
+    let ev = SHOW_EVENT.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if ev != 0 {
+        unsafe {
+            CloseHandle(ev as isize);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn release_single_instance() {}
+
+/// 두 번째 인스턴스가 보낸 창 표시 신호(`Local\Kova2AppShowEvent`)가 왔는지 비차단으로 확인한다.
+#[cfg(windows)]
+fn poll_show_event() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn WaitForSingleObject(h: isize, millis: u32) -> u32;
+    }
+    const WAIT_OBJECT_0: u32 = 0;
+    let ev = SHOW_EVENT.load(std::sync::atomic::Ordering::SeqCst);
+    ev != 0 && unsafe { WaitForSingleObject(ev as isize, 0) } == WAIT_OBJECT_0
+}
+
+#[cfg(not(windows))]
+fn poll_show_event() -> bool {
+    false
+}
+
+/// 이름 있는 뮤텍스로 앱을 하나만 띄운다. 이미 있으면 표시 이벤트 신호 + 기존 창 활성화 후 false.
+#[cfg(windows)]
+fn single_instance() -> bool {
     #[link(name = "kernel32")]
     extern "system" {
         fn CreateMutexW(attrs: *const u8, initial: i32, name: *const u16) -> isize;
+        fn CreateEventW(
+            attrs: *const u8,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> isize;
+        fn OpenEventW(desired_access: u32, inherit: i32, name: *const u16) -> isize;
+        fn SetEvent(h: isize) -> i32;
+        fn CloseHandle(h: isize) -> i32;
         fn GetLastError() -> u32;
     }
     #[link(name = "user32")]
@@ -2804,13 +3069,28 @@ fn single_instance() -> Option<isize> {
         fn SetForegroundWindow(h: isize) -> i32;
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
+    const EVENT_MODIFY_STATE: u32 = 0x0002;
     let name: Vec<u16> = "Local\\Kova2AppSingleInstance\0".encode_utf16().collect();
+    let ev_name: Vec<u16> = "Local\\Kova2AppShowEvent\0".encode_utf16().collect();
     let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if h != 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
-        return Some(h); // 프로세스가 끝날 때까지 핸들을 쥐고 있는다
+        SINGLE_MUTEX.store(h as usize, std::sync::atomic::Ordering::SeqCst);
+        let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, ev_name.as_ptr()) };
+        if ev != 0 {
+            SHOW_EVENT.store(ev as usize, std::sync::atomic::Ordering::SeqCst);
+        }
+        return true; // 프로세스가 끝날 때까지(또는 release_single_instance 호출 시까지) 핸들을 쥐고 있는다
     }
     if h == 0 {
-        return Some(0); // 뮤텍스를 못 만들어도 앱은 띄운다
+        return true; // 뮤텍스를 못 만들어도 앱은 띄운다
+    }
+    unsafe {
+        CloseHandle(h);
+        let ev = OpenEventW(EVENT_MODIFY_STATE, 0, ev_name.as_ptr());
+        if ev != 0 {
+            SetEvent(ev);
+            CloseHandle(ev);
+        }
     }
     let title: Vec<u16> = "Kova\0".encode_utf16().collect();
     unsafe {
@@ -2820,7 +3100,7 @@ fn single_instance() -> Option<isize> {
             SetForegroundWindow(w);
         }
     }
-    None
+    false
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -2841,18 +3121,26 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // 앱이 둘 뜨면 클릭이 엉키고 서비스 연결도 겹치므로, 이미 떠 있으면 그 창을 앞으로 가져오고 끝낸다
     #[cfg(windows)]
-    let _single = match single_instance() {
-        Some(g) => g,
-        None => return Ok(()),
-    };
+    if !single_instance() {
+        return Ok(());
+    }
     let w = MainWindow::new()?;
+    let banner_gen: std::sync::Arc<std::sync::atomic::AtomicU64> =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(windows)]
     {
         let weak = w.as_weak();
         w.on_volume_check(move |l| volume_check(&weak, l.as_str()));
         let weak = w.as_weak();
+        let vol_gate = BusyGate::default();
         w.on_restore_volume(move |img, l, t| {
-            restore_volume_job(weak.clone(), img.to_string(), l.to_string(), t.to_string())
+            restore_volume_job(
+                weak.clone(),
+                img.to_string(),
+                l.to_string(),
+                t.to_string(),
+                vol_gate.clone(),
+            )
         });
     }
     w.set_app_version(env!("CARGO_PKG_VERSION").into());
@@ -3044,24 +3332,34 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let weak = w.as_weak();
+        let bg = banner_gen.clone();
         w.on_run_backup(move |id| {
+            bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(w) = weak.upgrade() {
                 w.set_job_completed_show(false);
             }
-            let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
-            let pid = resolve_profile_id(&store, id.as_str()).unwrap_or_else(|| id.to_string());
-            send(weak.clone(), "backup", pid);
+            let (weak, id) = (weak.clone(), id.to_string());
+            std::thread::spawn(move || {
+                let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
+                let pid = resolve_profile_id(&store, &id).unwrap_or(id);
+                send_sync(weak, "backup".into(), pid);
+            });
         });
     }
     {
         let weak = w.as_weak();
+        let bg = banner_gen.clone();
         w.on_run_verify(move |id| {
+            bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(w) = weak.upgrade() {
                 w.set_job_completed_show(false);
             }
-            let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
-            let pid = resolve_profile_id(&store, id.as_str()).unwrap_or_else(|| id.to_string());
-            send(weak.clone(), "verify", pid);
+            let (weak, id) = (weak.clone(), id.to_string());
+            std::thread::spawn(move || {
+                let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
+                let pid = resolve_profile_id(&store, &id).unwrap_or(id);
+                send_sync(weak, "verify".into(), pid);
+            });
         });
     }
     {
@@ -3082,6 +3380,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 return;
             }
+            if let Some(w) = weak.upgrade() {
+                w.set_pick_error("".into());
+            }
             std::thread::spawn(move || {
                 #[cfg(windows)]
                 {
@@ -3095,15 +3396,13 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = w.as_weak();
         w.on_save_offsite(move |id, dir| {
-            let msg = if app_locked() {
-                LOCKED_MSG.to_string()
+            let res = if app_locked() {
+                Err(LOCKED_MSG.to_string())
             } else {
-                match save_offsite(&id, &dir) {
-                    Ok(m) | Err(m) => m,
-                }
+                save_offsite(&id, &dir)
             };
             if let Some(w) = weak.upgrade() {
-                w.set_settings_text(msg.into());
+                set_settings_msg(&w, res);
             }
         });
     }
@@ -3238,17 +3537,26 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = w.as_weak();
         w.on_save_settings(move |gb, ransom, enc, vss, pack| {
-            let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
-            let msg = if app_locked() {
-                LOCKED_MSG.to_string()
-            } else {
-                match apply_settings(&store, &gb, ransom, enc, vss, pack) {
-                    Ok(m) | Err(m) => m,
+            if app_locked() {
+                if let Some(w) = weak.upgrade() {
+                    set_settings_msg(&w, Err(LOCKED_MSG.to_string()));
                 }
-            };
-            if let Some(w) = weak.upgrade() {
-                w.set_settings_text(msg.into());
+                return;
             }
+            if let Some(w) = weak.upgrade() {
+                w.set_settings_err(false);
+                w.set_settings_text("설정 저장 중…".into());
+            }
+            let (gb, weak) = (gb.to_string(), weak.clone());
+            std::thread::spawn(move || {
+                let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
+                let res = apply_settings(&store, &gb, ransom, enc, vss, pack);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        set_settings_msg(&w, res);
+                    }
+                });
+            });
         });
     }
     {
@@ -3319,23 +3627,42 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = w.as_weak();
         w.on_restore_key(move |code| {
-            let msg = if app_locked() {
-                LOCKED_MSG.to_string()
-            } else {
-                match restore_keys(&code) {
-                    Ok(m) | Err(m) => m,
+            if app_locked() {
+                if let Some(w) = weak.upgrade() {
+                    set_settings_msg(&w, Err(LOCKED_MSG.to_string()));
+                    w.set_form_recovery("".into());
                 }
-            };
+                return;
+            }
             if let Some(w) = weak.upgrade() {
-                w.set_settings_text(msg.into());
+                w.set_settings_err(false);
+                w.set_settings_text("복구 키 복원 중…".into());
                 w.set_form_recovery("".into());
             }
+            let (code, weak) = (code.to_string(), weak.clone());
+            std::thread::spawn(move || {
+                let res = restore_keys(&code);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        set_settings_msg(&w, res);
+                    }
+                });
+            });
         });
         let weak = w.as_weak();
         w.on_export_recovery_kit(move || {
-            let msg = if app_locked() {
-                LOCKED_MSG.to_string()
-            } else {
+            if app_locked() {
+                if let Some(w) = weak.upgrade() {
+                    set_settings_msg(&w, Err(LOCKED_MSG.to_string()));
+                }
+                return;
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_settings_err(false);
+                w.set_settings_text("복구 키트 생성 중…".into());
+            }
+            let weak = weak.clone();
+            std::thread::spawn(move || {
                 let base = std::env::var_os("USERPROFILE")
                     .map(|u| std::path::PathBuf::from(u).join("Desktop"))
                     .filter(|d| d.is_dir())
@@ -3345,40 +3672,36 @@ fn main() -> Result<(), slint::PlatformError> {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let out = base.join(format!("Kova2_Recovery_Kit_{secs}.txt"));
-                match export_recovery_kit_to(&out) {
-                    Ok(m) | Err(m) => m,
-                }
-            };
-            if let Some(w) = weak.upgrade() {
-                w.set_settings_text(msg.into());
-            }
+                let res = export_recovery_kit_to(&out);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        set_settings_msg(&w, res);
+                    }
+                });
+            });
         });
         let weak = w.as_weak();
         w.on_save_ops_settings(move |wh, th, bw, bat| {
             let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
-            let msg = if app_locked() {
-                LOCKED_MSG.to_string()
+            let res = if app_locked() {
+                Err(LOCKED_MSG.to_string())
             } else {
-                match apply_ops_settings(&store, &wh, &th, &bw, bat) {
-                    Ok(m) | Err(m) => m,
-                }
+                apply_ops_settings(&store, &wh, &th, &bw, bat)
             };
             if let Some(w) = weak.upgrade() {
-                w.set_settings_text(msg.into());
+                set_settings_msg(&w, res);
             }
         });
         let weak = w.as_weak();
         w.on_save_watch_settings(move |dd, sd| {
             let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
-            let msg = if app_locked() {
-                LOCKED_MSG.to_string()
+            let res = if app_locked() {
+                Err(LOCKED_MSG.to_string())
             } else {
-                match apply_watch_settings(&store, &dd, &sd) {
-                    Ok(m) | Err(m) => m,
-                }
+                apply_watch_settings(&store, &dd, &sd)
             };
             if let Some(w) = weak.upgrade() {
-                w.set_settings_text(msg.into());
+                set_settings_msg(&w, res);
             }
         });
         let weak = w.as_weak();
@@ -3386,21 +3709,22 @@ fn main() -> Result<(), slint::PlatformError> {
             let url = wh.to_string();
             let weak = weak.clone();
             if let Some(w) = weak.upgrade() {
+                w.set_settings_err(false);
                 w.set_settings_text("웹훅 테스트 발송 중…".into());
             }
             std::thread::spawn(move || {
-                let text = match kova_core::notify::send_webhook(
+                let res = match kova_core::notify::send_webhook(
                     &url,
                     "info",
                     "테스트 알림",
                     "Kova2 원격 알림이 정상적으로 연결되었습니다.",
                 ) {
-                    Ok(()) => "웹훅 테스트 발송 성공".to_string(),
-                    Err(e) => format!("웹훅 테스트 실패: {e}"),
+                    Ok(()) => Ok("웹훅 테스트 발송 성공".to_string()),
+                    Err(e) => Err(format!("웹훅 테스트 실패: {e}")),
                 };
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak.upgrade() {
-                        w.set_settings_text(text.into());
+                        set_settings_msg(&w, res);
                     }
                 });
             });
@@ -3427,18 +3751,29 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = w.as_weak();
         w.on_export_drivers(move || {
             let weak = weak.clone();
+            let start_msg = "현재 PC 드라이버 자동 수집(덤프) 중… (DISM)";
             if let Some(w) = weak.upgrade() {
-                w.set_pe_text("현재 PC 드라이버 자동 수집(덤프) 중… (DISM)".into());
+                w.set_pe_text(start_msg.into());
+                w.set_diag_text(start_msg.into());
             }
             std::thread::spawn(move || {
-                let text = run_export_drivers(None);
-                let def = kova_pe::plan::default_driver_export_dir();
-                let def_str = def.to_string_lossy().to_string();
+                let res = run_export_drivers(None);
+                let def_str = kova_pe::plan::default_driver_export_dir()
+                    .to_string_lossy()
+                    .to_string();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak.upgrade() {
-                        w.set_pe_text(text.clone().into());
-                        w.set_diag_text(text.into());
-                        w.set_pe_drivers_dir(def_str.into());
+                        match res {
+                            Ok(text) => {
+                                w.set_pe_text(text.clone().into());
+                                w.set_diag_text(text.into());
+                                w.set_pe_drivers_dir(def_str.into());
+                            }
+                            Err(text) => {
+                                w.set_pe_text(text.clone().into());
+                                w.set_diag_text(text.into());
+                            }
+                        }
                     }
                 });
             });
@@ -3728,6 +4063,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let weak = w.as_weak();
+        let update_gate = BusyGate::default();
         w.on_install_update(move || {
             if app_locked() {
                 if let Some(w) = weak.upgrade() {
@@ -3735,13 +4071,16 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 return;
             }
-            install_update(weak.clone())
+            install_update(weak.clone(), update_gate.clone())
         });
     }
     {
+        let image_gate = BusyGate::default();
         let weak = w.as_weak();
-        w.on_verify_image(move |p| image_job(weak.clone(), p.to_string(), None));
+        let gate_v = image_gate.clone();
+        w.on_verify_image(move |p| image_job(weak.clone(), p.to_string(), None, gate_v.clone()));
         let weak = w.as_weak();
+        let gate_c = image_gate.clone();
         w.on_capture_image(move |s, o| {
             let (src, mut out) = (s.to_string(), o.to_string());
             if src.trim().is_empty() {
@@ -3763,22 +4102,29 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
             }
-            capture_job(weak.clone(), src, out);
+            capture_job(weak.clone(), src, out, gate_c.clone());
         });
         let weak = w.as_weak();
         w.on_scan_convert(move || scan_convert_async(weak.clone()));
         scan_convert_async(w.as_weak());
         let weak = w.as_weak();
         w.on_delete_image(move |p| {
-            let msg = match delete_image_file(p.as_str()) {
-                Ok(()) => "이미지를 삭제했습니다".to_string(),
-                Err(e) => e,
-            };
+            let res = delete_image_file(p.as_str());
             if let Some(w) = weak.upgrade() {
-                if w.get_img_path() == p {
-                    w.set_img_path("".into());
+                match res {
+                    Ok(()) => {
+                        if w.get_img_path() == p {
+                            w.set_img_path("".into());
+                        }
+                        if w.get_vol_img() == p {
+                            w.set_vol_img("".into());
+                        }
+                        w.set_image_text("이미지를 삭제했습니다".into());
+                    }
+                    Err(e) => {
+                        w.set_image_text(e.into());
+                    }
                 }
-                w.set_image_text(msg.into());
             }
         });
         let weak = w.as_weak();
@@ -3790,7 +4136,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 (_, None) => "프로파일이 없습니다. 홈 화면에서 먼저 백업을 설정하세요".to_string(),
                 (true, Some(p)) => {
                     send(weak.clone(), format!("image:{}", d.to_ascii_uppercase()), p.id.clone());
-                    format!("{}: 이미지 작업을 서비스에 요청했습니다. 진행·결과는 홈의 작업 기록에 표시됩니다", d.to_ascii_uppercase())
+                    format!("{}: 이미지 작업을 서비스에 요청했습니다. 진행·결과는 상단 실행 상태 표시줄에 표시됩니다", d.to_ascii_uppercase())
                 }
             };
             if let Some(w) = weak.upgrade() {
@@ -3798,6 +4144,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
         let weak = w.as_weak();
+        let gate_r = image_gate;
         w.on_restore_image(move |p, t| {
             let (p, mut t) = (p.to_string(), t.trim().to_string());
             if t.is_empty() {
@@ -3813,7 +4160,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 t = cand.to_string_lossy().to_string();
             }
-            image_job(weak.clone(), p, Some(t));
+            image_job(weak.clone(), p, Some(t), gate_r.clone());
         });
     }
     {
@@ -3925,14 +4272,27 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let weak = w.as_weak();
+        let bg = banner_gen.clone();
         w.on_run_gc(move |id| {
-            let Some(w) = weak.upgrade() else { return };
-            w.set_job_completed_show(false);
-            let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
-            match gc_target(app_locked(), &store, id.as_str()) {
-                Ok(pid) => send(weak.clone(), "gc", pid),
-                Err(e) => w.set_restore_text(e.into()),
+            bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(w) = weak.upgrade() {
+                w.set_job_completed_show(false);
             }
+            let locked = app_locked();
+            let (weak, id) = (weak.clone(), id.to_string());
+            std::thread::spawn(move || {
+                let store = kova_core::config::ConfigStore::new(kova_service::default_config_dir());
+                match gc_target(locked, &store, &id) {
+                    Ok(pid) => send_sync(weak, "gc".into(), pid),
+                    Err(e) => {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = weak.upgrade() {
+                                w.set_restore_text(e.into());
+                            }
+                        });
+                    }
+                }
+            });
         });
     }
     {
@@ -3994,9 +4354,18 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak_ack = w.as_weak();
         w.on_ack_alerts(move || {
+            if app_locked() {
+                if let Some(w) = weak_ack.upgrade() {
+                    w.set_pick_error(LOCKED_MSG.into());
+                }
+                return;
+            }
             let _ = kova_core::alerts::AlertLog::new(&kova_service::default_config_dir())
                 .acknowledge_all();
             if let Some(w) = weak_ack.upgrade() {
+                if w.get_pick_error() == LOCKED_MSG {
+                    w.set_pick_error("".into());
+                }
                 w.set_alert_text("".into());
                 let alerts = alert_rows();
                 w.set_alerts(std::rc::Rc::new(slint::VecModel::from(alerts)).into());
@@ -4005,13 +4374,15 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let weak_dismiss = w.as_weak();
+        let bg = banner_gen.clone();
         w.on_dismiss_completed(move || {
+            bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(w) = weak_dismiss.upgrade() {
                 w.set_job_completed_show(false);
             }
         });
     }
-    spawn_ipc(w.as_weak());
+    spawn_ipc(w.as_weak(), banner_gen);
 
     let menu = Menu::new();
     let open = MenuItem::new("열기", true, None);
@@ -4031,7 +4402,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     };
 
-    // 트레이 메뉴 이벤트를 Slint 이벤트 루프에서 주기적으로 처리
+    // 트레이 메뉴 이벤트 및 두 번째 인스턴스 창 표시 신호를 Slint 이벤트 루프에서 주기적으로 처리
     let weak = w.as_weak();
     let (open_id, quit_id, backup_id) = (
         open.id().clone(),
@@ -4043,10 +4414,17 @@ fn main() -> Result<(), slint::PlatformError> {
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(100),
         move || {
+            if poll_show_event() {
+                if let Some(w) = weak.upgrade() {
+                    let _ = w.show();
+                    w.window().set_minimized(false);
+                }
+            }
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if ev.id == open_id {
                     if let Some(w) = weak.upgrade() {
                         let _ = w.show();
+                        w.window().set_minimized(false);
                     }
                 } else if ev.id == backup_id {
                     let store =
@@ -4244,27 +4622,32 @@ mod tests {
     #[test]
     fn build_pe_ps_args_includes_drivers_only_when_given() {
         let a = build_pe_ps_args(
-            std::path::Path::new("C:\\Kova2\\make_pe.ps1"),
-            std::path::Path::new("D:\\out.iso"),
-            std::path::Path::new("C:\\Kova2\\kova-pe.exe"),
+            std::path::Path::new("C:\\Program Files\\Kova2\\make_pe.ps1"),
+            std::path::Path::new("D:\\O'Brien\\out.iso"),
+            std::path::Path::new("C:\\Program Files\\Kova2\\kova-pe.exe"),
             "",
         );
-        assert!(a.contains("-Out 'D:\\out.iso'") && !a.contains("-DriversDir"));
+        assert!(a.contains("-File \"C:\\Program Files\\Kova2\\make_pe.ps1\""));
+        assert!(a.contains("-Out \"D:\\O''Brien\\out.iso\"") && !a.contains("-DriversDir"));
+        assert!(a.contains("-Exe \"C:\\Program Files\\Kova2\\kova-pe.exe\""));
         let b = build_pe_ps_args(
             std::path::Path::new("C:\\Kova2\\make_pe.ps1"),
             std::path::Path::new("D:\\out.iso"),
             std::path::Path::new("C:\\Kova2\\kova-pe.exe"),
             "C:\\Drivers\\NVMe",
         );
-        assert!(b.contains("-DriversDir 'C:\\Drivers\\NVMe'"));
+        assert!(b.contains("-DriversDir \"C:\\Drivers\\NVMe\""));
     }
 
     #[test]
     fn run_export_drivers_handles_custom_destination() {
         let tmp = std::env::temp_dir().join(format!("kova_drv_test_{}", std::process::id()));
         let res = run_export_drivers(Some(&tmp));
-        // 관리자 권한이 없으면 "실패", 있으면 "완료", 비-Windows면 "모의 완료" -> 크래시 없이 결과 메시지 반환
-        assert!(!res.is_empty());
+        // 관리자 권한이 없으면 Err, 있으면 Ok, 비-Windows면 Ok -> 크래시 없이 결과 메시지 반환
+        let msg = match res {
+            Ok(m) | Err(m) => m,
+        };
+        assert!(!msg.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4588,5 +4971,83 @@ mod tests {
         assert!(!try_begin(&f));
         f.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(try_begin(&f));
+    }
+
+    #[test]
+    fn set_offsite_provider_toggles_offsite_enabled() {
+        let dir = std::env::temp_dir().join(format!("kova_offsite_prov_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = kova_core::config::ConfigStore::new(&dir);
+
+        set_offsite_provider_in(&store, "gdrive");
+        let s = store.settings();
+        assert_eq!(s.offsite_provider, "gdrive");
+        assert!(s.offsite_enabled);
+
+        set_offsite_provider_in(&store, "local");
+        let s = store.settings();
+        assert_eq!(s.offsite_provider, "local");
+        assert!(!s.offsite_enabled);
+
+        set_offsite_provider_in(&store, "gdrive");
+        assert!(store.settings().offsite_enabled);
+        set_offsite_provider_in(&store, "");
+        let s = store.settings();
+        assert_eq!(s.offsite_provider, "");
+        assert!(!s.offsite_enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_clear_idle_running_respects_event_seq_and_clears_zombies() {
+        let running = std::sync::Mutex::new(vec![RunInfo {
+            id: 1,
+            name: "테스트".into(),
+            pct: 50,
+            current: "a.txt".into(),
+            cancellable: true,
+            kind: "backup".into(),
+        }]);
+        let seq = std::sync::atomic::AtomicU64::new(5);
+
+        // 폴링 중 새 이벤트가 들어오면(seq != seq_before) 비우지 않는다
+        assert!(!try_clear_idle_running(&running, &seq, 4));
+        assert_eq!(running.lock().unwrap().len(), 1);
+
+        // 새 이벤트가 없었으면 좀비 항목을 비운다
+        assert!(try_clear_idle_running(&running, &seq, 5));
+        assert!(running.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn busy_gate_lock_releases_on_drop() {
+        let g = BusyGate::default();
+        {
+            let guard = g.lock();
+            assert!(guard.is_some());
+            assert!(g.lock().is_none(), "가드가 살아 있는 동안 재진입 불가");
+        }
+        assert!(g.lock().is_some(), "가드 드롭 후 재진입 가능");
+    }
+
+    #[test]
+    fn repo_drive_usage_handles_empty_and_existing_paths() {
+        assert_eq!(repo_drive_usage(""), (String::new(), 0));
+        assert_eq!(repo_drive_usage("   "), (String::new(), 0));
+        #[cfg(windows)]
+        {
+            let tmp = std::env::temp_dir().join("kova_nonexistent_subdir_for_usage");
+            let (free, pct) = repo_drive_usage(&tmp.to_string_lossy());
+            assert!(free.ends_with("GB 여유"), "got: {free}");
+            assert!((0..=100).contains(&pct));
+        }
+    }
+
+    #[test]
+    fn system_drive_letter_returns_uppercase_ascii() {
+        let ch = system_drive_letter();
+        assert!(ch.is_ascii_uppercase());
     }
 }

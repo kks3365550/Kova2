@@ -80,11 +80,15 @@ pub fn write_image<R: Read + Seek, W: Write + Seek + Send>(
             let mut pending: BTreeMap<u64, EncodedChunk> = BTreeMap::new();
             let mut ok = true;
             for (seq, c) in res_rx {
-                if !ok {
+                if !ok || failed.load(Ordering::Relaxed) {
                     continue; // 실패 뒤에는 남은 결과를 버리며 비운다
                 }
                 pending.insert(seq, c);
                 while let Some(c) = pending.remove(&next) {
+                    if failed.load(Ordering::Relaxed) {
+                        ok = false;
+                        break;
+                    }
                     if let Err(e) = w.write_encoded(&c) {
                         fail(e);
                         ok = false;
@@ -118,6 +122,7 @@ pub fn write_image<R: Read + Seek, W: Write + Seek + Send>(
         'runs: for (lcn, count) in runs {
             if cancel.load(Ordering::Relaxed) {
                 read_err = Some(QblkError::Cancelled);
+                failed.store(true, Ordering::Relaxed);
                 break;
             }
             if failed.load(Ordering::Relaxed) {
@@ -133,6 +138,7 @@ pub fn write_image<R: Read + Seek, W: Write + Seek + Send>(
                 }
                 if cancel.load(Ordering::Relaxed) {
                     read_err = Some(QblkError::Cancelled);
+                    failed.store(true, Ordering::Relaxed);
                     break 'runs;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -143,9 +149,11 @@ pub fn write_image<R: Read + Seek, W: Write + Seek + Send>(
                 .and_then(|_| src.read_exact(&mut buf));
             if let Err(e) = r {
                 read_err = Some(e.into());
+                failed.store(true, Ordering::Relaxed);
                 break;
             }
             if job_tx.send((seq, lcn, buf)).is_err() {
+                failed.store(true, Ordering::Relaxed);
                 break;
             }
             seq += 1;
@@ -322,6 +330,7 @@ mod win {
         }
         check_output(Path::new(&format!("{drive}\\")), out_path)?;
         let shadow = Shadow::create(&drive)?;
+        let mut created = false;
         let res = (|| -> Result<(Header, Stats), QblkError> {
             // 섀도 장치는 읽기 전용으로만 연다(쓰기 권한 요청 없음).
             let mut dev = OpenOptions::new()
@@ -342,19 +351,27 @@ mod win {
                 return Err(io_err("볼륨 클러스터 정보가 이상함"));
             }
             // 비트맵: StartingLcn(8)+BitmapSize(8)+bits. 한 번에 받고, 모자라면(ERROR_MORE_DATA) 오류로 중단한다.
-            let mut out = vec![0u8; 16 + (total as usize).div_ceil(8) + 64];
-            ioctl(&dev, FSCTL_GET_VOLUME_BITMAP, &0u64.to_le_bytes(), &mut out)
+            let bytes = (total as usize).div_ceil(8);
+            let mut out = vec![0u8; 16 + bytes + 64];
+            let ret = ioctl(&dev, FSCTL_GET_VOLUME_BITMAP, &0u64.to_le_bytes(), &mut out)
                 .map_err(|e| io_err(format!("볼륨 비트맵 조회 실패: {e}")))?;
+            if (ret as usize) < 16 + bytes {
+                return Err(io_err("볼륨 비트맵 응답이 예상보다 짧음"));
+            }
             let start = u64::from_le_bytes(out[0..8].try_into().unwrap());
             if start != 0 {
                 return Err(io_err("비트맵 시작 위치가 0이 아님"));
             }
-            let bytes = (total as usize).div_ceil(8);
+            let bm_clusters = u64::from_le_bytes(out[8..16].try_into().unwrap());
+            if bm_clusters < total {
+                return Err(io_err("볼륨 비트맵 클러스터 수가 볼륨 크기보다 작음"));
+            }
             let bitmap = out[16..16 + bytes].to_vec();
             let file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(out_path)?;
+            created = true;
             let mut header = Header {
                 version: crate::qblk::VERSION,
                 cluster_size: cs,
@@ -376,7 +393,7 @@ mod win {
             Ok((header, st))
         })();
         drop(shadow); // 섀도 복사본 삭제
-        if res.is_err() {
+        if res.is_err() && created {
             let _ = std::fs::remove_file(out_path);
         }
         res

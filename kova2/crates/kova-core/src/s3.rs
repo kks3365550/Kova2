@@ -106,9 +106,31 @@ fn host_from_endpoint(endpoint: &str) -> Result<String, String> {
     Ok(host.to_string())
 }
 
+fn encode_uri_segment(seg: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(seg.len());
+    for b in seg.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(&mut out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 fn object_uri(bucket: &str, key: &str) -> String {
-    let key = key.trim_start_matches('/');
-    format!("/{}/{}", bucket.trim_matches('/'), key)
+    let bucket_enc = encode_uri_segment(bucket.trim_matches('/'));
+    let key_trimmed = key.trim_start_matches('/');
+    if key_trimmed.is_empty() {
+        return format!("/{bucket_enc}/");
+    }
+    let key_enc = key_trimmed
+        .split('/')
+        .map(encode_uri_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/{bucket_enc}/{key_enc}")
 }
 
 /// AWS Signature Version 4 인증 헤더(`Authorization`, `x-amz-date`, `x-amz-content-sha256`, `Host`)를 생성한다.
@@ -123,7 +145,11 @@ pub fn sign_v4(
     payload: &[u8],
     amz_date: &str,
 ) -> (String, String, String) {
-    let date_stamp = &amz_date[..8];
+    let date_stamp = if amz_date.is_ascii() && amz_date.len() >= 8 {
+        &amz_date[..8]
+    } else {
+        ""
+    };
     let payload_hash = sha256_hex(payload);
     let canonical_headers =
         format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
@@ -228,6 +254,44 @@ pub fn put_object(cfg: &S3Config, rel_key: &str, data: &[u8]) -> Result<(), Stri
     }
 }
 
+fn get_object(cfg: &S3Config, rel_key: &str) -> Result<Option<Vec<u8>>, String> {
+    let host = host_from_endpoint(&cfg.endpoint)?;
+    let uri = object_uri(&cfg.bucket, &full_key(cfg, rel_key));
+    let url = format!("{}{}", cfg.endpoint.trim_end_matches('/'), uri);
+    let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let (auth, date, hash) = sign_v4(
+        "GET",
+        &host,
+        &uri,
+        &cfg.region,
+        &cfg.access_key,
+        &cfg.secret_key,
+        b"",
+        &amz_date,
+    );
+    match agent()
+        .get(&url)
+        .set("Host", &host)
+        .set("x-amz-date", &date)
+        .set("x-amz-content-sha256", &hash)
+        .set("Authorization", &auth)
+        .call()
+    {
+        Ok(r) if (200..300).contains(&r.status()) => {
+            use io::Read;
+            let mut buf = Vec::new();
+            r.into_reader()
+                .take(1024 * 1024)
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("S3 GET 본문 읽기 실패({rel_key}): {e}"))?;
+            Ok(Some(buf))
+        }
+        Ok(r) => Err(format!("S3 GET 오류({rel_key}): HTTP {}", r.status())),
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(e) => Err(format!("S3 GET 실패({rel_key}): {e}")),
+    }
+}
+
 /// 저장소의 스냅샷과 블롭(팩 포함)을 S3 호환 버킷으로 증분 복제한다.
 /// 블롭을 먼저 올리고 매니페스트를 마지막에 올려 불완전 스냅샷이 보이지 않게 한다.
 pub fn replicate_to_s3(
@@ -246,6 +310,28 @@ pub fn replicate_to_s3(
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .collect();
     manifests.sort();
+    // 암호화 표식(crypto.json)을 스냅샷보다 먼저 올린다. 없으면 S3 복제본만으로는 복호화할 수 없다.
+    let marker_path = repo.join(kova_engine::codec::MARKER);
+    if marker_path.is_file() {
+        let local_bytes = fs::read(&marker_path).map_err(|e| e.to_string())?;
+        if head_object(cfg, kova_engine::codec::MARKER)? {
+            match get_object(cfg, kova_engine::codec::MARKER)? {
+                Some(remote_bytes) if remote_bytes == local_bytes => {}
+                Some(_) => {
+                    return Err(
+                        "S3 버킷의 암호화 표식이 이 저장소와 다릅니다(다른 저장소의 복제본)".into(),
+                    );
+                }
+                None => {
+                    put_object(cfg, kova_engine::codec::MARKER, &local_bytes)?;
+                    rep.bytes_uploaded += local_bytes.len() as u64;
+                }
+            }
+        } else {
+            put_object(cfg, kova_engine::codec::MARKER, &local_bytes)?;
+            rep.bytes_uploaded += local_bytes.len() as u64;
+        }
+    }
     let packs = kova_engine::pack::load_index(repo);
     let mut done_packs = HashSet::new();
 
@@ -274,6 +360,10 @@ pub fn replicate_to_s3(
                 hashes.push(s);
             }
         }
+        hashes.retain(|h| !h.is_empty());
+        if let Some(bad) = hashes.iter().find(|h| !crate::offsite::valid_hash(h)) {
+            return Err(format!("{name}: 잘못된 해시 {bad:?}"));
+        }
 
         let mut seen = HashSet::new();
         for h in hashes {
@@ -283,7 +373,7 @@ pub fn replicate_to_s3(
             if cancel.load(Ordering::Relaxed) {
                 return Err("취소됨".into());
             }
-            let prefix = if h.len() >= 2 { &h[0..2] } else { "misc" };
+            let prefix = &h[0..2];
             let local_blob = repo.join("blobs").join(prefix).join(format!("{h}.blob"));
             if local_blob.is_file() {
                 let key = format!("blobs/{prefix}/{h}.blob");
@@ -442,6 +532,20 @@ mod tests {
                         };
                         let _ = sock.write_all(resp.as_bytes());
                     }
+                    "GET" => {
+                        if let Some(body) = store_srv.lock().unwrap().get(&uri).cloned() {
+                            let resp_hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = sock.write_all(resp_hdr.as_bytes());
+                            let _ = sock.write_all(&body);
+                        } else {
+                            let _ = sock.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    }
                     "PUT" => {
                         let body = data[bs..bs + content_len].to_vec();
                         store_srv.lock().unwrap().insert(uri, body);
@@ -481,6 +585,195 @@ mod tests {
 
         let r2 = replicate_to_s3(&repo, &cfg, &no).unwrap();
         assert_eq!((r2.snapshots_uploaded, r2.snapshots_skipped), (0, 1));
+
+        stop.store(true, Ordering::Relaxed);
+        srv.join().unwrap();
+    }
+
+    #[test]
+    fn object_uri_percent_encodes_segments_and_sign_v4_handles_short_date() {
+        assert_eq!(
+            object_uri("my-bucket", "한글 폴더/a b/c~d_e-f.json"),
+            "/my-bucket/%ED%95%9C%EA%B8%80%20%ED%8F%B4%EB%8D%94/a%20b/c~d_e-f.json"
+        );
+        assert_eq!(
+            object_uri("버킷 이름", "prefix/sub/file+1.txt"),
+            "/%EB%B2%84%ED%82%B7%20%EC%9D%B4%EB%A6%84/prefix/sub/file%2B1.txt"
+        );
+        // 짧거나 비-ASCII amz_date 에서도 패닉하지 않아야 한다
+        let (auth1, _, _) = sign_v4("GET", "h", "/b/k", "r", "ak", "sk", b"", "2026");
+        assert!(auth1.starts_with("AWS4-HMAC-SHA256 "));
+        let (auth2, _, _) = sign_v4("GET", "h", "/b/k", "r", "ak", "sk", b"", "한글날짜입니다");
+        assert!(auth2.starts_with("AWS4-HMAC-SHA256 "));
+    }
+
+    #[test]
+    fn replicate_to_s3_uploads_crypto_marker_and_rejects_conflict() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("doc.txt"), "s3 encrypted marker test").unwrap();
+        let repo = d.path().join("repo");
+        kova_engine::ops::run_backup(
+            &kova_engine::ops::BackupOptions {
+                sources: vec![src],
+                repo: repo.clone(),
+                session_id: Some("20261124_100000".into()),
+                zstd_level: 3,
+                exclude: vec![],
+                profile_id: None,
+                scan_from: None,
+            },
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let marker = br#"{"version":1,"repo_id":"repo1111","key_check":"aaaa"}"#;
+        fs::write(repo.join(kova_engine::codec::MARKER), marker).unwrap();
+
+        let store: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = stop.clone();
+        let store_srv = store.clone();
+        let order_srv = order.clone();
+        let srv = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !stop_srv.load(Ordering::Relaxed) {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                sock.set_nonblocking(false).unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0u8; 8192];
+                let mut body_start = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if body_start.is_none() {
+                        if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let hdr = String::from_utf8_lossy(&data[..pos]);
+                            content_len = hdr
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            body_start = Some(pos + 4);
+                        }
+                    }
+                    if let Some(bs) = body_start {
+                        if data.len() >= bs + content_len {
+                            break;
+                        }
+                    }
+                }
+                let bs = body_start.unwrap_or(data.len());
+                let hdr = String::from_utf8_lossy(&data[..bs]).to_string();
+                let first = hdr.lines().next().unwrap_or("");
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let uri = parts.next().unwrap_or("").to_string();
+                match method {
+                    "HEAD" => {
+                        let exists = store_srv.lock().unwrap().contains_key(&uri);
+                        let resp = if exists {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        } else {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        };
+                        let _ = sock.write_all(resp.as_bytes());
+                    }
+                    "GET" => {
+                        if let Some(body) = store_srv.lock().unwrap().get(&uri).cloned() {
+                            let resp_hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = sock.write_all(resp_hdr.as_bytes());
+                            let _ = sock.write_all(&body);
+                        } else {
+                            let _ = sock.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                    "PUT" => {
+                        let body = data[bs..bs + content_len].to_vec();
+                        store_srv.lock().unwrap().insert(uri.clone(), body);
+                        order_srv.lock().unwrap().push(uri);
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                    _ => {
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+                let _ = sock.flush();
+            }
+        });
+
+        let cfg = S3Config {
+            endpoint: format!("http://{addr}"),
+            region: "ap-northeast-2".into(),
+            bucket: "kova-bucket".into(),
+            prefix: "pc1".into(),
+            access_key: "TESTKEY".into(),
+            secret_key: "TESTSECRET".into(),
+        };
+        let no = AtomicBool::new(false);
+        let r1 = replicate_to_s3(&repo, &cfg, &no).unwrap();
+        assert_eq!(r1.snapshots_uploaded, 1);
+
+        let marker_uri = format!("/kova-bucket/pc1/{}", kova_engine::codec::MARKER);
+        let snap_uri = "/kova-bucket/pc1/snapshots/20261124_100000.json".to_string();
+        {
+            let st = store.lock().unwrap();
+            assert_eq!(st.get(&marker_uri).map(Vec::as_slice), Some(&marker[..]));
+            let ord = order.lock().unwrap();
+            let mk_pos = ord.iter().position(|u| u == &marker_uri).unwrap();
+            let sn_pos = ord.iter().position(|u| u == &snap_uri).unwrap();
+            assert!(
+                mk_pos < sn_pos,
+                "crypto.json 은 스냅샷보다 먼저 올라가야 함"
+            );
+        }
+
+        // 같은 내용의 crypto.json 으로 재실행하면 통과
+        let r2 = replicate_to_s3(&repo, &cfg, &no).unwrap();
+        assert_eq!((r2.snapshots_uploaded, r2.snapshots_skipped), (0, 1));
+
+        // 같은 길이의 다른 crypto.json 은 충돌로 거부
+        let conflict = br#"{"version":1,"repo_id":"repo2222","key_check":"bbbb"}"#;
+        assert_eq!(conflict.len(), marker.len());
+        fs::write(repo.join(kova_engine::codec::MARKER), conflict).unwrap();
+        let err = replicate_to_s3(&repo, &cfg, &no).unwrap_err();
+        assert!(err.contains("암호화 표식"), "{err}");
+
+        // 잘못된 해시가 들어 있는 매니페스트는 패닉 없이 오류 반환
+        fs::write(repo.join(kova_engine::codec::MARKER), marker).unwrap();
+        fs::write(
+            repo.join("snapshots").join("20261124_110000.json"),
+            r#"{"id":"20261124_110000","files":[{"path":"a","size":1,"chunks":[{"hash":"../bad","offset":0,"length":1,"compressed_length":1}]}]}"#,
+        )
+        .unwrap();
+        let err2 = replicate_to_s3(&repo, &cfg, &no).unwrap_err();
+        assert!(err2.contains("잘못된 해시"), "{err2}");
 
         stop.store(true, Ordering::Relaxed);
         srv.join().unwrap();

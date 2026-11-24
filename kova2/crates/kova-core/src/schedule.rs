@@ -75,7 +75,19 @@ fn schedule_due(p: &Profile, now: DateTime<Local>) -> bool {
             else {
                 return false;
             };
-            now >= target && last < target.timestamp() as f64
+            let effective = if now >= target {
+                target
+            } else {
+                let prev_day = now.date_naive() - chrono::Duration::days(1);
+                let Some(prev) = prev_day
+                    .and_hms_opt(h, m, 0)
+                    .and_then(|t| Local.from_local_datetime(&t).earliest())
+                else {
+                    return false;
+                };
+                prev
+            };
+            last < effective.timestamp() as f64
         }
         "weekly" => {
             if elapsed < 3600.0 {
@@ -126,7 +138,7 @@ fn schedule_due(p: &Profile, now: DateTime<Local>) -> bool {
             let Some((h, m)) = parse_hm(time_part) else {
                 return false;
             };
-            let Some(target_date) = now.date_naive().with_day(day) else {
+            let Some(target_date) = clamped_ymd(now.year(), now.month(), day) else {
                 return false;
             };
             let Some(target) = target_date
@@ -135,10 +147,40 @@ fn schedule_due(p: &Profile, now: DateTime<Local>) -> bool {
             else {
                 return false;
             };
-            now >= target && last < target.timestamp() as f64
+            let effective = if now >= target {
+                target
+            } else {
+                let (py, pm) = if now.month() == 1 {
+                    (now.year() - 1, 12)
+                } else {
+                    (now.year(), now.month() - 1)
+                };
+                let Some(prev_date) = clamped_ymd(py, pm, day) else {
+                    return false;
+                };
+                let Some(prev) = prev_date
+                    .and_hms_opt(h, m, 0)
+                    .and_then(|t| Local.from_local_datetime(&t).earliest())
+                else {
+                    return false;
+                };
+                prev
+            };
+            last < effective.timestamp() as f64
         }
         _ => false,
     }
+}
+
+fn clamped_ymd(year: i32, month: u32, day: u32) -> Option<chrono::NaiveDate> {
+    let mut d = day.min(31);
+    while d >= 1 {
+        if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, d) {
+            return Some(date);
+        }
+        d -= 1;
+    }
+    None
 }
 
 fn parse_hm(s: &str) -> Option<(u32, u32)> {
@@ -434,5 +476,33 @@ mod tests {
             (now.timestamp() as f64 - 4.0 * day).into(),
         );
         assert_eq!(stale_days(&p, now, 3), Some(4));
+    }
+
+    #[test]
+    fn daily_and_monthly_catch_up_missed_previous_occurrence_before_next_target() {
+        // daily: 어제 03:00 몫을 놓친 채 오늘 02:00(오늘 03:00 이전)에 켜지면 즉시 따라잡아야 한다
+        let d_missed = prof("daily", "03:00", Some(at(2026, 11, 9, 3, 5)));
+        assert!(
+            should_run(&d_missed, at(2026, 11, 11, 2, 0)),
+            "놓친 어제 daily 따라잡기"
+        );
+        // 어제 03:00 몫을 이미 돌았으면 오늘 02:00 에는 돌지 않는다
+        let d_done = prof("daily", "03:00", Some(at(2026, 11, 10, 3, 5)));
+        assert!(!should_run(&d_done, at(2026, 11, 11, 2, 0)));
+
+        // monthly: 10월 15일 02:30 몫을 놓친 채 11월 10일(11월 15일 이전)에 켜지면 따라잡는다
+        let m_missed = prof("monthly", "15@02:30", Some(at(2026, 9, 15, 2, 35)));
+        assert!(
+            should_run(&m_missed, at(2026, 11, 10, 9, 0)),
+            "놓친 지난달 monthly 따라잡기"
+        );
+        // 연도 경계(1월 -> 전년 12월)도 올바르게 판정한다
+        let m_year_missed = prof("monthly", "15@02:30", Some(at(2026, 11, 15, 2, 35)));
+        assert!(
+            should_run(&m_year_missed, at(2027, 1, 5, 9, 0)),
+            "놓친 전년 12월 monthly 따라잡기"
+        );
+        let m_year_done = prof("monthly", "15@02:30", Some(at(2026, 12, 15, 2, 35)));
+        assert!(!should_run(&m_year_done, at(2027, 1, 5, 9, 0)));
     }
 }

@@ -2,6 +2,14 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따릅니다. 버전은 `주.부.수정`입니다.
 
+## [3.17.7]
+
+### 수정
+- **앱·업데이트·트레이**: 자동 업데이트 후 재시작이 단일 인스턴스 뮤텍스 충돌로 실패하던 문제 수정, `--tray` 실행 중 바로가기 재실행 시 창이 열리도록 수정, WinPE ISO 생성 따옴표·종료코드 전달 오류 수정, 구글 드라이브 연결 시 `offsite_enabled` 자동 활성화, WORM 보호 이미지 삭제 및 상태 초기화 오류 수정, 설정 탭2 웹훅 저장 버튼 추가, 페이지2 스냅샷 삭제 버튼 활성화, 볼륨 복원 시스템 드라이브 제외·사전 검증, UI 스레드 동기 IPC 제거, 사이드바 저장소 용량을 실제 저장소 드라이브 기준으로 표시, 라이트모드 경고/성공 텍스트 가독성 개선.
+- **엔진·이미지**: 증분 이미지 블록 맵에 런 길이·SHA-256 해시 저장(충돌·확장 런 누락 방지), 체인 복원 NTFS 크기·sparse·실패 정리·헤더 일치 검증 추가, 볼륨 캡처 TOCTOU 기존 파일 삭제 방지 및 비트맵 반환 길이 검증, `u64` 오버플로·한글 UTF-8 경계 잘림·`sync_all` 보강, 스캐너 루트 권한오류 전파·Windows 정션/심볼릭링크 오인 차단·선형 `glob_match` 교체, `load_manifest`·`resolve_chain`·`resolve_restore_path` 경로 탈출 차단, baremetal IOCP 무한 대기 수정, 다중 원본 검색 병합 분리.
+- **코어**: S3 `crypto.json` 복제·SigV4 퍼센트 인코딩·해시 검증, 구글 드라이브 `crypto.json` 바이트 비교, 혼합 팩 전체 오프셋 암호화 탐지, VSS `/` 경로 정규화 및 생성 실패 시 섀도 정리, `config` ACL 유지 및 `.json.bak` 이름 오류 수정, `daily`/`monthly` 놓친 백업 보충, 복구 훈련 프로파일 격리·잠금·고유 임시 폴더, CP949 진단 디코딩, `history` 타임스탬프 및 `update` 접두사 태그 파싱 통일.
+- **서비스·IPC·WinPE·인스톨러**: 취소 백업 오탐 알림 차단, `Verify`/`Gc` 저장소 미연결 30초 무한 재시도 쿨다운, 장시간 업로드 중 프로파일 덮어쓰기 방지, `Drill`/`Restore` 종료 추적, `Subscribe` 스레드 누수 제거, IPC `ERROR_PIPE_BUSY` 재시도·요청 크기/타임아웃 제한, WinPE 한글 `diskpart`·`GetLogicalDrives`·실디스크 크기 조회, 인스톨러 `make_pe.ps1`·`make_update.ps1`·`make_checksums.ps1`·`Kova2.iss` 결함 수정.
+
 ## [3.17.6]
 
 ### 개선

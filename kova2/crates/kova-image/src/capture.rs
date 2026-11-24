@@ -72,10 +72,18 @@ pub fn capture_file(
     let mut src = File::open(source)?;
     let len = src.metadata()?.len();
     let cs = cluster_size as u64;
-    if cluster_size == 0 || !cluster_size.is_power_of_two() || len == 0 || len % cs != 0 {
+    if cluster_size == 0
+        || !cluster_size.is_power_of_two()
+        || cs > crate::qblk::MAX_CHUNK_BYTES
+        || len == 0
+        || !len.is_multiple_of(cs)
+    {
         return Err(QblkError::BadHeaderField("source length / cluster_size"));
     }
     let total = len / cs;
+    let chunk_clusters = CHUNK_CLUSTERS
+        .min((crate::qblk::MAX_CHUNK_BYTES / cs) as usize)
+        .max(1);
     let out = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -91,13 +99,14 @@ pub fn capture_file(
         };
         let mut w = Writer::new(std::io::BufWriter::new(out), &header, level)?;
         let mut st = Stats::default();
-        let mut buf = vec![0u8; CHUNK_CLUSTERS * cluster_size as usize];
+        let buf_clusters = (chunk_clusters as u64).min(total) as usize;
+        let mut buf = vec![0u8; buf_clusters * cluster_size as usize];
         let mut lcn = 0u64;
         while lcn < total {
             if cancel.load(Ordering::Relaxed) {
                 return Err(QblkError::Cancelled);
             }
-            let n = (CHUNK_CLUSTERS as u64).min(total - lcn) as usize;
+            let n = (chunk_clusters as u64).min(total - lcn) as usize;
             let bytes = &mut buf[..n * cluster_size as usize];
             src.read_exact(bytes)?;
             let cl = cluster_size as usize;
@@ -202,5 +211,24 @@ mod tests {
             Err(QblkError::Cancelled)
         ));
         assert!(!o2.exists());
+    }
+
+    #[test]
+    fn large_cluster_size_bounds_chunk_and_rejects_oversized() {
+        let d = tempfile::tempdir().unwrap();
+        let cs = 256 * 1024u32; // 256 KiB: CHUNK_CLUSTERS(2048) * 256 KiB = 512 MiB > MAX_CHUNK_BYTES
+        let src = d.path().join("bigcs.img");
+        let data = vec![0x5Au8; cs as usize * 2];
+        std::fs::write(&src, &data).unwrap();
+        let out = d.path().join("bigcs.qblk");
+        let (h, st) = capture_file(&src, &out, cs, 1, "big", &nocancel(), &|_| {}).unwrap();
+        assert_eq!((h.cluster_size, h.total_clusters, st.clusters), (cs, 2, 2));
+        // cluster_size > MAX_CHUNK_BYTES 거부
+        let out2 = d.path().join("too_big.qblk");
+        assert!(matches!(
+            capture_file(&src, &out2, 512 * 1024 * 1024, 1, "", &nocancel(), &|_| {}),
+            Err(QblkError::BadHeaderField(_))
+        ));
+        assert!(!out2.exists());
     }
 }

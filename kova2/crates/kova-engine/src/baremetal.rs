@@ -17,7 +17,9 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
-use windows::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
+use windows::Win32::System::IO::{
+    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
+};
 
 const SECTOR_SIZE: usize = 4096;
 
@@ -90,6 +92,8 @@ impl Drop for OwnedHandle {
 
 /// ERROR_IO_PENDING (997): the async I/O was submitted successfully.
 const ERROR_IO_PENDING_HR: HRESULT = HRESULT::from_win32(997);
+/// WAIT_TIMEOUT (258): GetQueuedCompletionStatus timed out waiting for completion.
+const WAIT_TIMEOUT_HR: HRESULT = HRESULT::from_win32(258);
 
 pub fn run_baremetal_clone(
     source_path: &str,
@@ -114,12 +118,23 @@ pub fn run_baremetal_clone(
         )
         .into());
     }
+    let end_offset = start_offset
+        .checked_add(total_bytes)
+        .ok_or("start_offset + total_bytes overflow")?;
     if chunk_mb == 0 {
         return Err("chunk_mb must be at least 1".into());
     }
 
-    let chunk_bytes = chunk_mb * 1024 * 1024;
-    let aligned_chunk = (chunk_bytes + SECTOR_SIZE - 1) & !(SECTOR_SIZE - 1);
+    let chunk_bytes = chunk_mb
+        .checked_mul(1024 * 1024)
+        .ok_or("chunk_mb overflow")?;
+    let aligned_chunk = chunk_bytes
+        .checked_add(SECTOR_SIZE - 1)
+        .map(|v| v & !(SECTOR_SIZE - 1))
+        .ok_or("aligned_chunk overflow")?;
+    if aligned_chunk == 0 || u32::try_from(aligned_chunk).is_err() {
+        return Err(format!("chunk_mb({}) exceeds maximum single I/O size", chunk_mb).into());
+    }
     let qd = if queue_depth == 0 { 32 } else { queue_depth };
 
     eprintln!(
@@ -247,7 +262,6 @@ pub fn run_baremetal_clone(
     });
 
     let mut current_offset = start_offset;
-    let end_offset = start_offset + total_bytes;
     let mut in_flight_count = 0usize;
     let mut free_slots: Vec<usize> = (0..qd).collect();
     // First failure reason. Once set, no new I/O is submitted and only in-flight I/O is reaped.
@@ -365,7 +379,6 @@ pub fn run_baremetal_clone(
                 )
             };
 
-            // A null OVERLAPPED means timeout (or a port error): just wait again.
             if !p_overlapped.is_null() {
                 if let Some(idx) = (0..qd).find(|&i| {
                     slots[i].in_flight && std::ptr::eq(&*slots[i].overlapped, p_overlapped)
@@ -393,6 +406,20 @@ pub fn run_baremetal_clone(
                         completed_bytes
                             .fetch_add(slots[idx].bytes_written as u64, Ordering::Relaxed);
                     }
+                }
+            } else if let Err(e) = status {
+                if e.code() != WAIT_TIMEOUT_HR {
+                    eprintln!(
+                        "[RUST IOCP ERROR] GetQueuedCompletionStatus failed: {:?}",
+                        e
+                    );
+                    failure.get_or_insert_with(|| {
+                        format!("GetQueuedCompletionStatus failed: {:?}", e)
+                    });
+                    unsafe {
+                        let _ = CancelIoEx(tgt_handle.0, None);
+                    }
+                    break;
                 }
             }
         }
@@ -530,6 +557,14 @@ mod tests {
     fn zero_length_is_rejected() {
         let res = run_baremetal_clone("unused", "unused", 0, 0, 4, 1, false);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn offset_and_chunk_overflows_are_rejected() {
+        let max_aligned = u64::MAX - (u64::MAX % SECTOR_SIZE as u64);
+        assert!(run_baremetal_clone("unused", "unused", max_aligned, 4096, 4, 1, false).is_err());
+        assert!(run_baremetal_clone("unused", "unused", 0, 4096, 4, usize::MAX, false).is_err());
+        assert!(run_baremetal_clone("unused", "unused", 0, 4096, 4, 4096, false).is_err());
     }
 
     #[test]

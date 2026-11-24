@@ -3,7 +3,7 @@
 ; =========================================================================
 
 #define MyAppName "Kova2"
-#define MyAppVersion "3.17.6"
+#define MyAppVersion "3.17.7"
 #define MyAppPublisher "kks3365550"
 
 [Setup]
@@ -48,7 +48,7 @@ Filename: "{sys}\sc.exe"; Parameters: "config KovaSvc binPath= ""\""{app}\kova-s
 Filename: "{app}\kova-service.exe"; Parameters: "--harden"; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "failureflag KovaSvc 1"; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "start KovaSvc"; Flags: runhidden waituntilterminated
-Filename: "{app}\kova-app.exe"; Description: "Kova2 앱 실행"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\kova-app.exe"; Description: "Kova2 앱 실행"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM kova-app.exe /IM kova-pe.exe"; Flags: runhidden waituntilterminated
@@ -101,6 +101,10 @@ begin
       Sleep(1000);
     end;
   end;
+  { 강제 종료 전 서비스가 아직 살아 있으면 장애 자동 재시작을 꺼서 SCM 이 5초 뒤 되살리지 않게 한다
+    (설치 [Run] 의 --harden 이 5/15/60초 자동 재시작을 다시 복원한다) }
+  if IsKovaSvcInstalled() and not IsKovaSvcStopped() then
+    Exec(ExpandConstant('{sys}\sc.exe'), 'failure KovaSvc reset= 0 actions= ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   { 서비스가 멈췄으면 프로세스가 없어 아무 일도 하지 않는다(콘솔 실행본·응답 없는 서비스만 끝낸다) }
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM kova-service.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;

@@ -3,19 +3,39 @@
 //! 원본·저장소는 읽기만 하고, 임시 폴더는 끝나면 지운다.
 use crate::config::Profile;
 use crate::history::History;
+use crate::lock::{LockError, RepoLock};
 use kova_engine::ops::{run_restore, RestoreOptions};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+static DRILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn run(p: &Profile, scratch_root: &Path) -> String {
     let repo = Path::new(&p.repo_dir);
+    let _lock = match RepoLock::acquire_wait(repo, Duration::from_secs(30)) {
+        Ok(l) => l,
+        Err(LockError::Busy) => {
+            return format!(
+                "{}: 복구 훈련을 건너뜁니다: 다른 작업이 저장소를 사용 중입니다",
+                p.name
+            );
+        }
+        Err(LockError::Io(e)) => {
+            return format!("{}: 저장소를 읽지 못했습니다 ({e})", p.name);
+        }
+    };
     let snap = match History::open(repo).and_then(|mut h| {
         h.sync_snapshots()?;
         h.list_snapshots()
     }) {
-        Ok(mut v) => {
-            v.sort_by(|a, b| a.created_at.total_cmp(&b.created_at));
-            match v.pop() {
+        Ok(v) => {
+            let mut mine: Vec<_> = v.iter().filter(|s| s.profile_id == p.id).cloned().collect();
+            if mine.is_empty() {
+                mine = v.into_iter().filter(|s| s.profile_id.is_empty()).collect();
+            }
+            mine.sort_by(|a, b| a.created_at.total_cmp(&b.created_at));
+            match mine.pop() {
                 Some(s) => s,
                 None => return format!("{}: 스냅샷이 없어 훈련할 수 없습니다", p.name),
             }
@@ -33,7 +53,13 @@ pub fn run(p: &Profile, scratch_root: &Path) -> String {
             );
         }
     }
-    let tmp = scratch_root.join(format!("kova_drill_{}_{}", std::process::id(), snap.id));
+    let seq = DRILL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = scratch_root.join(format!(
+        "kova_drill_{}_{}_{}",
+        std::process::id(),
+        seq,
+        snap.id
+    ));
     let opts = RestoreOptions {
         repo: repo.to_path_buf(),
         session_id: snap.id.clone(),
@@ -101,6 +127,56 @@ mod tests {
         }
         let bad = run(&p, &scratch);
         assert!(bad.contains("실패"), "{bad}");
+    }
+
+    #[test]
+    fn drill_picks_matching_profile_snapshot_in_shared_repo() {
+        let d = tempfile::tempdir().unwrap();
+        let src_a = d.path().join("src_a");
+        std::fs::create_dir_all(&src_a).unwrap();
+        std::fs::write(src_a.join("a.txt"), "profile a data").unwrap();
+        let repo = d.path().join("repo");
+
+        // prof_a 의 정상 스냅샷
+        let opts = BackupOptions {
+            sources: vec![src_a.clone()],
+            repo: repo.clone(),
+            session_id: Some("20261101_000000".into()),
+            zstd_level: 3,
+            exclude: vec![],
+            profile_id: Some("prof_a".into()),
+            scan_from: None,
+        };
+        run_backup(&opts, &|_| {}, &AtomicBool::new(false)).unwrap();
+
+        // 같은 저장소에 더 최신인 prof_b 스냅샷(블롭 누락)을 추가:
+        // prof_a 훈련이 prof_b 스냅샷을 잘못 고르면 실패하므로 프로파일 분리가 검증된다.
+        let missing_hash = "ff".repeat(32);
+        std::fs::write(
+            repo.join("snapshots").join("20261199_000000.json"),
+            format!(
+                r#"{{"id":"20261199_000000","created_at":9999999999.0,"profile_id":"prof_b","files":[{{"path":"broken.txt","size":10,"chunks":[{{"hash":"{missing_hash}","offset":0,"length":10,"compressed_length":10}}]}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let scratch = d.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let mut pa = Profile::new("prof_a", "프로파일A");
+        pa.repo_dir = repo.to_string_lossy().into();
+        let res_a = run(&pa, &scratch);
+        assert!(res_a.contains("통과"), "{res_a}");
+
+        let mut pb = Profile::new("prof_b", "프로파일B");
+        pb.repo_dir = repo.to_string_lossy().into();
+        let res_b = run(&pb, &scratch);
+        assert!(res_b.contains("실패"), "{res_b}");
+
+        let mut pc = Profile::new("prof_c", "프로파일C");
+        pc.repo_dir = repo.to_string_lossy().into();
+        let res_c = run(&pc, &scratch);
+        assert!(res_c.contains("스냅샷이 없어"), "{res_c}");
     }
 
     fn walk(dir: &Path) -> Vec<std::path::PathBuf> {

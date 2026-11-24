@@ -97,8 +97,16 @@ pub struct Header {
 }
 
 fn fixed(s: &str, n: usize) -> Vec<u8> {
-    let mut b = s.as_bytes().to_vec();
-    b.truncate(n);
+    let end = if s.len() <= n {
+        s.len()
+    } else {
+        s.char_indices()
+            .take_while(|&(i, c)| i + c.len_utf8() <= n)
+            .last()
+            .map_or(0, |(i, c)| i + c.len_utf8())
+    };
+    let mut b = Vec::with_capacity(n);
+    b.extend_from_slice(&s.as_bytes()[..end]);
     b.resize(n, 0);
     b
 }
@@ -143,6 +151,12 @@ impl Header {
             return Err(QblkError::BadHeaderField("cluster_size"));
         }
         let total_clusters = u64::from_le_bytes(b[14..22].try_into().unwrap());
+        if total_clusters
+            .checked_mul(cluster_size as u64)
+            .is_none_or(|n| n > i64::MAX as u64)
+        {
+            return Err(QblkError::BadHeaderField("volume size overflow"));
+        }
         let used_clusters = u64::from_le_bytes(b[22..30].try_into().unwrap());
         if used_clusters > total_clusters {
             return Err(QblkError::BadHeaderField("used_clusters"));
@@ -313,10 +327,12 @@ pub fn verify<R: Read>(
         if cancel.load(Ordering::Relaxed) {
             return Err(QblkError::Cancelled);
         }
-        if c.lcn < prev_end {
-            st.order_violations += 1;
+        if !c.raw.is_empty() {
+            if c.lcn < prev_end {
+                st.order_violations += 1;
+            }
+            prev_end = c.lcn.saturating_add(c.cluster_count as u64);
         }
-        prev_end = c.lcn + c.cluster_count as u64;
         st.chunks += 1;
         if c.raw.is_empty() {
             st.empty_chunks += 1;
@@ -356,7 +372,12 @@ pub fn restore_to<R: Read, W: Write + Seek>(
             return Err(QblkError::Cancelled);
         }
         if !c.raw.is_empty() {
-            out.seek(SeekFrom::Start(c.lcn * cs))?;
+            let off = c.lcn.checked_mul(cs).ok_or(QblkError::OutOfRange {
+                lcn: c.lcn,
+                cluster_count: c.cluster_count,
+                total_clusters: rd.header.total_clusters,
+            })?;
+            out.seek(SeekFrom::Start(off))?;
             out.write_all(&c.raw)?;
         }
         st.chunks += 1;
@@ -670,6 +691,42 @@ mod tests {
         assert!(matches!(
             verify(Cursor::new(&img), &nocancel(), &|_| {}),
             Err(QblkError::CrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn korean_source_label_truncates_on_utf8_boundary() {
+        // 12글자 × 3바이트 = 36바이트(> 32바이트). 32바이트 한도에서 10글자(30바이트)로 깔끔히 잘려야 한다.
+        let label = "가나다라마바사아자차카타";
+        let h = Header {
+            version: VERSION,
+            cluster_size: 4096,
+            total_clusters: 10,
+            used_clusters: 0,
+            vsn: "1234-5678".into(),
+            source_label: label.into(),
+        };
+        let bytes = h.to_bytes();
+        let parsed = Header::parse(&bytes).unwrap();
+        assert!(!parsed.source_label.contains('\u{FFFD}'));
+        assert_eq!(parsed.source_label, "가나다라마바사아자차");
+        assert!(parsed.source_label.len() <= 32);
+    }
+
+    #[test]
+    fn header_parse_rejects_volume_size_overflow() {
+        let h = Header {
+            version: VERSION,
+            cluster_size: 4096,
+            total_clusters: (i64::MAX as u64 / 4096) + 1,
+            used_clusters: 0,
+            vsn: String::new(),
+            source_label: String::new(),
+        };
+        let bytes = h.to_bytes();
+        assert!(matches!(
+            Header::parse(&bytes),
+            Err(QblkError::BadHeaderField("volume size overflow"))
         ));
     }
 }

@@ -374,13 +374,9 @@ mod win {
                 if !ioctl(&probe, IOCTL_DISK_GET_LENGTH_INFO, &mut len) {
                     return Err(VolumeError::Io(io::Error::last_os_error()));
                 }
-                check_policy(
-                    info.letter,
-                    system,
-                    &prot,
-                    i64::from_le_bytes(len) as u64,
-                    header,
-                )?;
+                let volume_bytes = u64::try_from(i64::from_le_bytes(len))
+                    .map_err(|_| VolumeError::Refused("음수 볼륨 크기".into()))?;
+                check_policy(info.letter, system, &prot, volume_bytes, header)?;
                 check_confirmation(&info, typed)?;
                 drop(probe);
                 let dev = OpenOptionsExt::share_mode(

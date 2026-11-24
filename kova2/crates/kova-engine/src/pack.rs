@@ -148,27 +148,34 @@ pub fn write_pack(repo: &Path, items: &[(String, Vec<u8>)]) -> io::Result<String
     let id = new_id();
     let pack_tmp = dir.join(format!("{id}.pack.tmp"));
     let idx_tmp = dir.join(format!("{id}.idx.tmp"));
-    let mut idx = String::new();
-    {
-        let mut f = File::create(&pack_tmp)?;
-        let mut off = 0u64;
-        for (h, data) in items {
-            f.write_all(data)?;
-            idx.push_str(&format!("{h} {off} {}\n", data.len()));
-            off += data.len() as u64;
+    let res = (|| -> io::Result<String> {
+        let mut idx = String::new();
+        {
+            let mut f = File::create(&pack_tmp)?;
+            let mut off = 0u64;
+            for (h, data) in items {
+                f.write_all(data)?;
+                idx.push_str(&format!("{h} {off} {}\n", data.len()));
+                off += data.len() as u64;
+            }
+            f.flush()?;
+            f.sync_all()?;
         }
-        f.flush()?;
-        f.sync_all()?;
+        fs::rename(&pack_tmp, pack_file(repo, &id))?;
+        {
+            let mut f = File::create(&idx_tmp)?;
+            f.write_all(idx.as_bytes())?;
+            f.flush()?;
+            f.sync_all()?;
+        }
+        fs::rename(&idx_tmp, idx_file(repo, &id))?;
+        Ok(id)
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&pack_tmp);
+        let _ = fs::remove_file(&idx_tmp);
     }
-    fs::rename(&pack_tmp, pack_file(repo, &id))?;
-    {
-        let mut f = File::create(&idx_tmp)?;
-        f.write_all(idx.as_bytes())?;
-        f.flush()?;
-        f.sync_all()?;
-    }
-    fs::rename(&idx_tmp, idx_file(repo, &id))?;
-    Ok(id)
+    res
 }
 
 #[cfg(test)]

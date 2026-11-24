@@ -7,9 +7,9 @@ export struct SnapRow { id: string, profile-id: string, repo: string, when: stri
 export struct OffsiteRow { id: string, name: string, dir: string }
 export struct AlertRow { when: string, level: string, message: string, full: string, ack: bool }
 export struct BrowseRow { name: string, path: string, is-dir: bool, info: string, selected: bool }
-export struct DriveRow { name: string, pct: int, used: string, free: string, repo: bool }
+export struct DriveRow { name: string, pct: int, used: string, free: string, repo: bool, sys: bool }
 export struct ImageRow { name: string, path: string, size: string, when: string, verified: bool }
-export struct RunRow { id: int, name: string, pct: int, current: string, cancellable: bool, kind: string }
+export struct RunRow { id: int, name: string, pct: int, current: string, cancellable: bool, kind: string, label: string }
 export struct GlobalFileRow { filename: string, rel-path: string, repo: string, snapshot-id: string, versions: string, info: string }
 // '찾아보기' 결과 전달: 선택 창은 별도 스레드에서 열고, 끝나면 앱이 target 이 같은 PathField 에 값을 넣는다(seq 증가로 알림).
 export global PickBus {
@@ -47,10 +47,10 @@ global Theme {
     out property <color> accent-hi: dark ? #60a5fa : #1d4ed8;
     out property <color> accent-bg: dark ? #3b82f61a : #eff6ff;
     
-    out property <color> ok: #22c55e;
+    out property <color> ok: dark ? #22c55e : #15803d;
     out property <color> ok-bg: dark ? #22c55e1a : #f0fdf4;
     
-    out property <color> warn: #eab308;
+    out property <color> warn: dark ? #eab308 : #b45309;
     out property <color> warn-bg: dark ? #eab3081a : #fefce8;
     
     out property <color> danger: #ef4444;
@@ -522,7 +522,10 @@ export component MainWindow inherits Window {
     callback unlock-app(string);
     callback set-master(string, string);
     in-out property <string> settings-text;
+    in-out property <bool> settings-err: false;
     in property <string> main-repo;
+    in-out property <string> repo-drive-free: "";
+    in-out property <int> repo-drive-pct: 0;
     callback verify-image(string);
     callback restore-image(string, string);
     callback capture-image(string, string);
@@ -766,8 +769,8 @@ export component MainWindow inherits Window {
                                 horizontal-stretch: 1;
                             }
                             Text {
-                                text: root.drives.length > 0 ? (root.drives[0].free + " 여유") : "정상";
-                                color: Theme.ok;
+                                text: root.repo-drive-free != "" ? root.repo-drive-free : (root.drives.length > 0 ? (root.drives[0].free + " 여유") : "정상");
+                                color: root.repo-drive-pct >= 90 ? Theme.danger : (root.repo-drive-pct >= 80 ? Theme.warn : Theme.ok);
                                 font-size: 11px;
                                 font-weight: 700;
                             }
@@ -792,8 +795,8 @@ export component MainWindow inherits Window {
                             }
                         }
                         Meter {
-                            pct: root.drives.length > 0 ? root.drives[0].pct : 35;
-                            tone: Theme.accent;
+                            pct: root.repo-drive-free != "" ? root.repo-drive-pct : (root.drives.length > 0 ? root.drives[0].pct : 0);
+                            tone: root.repo-drive-pct >= 90 ? Theme.danger : Theme.accent;
                         }
                     }
                 }
@@ -915,7 +918,7 @@ export component MainWindow inherits Window {
                                     background: Theme.accent;
                                 }
                                 Text {
-                                    text: r.kind == "verify" ? "무결성 검사 진행 중" : (r.kind == "gc" ? "저장소 정리 진행 중" : (r.kind == "delsnap" ? "스냅샷 삭제 중" : (r.kind != "" && r.kind != "backup" ? r.kind + " 진행 중" : "백업 진행 중")));
+                                    text: r.label != "" ? r.label : "백업 진행 중";
                                     color: Theme.accent;
                                     font-size: 12px;
                                     font-weight: 800;
@@ -1193,6 +1196,7 @@ export component MainWindow inherits Window {
 
                 // PAGE 1: PROFILES & SCHEDULE (ADVANCED / CUSTOM)
                 if root.page == 1: ScrollView {
+                    content-width: self.width;
                     VerticalLayout {
                         spacing: 14px;
                         
@@ -1726,7 +1730,7 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 
-                                if root.advanced: VerticalLayout {
+                                VerticalLayout {
                                     alignment: center;
                                     Btn {
                                         text: root.snap-pending == "D" + s.repo + s.id ? "삭제 확인" : "삭제";
@@ -1987,15 +1991,15 @@ export component MainWindow inherits Window {
                                 }
                             }
                             PathField { text <=> root.vol-img; target: "vol-img"; kind: "qblk-open"; placeholder: "선택한 이미지 경로 (목록에 없으면 '찾아보기')"; pick(k, t) => { root.browse(k, t); } }
-                            Hint { text: "② 덮어쓸 드라이브를 고르세요. 선택하면 바로 상태를 확인하고, 아래에 입력할 확인 문구를 보여 줍니다. (백업 보관소 드라이브는 목록에서 제외)"; }
+                            Hint { text: "② 덮어쓸 드라이브를 고르세요. 선택하면 바로 상태를 확인하고, 아래에 입력할 확인 문구를 보여 줍니다. (시스템·백업 보관소 드라이브는 목록에서 제외)"; }
                             HorizontalLayout {
                                 spacing: 10px;
                                 for d in root.drives: Rectangle {
-                                    visible: !d.repo;
-                                    height: d.repo ? 0px : 44px;
-                                    min-width: d.repo ? 0px : 70px;
-                                    max-width: d.repo ? 0px : 160px;
-                                    horizontal-stretch: d.repo ? 0 : 1;
+                                    visible: !d.repo && !d.sys;
+                                    height: (d.repo || d.sys) ? 0px : 44px;
+                                    min-width: (d.repo || d.sys) ? 0px : 70px;
+                                    max-width: (d.repo || d.sys) ? 0px : 160px;
+                                    horizontal-stretch: (d.repo || d.sys) ? 0 : 1;
                                     border-radius: 8px;
                                     border-width: 2px;
                                     border-color: root.vol-letter == d.name ? Theme.danger : Theme.line;
@@ -2059,6 +2063,7 @@ export component MainWindow inherits Window {
 
                 // PAGE 5: PROTECTION & SETTINGS (ADVANCED)
                 if root.page == 5: ScrollView {
+                    content-width: self.width;
                     VerticalLayout {
                         spacing: 16px;
                         alignment: start;
@@ -2113,25 +2118,25 @@ export component MainWindow inherits Window {
                                     text: "⚙ 일반 & 스케줄";
                                     kind: root.settings-tab == 0 ? 1 : 0;
                                     horizontal-stretch: 1;
-                                    clicked => { root.settings-tab = 0; root.settings-text = ""; }
+                                    clicked => { root.settings-tab = 0; root.settings-text = ""; root.settings-err = false; }
                                 }
                                 Btn {
                                     text: "🔒 보안 & 보호";
                                     kind: root.settings-tab == 1 ? 1 : 0;
                                     horizontal-stretch: 1;
-                                    clicked => { root.settings-tab = 1; root.settings-text = ""; }
+                                    clicked => { root.settings-tab = 1; root.settings-text = ""; root.settings-err = false; }
                                 }
                                 Btn {
                                     text: "☁ 클라우드 & 알림";
                                     kind: root.settings-tab == 2 ? 1 : 0;
                                     horizontal-stretch: 1;
-                                    clicked => { root.settings-tab = 2; root.settings-text = ""; }
+                                    clicked => { root.settings-tab = 2; root.settings-text = ""; root.settings-err = false; }
                                 }
                                 Btn {
                                     text: "🚨 비상복구 & 도구";
                                     kind: root.settings-tab == 3 ? 1 : 0;
                                     horizontal-stretch: 1;
-                                    clicked => { root.settings-tab = 3; root.settings-text = ""; }
+                                    clicked => { root.settings-tab = 3; root.settings-text = ""; root.settings-err = false; }
                                 }
                             }
                         }
@@ -2149,24 +2154,6 @@ export component MainWindow inherits Window {
                                 HorizontalLayout {
                                     alignment: start;
                                     Btn { text: "백업 주기·보관·저장소 설정 열기"; clicked => { root.page = 1; } }
-                                }
-
-                                HorizontalLayout {
-                                    spacing: 12px;
-                                    Btn {
-                                        text: "잔여 공간·패킹 설정 저장";
-                                        kind: 1;
-                                        clicked => {
-                                            root.save-settings(root.form-min-free, root.form-ransom, root.form-encrypt, root.form-vss, root.form-pack);
-                                        }
-                                    }
-                                    if root.settings-text != "": Text {
-                                        text: root.settings-text;
-                                        color: Theme.ok;
-                                        font-size: 12px;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
                                 }
                             }
                         }
@@ -2189,6 +2176,13 @@ export component MainWindow inherits Window {
                                     spacing: 10px;
                                     Text { text: "소용량 청크 패킹(Pack)"; color: Theme.text; font-size: 13px; width: 190px; vertical-alignment: center; }
                                     Btn { text: root.form-pack ? "켜짐" : "꺼짐"; kind: root.form-pack ? 1 : 0; clicked => { root.form-pack = !root.form-pack; } }
+                                    Btn {
+                                        text: "잔여 공간·패킹 설정 저장";
+                                        kind: 1;
+                                        clicked => {
+                                            root.save-settings(root.form-min-free, root.form-ransom, root.form-encrypt, root.form-vss, root.form-pack);
+                                        }
+                                    }
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                                 Hint { text: "수만 개의 작은 파일들을 고속 팩 블록으로 묶어 IOPS 병목을 획기적으로 줄입니다."; }
@@ -2203,6 +2197,21 @@ export component MainWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                                 Hint { text: "0은 자동/무제한. CPU 스레드(1~64)와 오프사이트 전송 속도(MB/s)를 제한해 작업 중 PC 부하를 줄입니다."; }
+                            }
+                        }
+
+                        if root.settings-tab == 0 && root.settings-text != "": Card {
+                            border-color: root.settings-err ? Theme.danger : Theme.ok;
+                            background: root.settings-err ? Theme.danger-bg : Theme.ok-bg;
+                            VerticalLayout {
+                                padding: 12px;
+                                Text {
+                                    text: root.settings-text;
+                                    color: root.settings-err ? Theme.danger : Theme.ok;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    wrap: word-wrap;
+                                }
                             }
                         }
 
@@ -2281,7 +2290,7 @@ export component MainWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 8px;
                                     Btn { text: "보안 설정 저장"; kind: 1; clicked => { root.save-settings(root.form-min-free, root.form-ransom, root.form-encrypt, root.form-vss, root.form-pack); } }
-                                    if root.settings-text != "": Text { text: root.settings-text; color: Theme.muted; font-size: 13px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+                                    if root.settings-text != "": Text { text: root.settings-text; color: root.settings-err ? Theme.danger : Theme.ok; font-size: 13px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
                                 }
                             }
                         }
@@ -2339,9 +2348,16 @@ export component MainWindow inherits Window {
                                     Text { text: "원격 웹훅 알림 URL"; color: Theme.text; font-size: 13px; width: 190px; vertical-alignment: center; }
                                     Field { text <=> root.form-webhook; placeholder: "https://hooks.slack.com/... 또는 Discord 웹훅"; horizontal-stretch: 1; }
                                     Btn { text: "테스트 발송"; clicked => { root.test-webhook(root.form-webhook); } }
+                                    Btn {
+                                        text: "웹훅 저장";
+                                        kind: 1;
+                                        clicked => {
+                                            root.save-ops-settings(root.form-webhook, root.form-max-threads, root.form-bw-limit, root.form-pause-battery);
+                                        }
+                                    }
                                 }
                                 Hint { text: "백업 실패·경고 시 Slack/Discord/HTTP 웹훅으로 즉시 알림을 보냅니다. 비워두면 끕니다."; }
-                                if root.settings-text != "": Text { text: root.settings-text; color: Theme.muted; font-size: 13px; wrap: word-wrap; }
+                                if root.settings-text != "": Text { text: root.settings-text; color: root.settings-err ? Theme.danger : Theme.ok; font-size: 13px; wrap: word-wrap; }
                             }
                         }
 
@@ -2374,7 +2390,7 @@ export component MainWindow inherits Window {
                                     Btn { text: "키 복원"; clicked => { root.restore-key(root.form-recovery); } }
                                 }
                                 Hint { text: "암호화 키 분실 시 내보내 둔 복구 코드를 입력하여 복구 마스터 키를 복원합니다."; }
-                                if root.settings-text != "": Text { text: root.settings-text; color: Theme.muted; font-size: 13px; wrap: word-wrap; }
+                                if root.settings-text != "": Text { text: root.settings-text; color: root.settings-err ? Theme.danger : Theme.ok; font-size: 13px; wrap: word-wrap; }
                                 
                                 HorizontalLayout {
                                     spacing: 8px;

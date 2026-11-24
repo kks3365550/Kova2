@@ -11,7 +11,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-cargo build --release -p kova-app -p kova-service
+cargo build --release -p kova-app -p kova-service -p kova-pe
 if ($LASTEXITCODE -ne 0) { throw "release build failed" }
 
 $dist = Join-Path $root "dist"
@@ -19,11 +19,14 @@ New-Item -ItemType Directory -Force $dist | Out-Null
 $stage = Join-Path $dist ("stage_" + $Tag)
 Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $stage | Out-Null
-foreach ($f in @("kova-app.exe", "kova-service.exe")) {
+foreach ($f in @("kova-app.exe", "kova-service.exe", "kova-pe.exe")) {
     $src = Join-Path $root ("target\release\" + $f)
     if (-not (Test-Path $src)) { throw "missing build output: $src" }
     Copy-Item $src $stage
 }
+$makePe = Join-Path $PSScriptRoot "make_pe.ps1"
+if (-not (Test-Path $makePe)) { throw "missing script: $makePe" }
+Copy-Item $makePe $stage
 $zip = Join-Path $dist ("release_" + $Tag + ".zip")
 Remove-Item -Force $zip, ($zip + ".sig"), ($zip + ".sig2") -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip

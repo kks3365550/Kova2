@@ -5,14 +5,21 @@ use crate::bitmap::{allocated_runs, RunParams};
 use crate::qblk::{restore_to, verify, Header, QblkError, Stats, Writer};
 use crate::restore::{check_target, RestoreError};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const DEFAULT_BLOCK_CLUSTERS: u64 = 256; // 4KiB 클러스터 기준 1MiB 단위
 pub const MAX_CHAIN_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockEntry {
+    pub count: u64,
+    pub hash: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockMap {
@@ -20,8 +27,8 @@ pub struct BlockMap {
     pub cluster_size: u32,
     pub total_clusters: u64,
     pub block_clusters: u64,
-    /// 블록 시작 LCN -> CRC32 해시
-    pub hashes: BTreeMap<u64, u32>,
+    /// 블록 시작 LCN -> (클러스터 수, SHA-256 해시)
+    pub hashes: BTreeMap<u64, BlockEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,11 +55,32 @@ pub fn chain_path_for(image: &Path) -> PathBuf {
     PathBuf::from(format!("{}.qchain.json", image.display()))
 }
 
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), QblkError> {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = PathBuf::from(format!(
+        "{}.{}.{}.tmp",
+        path.display(),
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res.map_err(QblkError::from)
+}
+
 pub fn save_block_map(image: &Path, map: &BlockMap) -> Result<(), QblkError> {
     let json = serde_json::to_string_pretty(map)
         .map_err(|e| QblkError::Io(std::io::Error::other(e.to_string())))?;
-    fs::write(map_path_for(image), json)?;
-    Ok(())
+    write_atomic(&map_path_for(image), json.as_bytes())
 }
 
 pub fn load_block_map(image: &Path) -> Result<BlockMap, QblkError> {
@@ -63,8 +91,7 @@ pub fn load_block_map(image: &Path) -> Result<BlockMap, QblkError> {
 pub fn save_chain_meta(image: &Path, meta: &ChainMeta) -> Result<(), QblkError> {
     let json = serde_json::to_string_pretty(meta)
         .map_err(|e| QblkError::Io(std::io::Error::other(e.to_string())))?;
-    fs::write(chain_path_for(image), json)?;
-    Ok(())
+    write_atomic(&chain_path_for(image), json.as_bytes())
 }
 
 pub fn load_chain_meta(image: &Path) -> Result<Option<ChainMeta>, QblkError> {
@@ -93,17 +120,24 @@ pub fn write_incremental_image<R: Read + Seek, W: Write + Seek>(
 ) -> Result<(Stats, IncrementalStats, BlockMap, W), QblkError> {
     let cs = header.cluster_size as u64;
     let total = header.total_clusters;
+    if cs == 0 || !header.cluster_size.is_power_of_two() || cs > crate::qblk::MAX_CHUNK_BYTES {
+        return Err(QblkError::BadHeaderField("cluster_size"));
+    }
     let block_clusters = base_map
         .map(|m| m.block_clusters)
         .unwrap_or(DEFAULT_BLOCK_CLUSTERS)
         .max(1);
+    let max_chunk_bytes = block_clusters
+        .checked_mul(cs)
+        .filter(|&n| n <= crate::qblk::MAX_CHUNK_BYTES)
+        .ok_or(QblkError::BadHeaderField("block_clusters"))?;
 
     // 블록 단위로 분할된 할당 런 목록
     let runs = allocated_runs(
         bitmap,
         RunParams {
             cluster_size: cs,
-            max_chunk_bytes: block_clusters * cs,
+            max_chunk_bytes,
             max_coalesce_gap_bytes: 0,
             ..RunParams::default()
         },
@@ -130,21 +164,31 @@ pub fn write_incremental_image<R: Read + Seek, W: Write + Seek>(
             continue;
         }
         let count = count.min(total - lcn);
-        buf.resize((count * cs) as usize, 0);
-        src.seek(SeekFrom::Start(lcn * cs))?;
+        let byte_off = lcn
+            .checked_mul(cs)
+            .ok_or(QblkError::BadHeaderField("lcn overflow"))?;
+        let byte_len = count
+            .checked_mul(cs)
+            .ok_or(QblkError::BadHeaderField("chunk length"))?;
+        buf.resize(byte_len as usize, 0);
+        src.seek(SeekFrom::Start(byte_off))?;
         src.read_exact(&mut buf)?;
-        let hash = crc32fast::hash(&buf);
-        new_hashes.insert(lcn, hash);
+        let hash = format!("{:x}", Sha256::digest(&buf));
 
         let unchanged = base_map
             .and_then(|m| {
-                if m.cluster_size == header.cluster_size && m.total_clusters == total {
-                    m.hashes.get(&lcn).copied()
+                if m.version == 2
+                    && m.cluster_size == header.cluster_size
+                    && m.total_clusters == total
+                {
+                    m.hashes.get(&lcn)
                 } else {
                     None
                 }
             })
-            .is_some_and(|prev| prev == hash);
+            .is_some_and(|prev| prev.count == count && prev.hash == hash);
+
+        new_hashes.insert(lcn, BlockEntry { count, hash });
 
         if unchanged {
             inc.skipped_clusters += count;
@@ -154,7 +198,7 @@ pub fn write_incremental_image<R: Read + Seek, W: Write + Seek>(
             inc.chunks_written += 1;
             st.chunks += 1;
             st.clusters += count;
-            st.raw_bytes += count * cs;
+            st.raw_bytes += byte_len;
         }
         progress(&st);
     }
@@ -167,7 +211,7 @@ pub fn write_incremental_image<R: Read + Seek, W: Write + Seek>(
     f.flush()?;
 
     let new_map = BlockMap {
-        version: 1,
+        version: 2,
         cluster_size: header.cluster_size,
         total_clusters: total,
         block_clusters,
@@ -203,10 +247,10 @@ pub fn resolve_chain(image: &Path) -> Result<Vec<PathBuf>, QblkError> {
         let Some(meta) = load_chain_meta(&cur)? else {
             break;
         };
+        let comps: Vec<Component<'_>> = Path::new(&meta.parent).components().collect();
         if meta.parent.is_empty()
-            || meta.parent.contains(['/', '\\'])
-            || meta.parent == "."
-            || meta.parent == ".."
+            || meta.parent.contains(['/', '\\', ':'])
+            || !matches!(comps.as_slice(), [Component::Normal(_)])
         {
             return Err(QblkError::Io(std::io::Error::other(format!(
                 "잘못된 부모 이미지 이름: {}",
@@ -249,34 +293,48 @@ pub fn restore_chain_to_file(
         .write(true)
         .create_new(true)
         .open(target)?;
-    let mut out = BufWriter::with_capacity(8 << 20, f);
-    let mut last_header = None;
-    let mut total_stats = Stats::default();
-    for p in &chain {
-        let src = BufReader::with_capacity(8 << 20, File::open(p)?);
-        match restore_to(src, &mut out, cancel, progress) {
-            Ok((h, s)) => {
-                total_stats.chunks += s.chunks;
-                total_stats.clusters += s.clusters;
-                total_stats.raw_bytes += s.raw_bytes;
-                total_stats.compressed_bytes += s.compressed_bytes;
-                last_header = Some(h);
+    let res = (|| -> Result<(Header, Stats), RestoreError> {
+        crate::restore::mark_sparse(&f);
+        let mut out = BufWriter::with_capacity(8 << 20, f);
+        let mut first_geom: Option<(u32, u64)> = None;
+        let mut last_header = None;
+        let mut total_stats = Stats::default();
+        for p in &chain {
+            let src = BufReader::with_capacity(8 << 20, File::open(p)?);
+            let (h, s) = restore_to(src, &mut out, cancel, progress)?;
+            if let Some((cs, tc)) = first_geom {
+                if h.cluster_size != cs || h.total_clusters != tc {
+                    return Err(QblkError::BadHeaderField("chain geometry mismatch").into());
+                }
+            } else {
+                first_geom = Some((h.cluster_size, h.total_clusters));
             }
-            Err(e) => {
-                drop(out);
-                let _ = fs::remove_file(target);
-                return Err(e.into());
-            }
+            total_stats.chunks += s.chunks;
+            total_stats.clusters += s.clusters;
+            total_stats.raw_bytes += s.raw_bytes;
+            total_stats.compressed_bytes += s.compressed_bytes;
+            last_header = Some(h);
         }
+        out.flush()?;
+        let h = last_header.ok_or(QblkError::BadHeaderField("empty chain"))?;
+        let mut full = h
+            .total_clusters
+            .checked_mul(h.cluster_size as u64)
+            .ok_or(QblkError::BadHeaderField("volume size overflow"))?;
+        let f = out.into_inner().map_err(|e| e.into_error())?;
+        if let Some(n) = crate::restore::ntfs_volume_len(target) {
+            full = full.max(n);
+        }
+        if f.metadata()?.len() < full {
+            f.set_len(full)?;
+        }
+        f.sync_all()?;
+        Ok((h, total_stats))
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(target);
     }
-    out.flush()?;
-    let h = last_header.expect("체인은 최소 1개 이상");
-    let full = h.total_clusters * h.cluster_size as u64;
-    let f = out.into_inner().map_err(|e| e.into_error())?;
-    if f.metadata()?.len() < full {
-        f.set_len(full)?;
-    }
-    Ok((h, total_stats))
+    res
 }
 
 #[cfg(test)]
@@ -331,7 +389,7 @@ mod tests {
         let base2_map = {
             let f = File::create(&base2_path).unwrap();
             let dummy = BlockMap {
-                version: 1,
+                version: 2,
                 cluster_size: cs as u32,
                 total_clusters,
                 block_clusters: 2,
@@ -466,5 +524,177 @@ mod tests {
         )
         .unwrap();
         assert!(resolve_chain(&a).is_err());
+    }
+
+    #[test]
+    fn expanded_run_at_same_lcn_is_not_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let cs = 4096usize;
+        let total_clusters = 8u64;
+        let mut disk = vec![0u8; cs * total_clusters as usize];
+        disk[0..cs].fill(0x11);
+        disk[cs..2 * cs].fill(0x22);
+        let no = AtomicBool::new(false);
+        let h = Header {
+            version: 1,
+            cluster_size: cs as u32,
+            total_clusters,
+            used_clusters: 0,
+            vsn: "AABB-CCDD".into(),
+            source_label: "DATA".into(),
+        };
+
+        // 1) Base: LCN 0에 1클러스터만 할당 (bitmap = 0b0000_0001)
+        let base_path = d.path().join("base.qblk");
+        let base_map = {
+            let f = File::create(&base_path).unwrap();
+            let (_, inc, map, _) = write_incremental_image(
+                &mut Cursor::new(&disk),
+                f,
+                &mut h.clone(),
+                &[0b0000_0001],
+                None,
+                1,
+                &no,
+                &|_| {},
+            )
+            .unwrap();
+            assert_eq!(inc.changed_clusters, 1);
+            assert_eq!(map.version, 2);
+            assert_eq!(map.hashes.get(&0).map(|e| e.count), Some(1));
+            map
+        };
+
+        // 2) 해시가 우연히 같더라도 count가 다르면 절대로 건너뛰지 않아야 한다
+        let expanded_hash = format!("{:x}", Sha256::digest(&disk[0..2 * cs]));
+        let mut collided_map = base_map.clone();
+        collided_map.hashes.insert(
+            0,
+            BlockEntry {
+                count: 1,
+                hash: expanded_hash,
+            },
+        );
+        let inc_path = d.path().join("inc.qblk");
+        {
+            let f = File::create(&inc_path).unwrap();
+            let (_, inc, map, _) = write_incremental_image(
+                &mut Cursor::new(&disk),
+                f,
+                &mut h.clone(),
+                &[0b0000_0011],
+                Some(&collided_map),
+                1,
+                &no,
+                &|_| {},
+            )
+            .unwrap();
+            assert_eq!(inc.changed_clusters, 2);
+            assert_eq!(inc.skipped_clusters, 0);
+            assert_eq!(map.hashes.get(&0).map(|e| e.count), Some(2));
+        }
+
+        // 3) 실제 확장 런 복원 검증
+        save_chain_meta(
+            &inc_path,
+            &ChainMeta {
+                version: 1,
+                parent: "base.qblk".into(),
+                changed_clusters: 2,
+                skipped_clusters: 0,
+            },
+        )
+        .unwrap();
+        let out_raw = d.path().join("expanded.img");
+        restore_chain_to_file(&inc_path, &out_raw, &no, &|_| {}).unwrap();
+        assert_eq!(fs::read(&out_raw).unwrap(), disk);
+    }
+
+    #[test]
+    fn resolve_chain_rejects_drive_relative_and_ads_parent() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.qblk");
+        fs::write(&a, b"x").unwrap();
+        for bad in [
+            "C:evil.qblk",
+            "foo.qblk:stream",
+            "../evil.qblk",
+            "sub/b.qblk",
+            ".",
+        ] {
+            save_chain_meta(
+                &a,
+                &ChainMeta {
+                    version: 1,
+                    parent: bad.into(),
+                    changed_clusters: 0,
+                    skipped_clusters: 0,
+                },
+            )
+            .unwrap();
+            assert!(resolve_chain(&a).is_err(), "should reject parent {bad:?}");
+        }
+    }
+
+    #[test]
+    fn restore_chain_rejects_mismatched_header_geometry() {
+        let d = tempfile::tempdir().unwrap();
+        let no = AtomicBool::new(false);
+        let base_path = d.path().join("base.qblk");
+        let inc_path = d.path().join("inc.qblk");
+
+        let mut h1 = Header {
+            version: 1,
+            cluster_size: 4096,
+            total_clusters: 8,
+            used_clusters: 0,
+            vsn: "1111".into(),
+            source_label: "A".into(),
+        };
+        write_incremental_image(
+            &mut Cursor::new(vec![1u8; 4096 * 8]),
+            File::create(&base_path).unwrap(),
+            &mut h1,
+            &[0x01],
+            None,
+            1,
+            &no,
+            &|_| {},
+        )
+        .unwrap();
+
+        let mut h2 = Header {
+            version: 1,
+            cluster_size: 4096,
+            total_clusters: 16, // total_clusters 불일치
+            used_clusters: 0,
+            vsn: "1111".into(),
+            source_label: "A".into(),
+        };
+        write_incremental_image(
+            &mut Cursor::new(vec![2u8; 4096 * 16]),
+            File::create(&inc_path).unwrap(),
+            &mut h2,
+            &[0x01],
+            None,
+            1,
+            &no,
+            &|_| {},
+        )
+        .unwrap();
+        save_chain_meta(
+            &inc_path,
+            &ChainMeta {
+                version: 1,
+                parent: "base.qblk".into(),
+                changed_clusters: 1,
+                skipped_clusters: 0,
+            },
+        )
+        .unwrap();
+
+        let target = d.path().join("mismatch.img");
+        assert!(restore_chain_to_file(&inc_path, &target, &no, &|_| {}).is_err());
+        assert!(!target.exists());
     }
 }

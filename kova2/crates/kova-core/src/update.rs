@@ -2,9 +2,15 @@
 //! 파이썬은 서명이 비어 있으면 서명 검사를 건너뛰지만, 여기서는 서명이 없거나 신뢰 키가 없으면 거부한다(Fail-Closed).
 use sha2::{Digest, Sha256};
 
-/// 'v2.9.1' → [2, 9, 1]. 숫자 접두부만 읽고(예: '3rc1' → 3) 숫자가 없으면 0. 빈 문자열은 [0,0,0].
+/// 'v2.9.1', 'kova2-v3.18.0' → [2, 9, 1], [3, 18, 0]. 숫자 접두부만 읽고(예: '3rc1' → 3) 숫자가 없으면 0. 빈 문자열은 [0,0,0].
 pub fn parse_version(s: &str) -> Vec<u64> {
-    let clean = s.trim().trim_start_matches(['v', 'V']);
+    let trimmed = s.trim();
+    let head = trimmed.split('.').next().unwrap_or(trimmed);
+    let stripped = match head.rfind("-v").into_iter().chain(head.rfind("-V")).max() {
+        Some(pos) => &trimmed[pos + 2..],
+        None => trimmed,
+    };
+    let clean = stripped.trim_start_matches(['v', 'V']);
     let parts: Vec<u64> = clean
         .split('.')
         .map(|p| {
@@ -134,6 +140,12 @@ mod tests {
         assert_eq!(parse_version(" V2.17.82 "), vec![2, 17, 82]);
         assert_eq!(parse_version("3rc1.x"), vec![3, 0]);
         assert_eq!(parse_version(""), vec![0]);
+        assert_eq!(parse_version("kova2-v3.18.0"), vec![3, 18, 0]);
+        assert_eq!(parse_version("kova2-V3.18.1"), vec![3, 18, 1]);
+        assert_eq!(parse_version("1.2.3-v4"), vec![1, 2, 3]);
+        assert!(is_newer("kova2-v3.18.0", "3.17.9"));
+        assert!(!is_newer("kova2-v3.18.0", "kova2-v3.18.0"));
+        assert!(is_newer("kova2-v3.18.1", "kova2-v3.18.0"));
     }
 
     #[test]

@@ -11,7 +11,7 @@ if (-not (Test-Path $DistDir)) { throw "dist 폴더가 없습니다: $DistDir" }
 
 $targets = Get-ChildItem -Path $DistDir -File | Where-Object {
     $_.Name -ne 'SHA256SUMS.txt' -and (
-        $_.Extension -in @('.exe', '.zip', '.sig', '.iso')
+        $_.Extension -in @('.exe', '.zip', '.sig', '.sig2', '.iso')
     )
 } | Sort-Object Name
 

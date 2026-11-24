@@ -109,7 +109,17 @@ fn copy_atomic_throttled(
     w.flush()?;
     w.sync_all()?;
     drop(w);
-    fs::rename(&tmp, dst)?;
+    if let Err(e) = fs::rename(&tmp, dst) {
+        if dst.exists() {
+            let _ = crate::worm::remove_protected(dst);
+            fs::rename(&tmp, dst).inspect_err(|_| {
+                let _ = fs::remove_file(&tmp);
+            })?;
+        } else {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+    }
     Ok(n)
 }
 
@@ -233,7 +243,8 @@ pub fn replicate_with_limit(
                     use kova_engine::pack::{idx_file, pack_file};
                     let (sp, si) = (pack_file(repo, &e.pack), idx_file(repo, &e.pack));
                     let (dp, di) = (pack_file(dest, &e.pack), idx_file(dest, &e.pack));
-                    let have = fs::metadata(&di).is_ok()
+                    let have = fs::metadata(&di)
+                        .is_ok_and(|m| fs::metadata(&si).is_ok_and(|s| s.len() == m.len()))
                         && fs::metadata(&dp)
                             .is_ok_and(|m| fs::metadata(&sp).is_ok_and(|s| s.len() == m.len()));
                     if have {
@@ -485,5 +496,39 @@ mod tests {
             Err(OffsiteError::Io(_))
         ));
         assert!(!other.join("snapshots").exists());
+    }
+
+    #[test]
+    fn copy_atomic_overwrites_readonly_truncated_destination_and_verifies_idx_size() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = make_repo(d.path(), "readonly truncated idx test");
+        let dest = d.path().join("offsite");
+        let no = AtomicBool::new(false);
+        replicate(&repo, &dest, &no).unwrap();
+
+        // 대상의 .idx 파일을 잘라내고 읽기 전용으로 잠근다 + 스냅샷 매니페스트 삭제(재복제 유도)
+        let idx_dst = fs::read_dir(dest.join("packs"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "idx"))
+            .expect("대상 .idx 없음");
+        let idx_src = repo.join("packs").join(idx_dst.file_name().unwrap());
+        let orig_idx = fs::read(&idx_src).unwrap();
+        assert!(orig_idx.len() > 2);
+        fs::write(&idx_dst, &orig_idx[..1]).unwrap();
+        let mut perm = fs::metadata(&idx_dst).unwrap().permissions();
+        perm.set_readonly(true);
+        fs::set_permissions(&idx_dst, perm).unwrap();
+
+        for e in fs::read_dir(dest.join("snapshots")).unwrap() {
+            fs::remove_file(e.unwrap().path()).unwrap();
+        }
+
+        // 재복제 시 .idx 크기 불일치를 감지하고 읽기 전용 대상 파일도 안전하게 덮어써야 한다
+        let r = replicate(&repo, &dest, &no).unwrap();
+        assert_eq!((r.snapshots_copied, r.blobs_copied), (1, 1));
+        assert_eq!(fs::read(&idx_dst).unwrap(), orig_idx);
+        assert!(crate::verify::verify_repo(&dest, true).unwrap().ok());
     }
 }

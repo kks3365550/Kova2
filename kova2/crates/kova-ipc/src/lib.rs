@@ -6,13 +6,21 @@ use std::os::windows::io::AsRawHandle;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\kova";
 
 /// 클라이언트가 읽지 않아 쓰기가 막히면 이 시간 뒤 연결을 끊는다(구독이 서비스 쪽에 쌓이지 않게).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 클라이언트가 연결만 열어 두고 첫 요청 줄을 보내지 않을 때 기다리는 최대 시간.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// 요청 한 줄의 최대 크기(1 MiB). 이보다 큰 요청은 거부해 메모리 고갈을 막는다.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// ERROR_PIPE_BUSY: 모든 파이프 인스턴스가 사용 중(서버가 다음 인스턴스를 만드는 짧은 틈).
+const ERROR_PIPE_BUSY: i32 = 231;
+/// ERROR_PIPE_BUSY 시 파이프 열기를 재시도하는 최대 시간.
+const OPEN_RETRY_LIMIT: Duration = Duration::from_secs(3);
 
 /// 토큰·복구 코드 같은 비밀 문자열. 전송(JSON)은 그대로 하고 Debug 출력은 가린다(로그에 남지 않게).
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -414,10 +422,28 @@ async fn handle(
     // 원시 포인터는 Send 가 아니라 정수로 들고 있다(핸들은 pipe 의 두 반쪽이 살아 있는 동안 유효).
     let raw = pipe.as_raw_handle() as usize;
     let (r, mut w) = tokio::io::split(pipe);
-    let mut lines = BufReader::new(r).lines();
-    let Some(line) = lines.next_line().await? else {
-        return Ok(());
+    let mut lines = BufReader::new(r.take((MAX_REQUEST_BYTES + 1) as u64)).lines();
+    let line = match tokio::time::timeout(READ_TIMEOUT, lines.next_line()).await {
+        Ok(Ok(Some(l))) => l,
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "클라이언트 요청 읽기 시간 초과",
+            ));
+        }
     };
+    if line.len() > MAX_REQUEST_BYTES {
+        send(
+            &mut w,
+            &Event::Error {
+                message: format!("요청 크기가 상한({MAX_REQUEST_BYTES}바이트)을 초과했습니다"),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
     let (caller, token) = caller_of(raw as *mut core::ffi::c_void);
     let reply = match serde_json::from_str::<Request>(&line) {
         Ok(req) => h.handle_with_token(req, caller, token),
@@ -462,6 +488,29 @@ fn parse(line: &str) -> Option<Event> {
     serde_json::from_str(line).ok()
 }
 
+/// 서버가 다음 파이프 인스턴스를 만드는 짧은 틈(ERROR_PIPE_BUSY=231)에는 짧게 쉬며 재시도한다.
+async fn open_pipe(name: &str, sqos: Option<u32>) -> std::io::Result<NamedPipeClient> {
+    let start = std::time::Instant::now();
+    let mut backoff = Duration::from_millis(25);
+    loop {
+        let mut opts = ClientOptions::new();
+        if let Some(flags) = sqos {
+            opts.security_qos_flags(flags);
+        }
+        match opts.open(name) {
+            Ok(c) => return Ok(c),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                if start.elapsed() >= OPEN_RETRY_LIMIT {
+                    return Err(e);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// 클라이언트: 요청 한 줄을 보내고 연결이 닫힐 때까지 이벤트를 모은다.
 pub async fn request(name: &str, req: &Request) -> std::io::Result<Vec<Event>> {
     request_until(name, req, |_| false).await
@@ -473,7 +522,7 @@ pub async fn request_until(
     req: &Request,
     stop: impl Fn(&Event) -> bool,
 ) -> std::io::Result<Vec<Event>> {
-    let client = ClientOptions::new().open(name)?;
+    let client = open_pipe(name, None).await?;
     let (r, mut w) = tokio::io::split(client);
     let mut line = serde_json::to_string(req).unwrap();
     line.push('\n');
@@ -499,7 +548,7 @@ pub async fn stream(
     req: &Request,
     on_event: impl FnMut(Event) -> bool,
 ) -> std::io::Result<()> {
-    stream_with(ClientOptions::new().open(name)?, req, on_event).await
+    stream_with(open_pipe(name, None).await?, req, on_event).await
 }
 
 /// `stream` 과 같되, 서비스가 이 연결 동안 호출한 사용자로 가장할 수 있게 접속한다(`Request::Restore` 용:
@@ -509,9 +558,7 @@ pub async fn stream_as_caller(
     req: &Request,
     on_event: impl FnMut(Event) -> bool,
 ) -> std::io::Result<()> {
-    let client = ClientOptions::new()
-        .security_qos_flags(SQOS_IMPERSONATION)
-        .open(name)?;
+    let client = open_pipe(name, Some(SQOS_IMPERSONATION)).await?;
     stream_with(client, req, on_event).await
 }
 
@@ -755,5 +802,59 @@ mod tests {
         let big = vec![b'x'; 1024];
         let r = write_within(&mut a, &big, Duration::from_millis(100)).await;
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected_with_error() {
+        let name = format!(r"\\.\pipe\kova-test-oversize-{}", std::process::id());
+        let h: Arc<dyn Handler> = Arc::new(Echo(Mutex::new(None)));
+        let n2 = name.clone();
+        tokio::spawn(async move {
+            let _ = serve(&n2, h).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = open_pipe(&name, None).await.unwrap();
+        let (r, mut w) = tokio::io::split(client);
+        let mut big = vec![b'a'; MAX_REQUEST_BYTES + 2];
+        big.push(b'\n');
+        let _ = w.write_all(&big).await;
+        let _ = w.flush().await;
+        let line = BufReader::new(r)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<Event>(&line).unwrap(),
+                Event::Error { .. }
+            ),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_clients_succeed_with_pipe_busy_retry() {
+        let name = format!(r"\\.\pipe\kova-test-concurrent-{}", std::process::id());
+        let h: Arc<dyn Handler> = Arc::new(Echo(Mutex::new(None)));
+        let n2 = name.clone();
+        tokio::spawn(async move {
+            let _ = serve(&n2, h).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let n = name.clone();
+            handles.push(tokio::spawn(
+                async move { request(&n, &Request::Ping).await },
+            ));
+        }
+        for h in handles {
+            let evs = h.await.unwrap().unwrap();
+            assert!(matches!(evs.first(), Some(Event::Pong { .. })), "{evs:?}");
+        }
     }
 }

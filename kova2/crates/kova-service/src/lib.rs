@@ -6,18 +6,20 @@ use kova_core::history::History;
 use kova_core::jobs::{Enqueue, Job, JobQueue, Kind};
 use kova_core::schedule::{should_run, should_run_maintenance, MAX_AUTO_RETRIES};
 use kova_engine::ops::{run_backup_with_threads, BackupOptions, EngineError, Event as EngineEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REPO_LOCK_WAIT: Duration = Duration::from_secs(3);
 /// 저장소 잠금 충돌(Busy) 메시지의 공통 머리말. 이 결과는 알림·웹훅을 보내지 않는다.
 const BUSY_PREFIX: &str = "다른 작업이 저장소를 사용 중";
 /// 잠금 충돌 뒤 이 시간 동안은 정기 스케줄이 같은 프로파일을 다시 큐에 넣지 않는다(30초마다 재큐 방지).
 const LOCK_BUSY_COOLDOWN_SEC: f64 = 300.0;
+/// 정기 유지보수(Verify/Gc)가 실패했을 때 다시 큐에 넣기 전 기다리는 시간(30초마다 무한 재큐 방지).
+const MAINT_FAIL_COOLDOWN: Duration = Duration::from_secs(1800);
 /// 구독자 한 명이 쌓아 둘 수 있는 이벤트 수. 넘치면(읽지 않는 구독자) 그 구독을 끊는다.
 const SUB_CAPACITY: usize = 1024;
 /// 이미지를 만드는 중간 파일 폴더(`images` 아래). 끝나면 `images` 로 옮겨 미완성 파일이 이미지 목록에 보이지 않게 한다.
@@ -157,17 +159,48 @@ pub enum SvcEvent {
 struct Shared {
     queue: Mutex<JobQueue>,
     subs: Mutex<Vec<SyncSender<SvcEvent>>>,
+    wire_subs: Mutex<Vec<SyncSender<kova_ipc::Event>>>,
     store: ConfigStore,
     max_concurrent: usize,
     config_dir: PathBuf,
     /// 실행 중 작업의 취소 플래그(서비스 중지 때 모두 세운다). 이 잠금 안에서 `stopping` 을 확인하고 작업을 시작한다.
     running_flags: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    /// 정기 유지보수(Verify/Gc) 실패 시각(프로파일 ID 기준). 쿨다운 동안 정기 스케줄에서 재예약하지 않는다.
+    maint_failed_at: Mutex<HashMap<String, Instant>>,
+    /// 백그라운드 작업(복구 훈련·IPC 복원) 실행 중 수. shutdown() 이 0 이 될 때까지 기다린다.
+    active_bg: AtomicUsize,
+    /// 현재 복구 훈련이 돌고 있는 프로파일 ID 집합(같은 프로파일에 훈련이 겹치지 않게).
+    active_drills: Mutex<HashSet<String>>,
+    /// 백그라운드 작업(IPC 복원)의 취소 플래그 목록(shutdown() 때 모두 세운다).
+    bg_cancels: Mutex<Vec<Arc<AtomicBool>>>,
     /// 서비스 중지 중: 새 작업을 시작하지 않는다.
     stopping: AtomicBool,
     /// 배터리 때문에 스케줄을 멈춘 상태(로그는 상태가 바뀔 때만 남긴다).
     on_battery: AtomicBool,
     /// IPC 로 보이는 작업 번호 = 내부 번호 + id_base
     id_base: u64,
+}
+
+struct BgGuard {
+    shared: Arc<Shared>,
+    drill_profile: Option<String>,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for BgGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.drill_profile.take() {
+            self.shared.active_drills.lock().unwrap().remove(&pid);
+        }
+        if let Some(flag) = self.cancel.take() {
+            self.shared
+                .bg_cancels
+                .lock()
+                .unwrap()
+                .retain(|f| !Arc::ptr_eq(f, &flag));
+        }
+        self.shared.active_bg.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -180,10 +213,15 @@ impl Supervisor {
         Self(Arc::new(Shared {
             queue: Mutex::new(JobQueue::new()),
             subs: Mutex::new(vec![]),
+            wire_subs: Mutex::new(vec![]),
             store: ConfigStore::new(&config_dir),
             max_concurrent: max_concurrent.max(1),
             config_dir,
             running_flags: Mutex::new(HashMap::new()),
+            maint_failed_at: Mutex::new(HashMap::new()),
+            active_bg: AtomicUsize::new(0),
+            active_drills: Mutex::new(HashSet::new()),
+            bg_cancels: Mutex::new(vec![]),
             stopping: AtomicBool::new(false),
             on_battery: AtomicBool::new(false),
             id_base: wire_id_base(Local::now().timestamp()),
@@ -196,6 +234,12 @@ impl Supervisor {
         rx
     }
 
+    fn subscribe_wire(&self) -> Receiver<kova_ipc::Event> {
+        let (tx, rx) = sync_channel(SUB_CAPACITY);
+        self.0.wire_subs.lock().unwrap().push(tx);
+        rx
+    }
+
     /// 구독자마다 유한한 채널로 보낸다. 가득 찬(읽지 않는) 구독자나 끊긴 구독자는 목록에서 뺀다.
     fn emit(&self, e: SvcEvent) {
         self.0
@@ -203,6 +247,68 @@ impl Supervisor {
             .lock()
             .unwrap()
             .retain(|s| s.try_send(e.clone()).is_ok());
+        let mut wire_subs = self.0.wire_subs.lock().unwrap();
+        if !wire_subs.is_empty() {
+            let wire = to_wire(e, self.0.id_base);
+            wire_subs.retain(|s| s.try_send(wire.clone()).is_ok());
+        }
+    }
+
+    fn maint_failed_recently(&self, profile_id: &str) -> bool {
+        self.0
+            .maint_failed_at
+            .lock()
+            .unwrap()
+            .get(profile_id)
+            .is_some_and(|t| t.elapsed() < MAINT_FAIL_COOLDOWN)
+    }
+
+    fn note_maint_failed(&self, profile_id: &str) {
+        self.0
+            .maint_failed_at
+            .lock()
+            .unwrap()
+            .insert(profile_id.to_string(), Instant::now());
+    }
+
+    fn clear_maint_failed(&self, profile_id: &str) {
+        self.0.maint_failed_at.lock().unwrap().remove(profile_id);
+    }
+
+    fn try_begin_drill(&self, profile_id: &str) -> Result<BgGuard, &'static str> {
+        let mut drills = self.0.active_drills.lock().unwrap();
+        self.0.active_bg.fetch_add(1, Ordering::SeqCst);
+        if self.0.stopping.load(Ordering::SeqCst) {
+            self.0.active_bg.fetch_sub(1, Ordering::SeqCst);
+            return Err("서비스가 중지 중이라 복구 훈련을 시작할 수 없습니다");
+        }
+        if !drills.insert(profile_id.to_string()) {
+            self.0.active_bg.fetch_sub(1, Ordering::SeqCst);
+            return Err("이 프로파일의 복구 훈련이 이미 진행 중입니다");
+        }
+        Ok(BgGuard {
+            shared: self.0.clone(),
+            drill_profile: Some(profile_id.to_string()),
+            cancel: None,
+        })
+    }
+
+    fn try_begin_restore(&self) -> Result<(BgGuard, Arc<AtomicBool>), &'static str> {
+        let mut cancels = self.0.bg_cancels.lock().unwrap();
+        if self.0.stopping.load(Ordering::SeqCst) {
+            return Err("서비스가 중지 중이라 복원을 시작할 수 없습니다");
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        cancels.push(cancel.clone());
+        self.0.active_bg.fetch_add(1, Ordering::SeqCst);
+        Ok((
+            BgGuard {
+                shared: self.0.clone(),
+                drill_profile: None,
+                cancel: Some(cancel.clone()),
+            },
+            cancel,
+        ))
     }
 
     /// 서비스 중지: 새 작업 시작을 막고 실행 중 작업에 취소를 알린 뒤 모두 끝날 때까지(최대 `limit`) 기다린다.
@@ -215,9 +321,15 @@ impl Supervisor {
                 f.store(true, Ordering::SeqCst);
             }
         }
-        let t = std::time::Instant::now();
+        {
+            let bg = self.0.bg_cancels.lock().unwrap();
+            for f in bg.iter() {
+                f.store(true, Ordering::SeqCst);
+            }
+        }
+        let t = Instant::now();
         loop {
-            if self.counts().1 == 0 {
+            if self.counts().1 == 0 && self.0.active_bg.load(Ordering::SeqCst) == 0 {
                 return true;
             }
             if t.elapsed() >= limit {
@@ -369,77 +481,81 @@ impl Supervisor {
             if p.last_snapshot_id.is_some() {
                 let last_verify = p.extra.get("last_verify_at").and_then(|v| v.as_f64());
                 let last_gc = p.extra.get("last_gc_at").and_then(|v| v.as_f64());
-                let mut q = self.0.queue.lock().unwrap();
-                if !q.is_profile_busy(&p.id) {
-                    if should_run_maintenance(
-                        last_verify,
-                        p.last_run,
-                        settings.auto_verify_days,
-                        now,
-                    ) {
-                        q.enqueue(&p.id, Kind::Verify);
-                        kova_core::applog::write(
-                            &self.0.config_dir,
-                            "INFO",
-                            &format!("정기 무결성 검증(Deep Scrub) 예약: profile={}", p.id),
-                        );
-                        n += 1;
-                    } else if should_run_maintenance(
-                        last_gc,
-                        p.last_run,
-                        settings.auto_gc_days,
-                        now,
-                    ) {
-                        q.enqueue(&p.id, Kind::Gc);
-                        kova_core::applog::write(
-                            &self.0.config_dir,
-                            "INFO",
-                            &format!("정기 고아 블롭 정리(GC) 예약: profile={}", p.id),
-                        );
-                        n += 1;
+                if !self.maint_failed_recently(&p.id) {
+                    let mut q = self.0.queue.lock().unwrap();
+                    if !q.is_profile_busy(&p.id) {
+                        if should_run_maintenance(
+                            last_verify,
+                            p.last_run,
+                            settings.auto_verify_days,
+                            now,
+                        ) {
+                            q.enqueue(&p.id, Kind::Verify);
+                            kova_core::applog::write(
+                                &self.0.config_dir,
+                                "INFO",
+                                &format!("정기 무결성 검증(Deep Scrub) 예약: profile={}", p.id),
+                            );
+                            n += 1;
+                        } else if should_run_maintenance(
+                            last_gc,
+                            p.last_run,
+                            settings.auto_gc_days,
+                            now,
+                        ) {
+                            q.enqueue(&p.id, Kind::Gc);
+                            kova_core::applog::write(
+                                &self.0.config_dir,
+                                "INFO",
+                                &format!("정기 고아 블롭 정리(GC) 예약: profile={}", p.id),
+                            );
+                            n += 1;
+                        }
                     }
                 }
-                drop(q);
                 // 주기 복구 훈련: 최근 스냅샷을 임시 폴더에 실제로 복원해 보고 결과를 남긴다(실패하면 알림)
                 let last_drill = p.extra.get("last_drill_at").and_then(|v| v.as_f64());
                 let idle = !self.0.queue.lock().unwrap().is_profile_busy(&p.id);
                 if idle
                     && should_run_maintenance(last_drill, p.last_run, settings.auto_drill_days, now)
                 {
-                    if let Some(mut fresh) = self.0.store.get(&p.id) {
-                        fresh.extra.insert("last_drill_at".into(), now_ts.into());
-                        let _ = self.0.store.upsert(fresh);
-                    }
-                    let me = self.clone();
-                    let prof = p.clone();
-                    std::thread::spawn(move || {
-                        let text = kova_core::drill::run(&prof, &std::env::temp_dir());
-                        let pass = text.contains("통과");
-                        let skipped =
-                            text.contains("건너뜁니다") || text.contains("훈련할 수 없습니다");
-                        kova_core::applog::write(
-                            &me.0.config_dir,
-                            if pass || skipped { "INFO" } else { "ERROR" },
-                            &format!("정기 복구 훈련: {text}"),
-                        );
-                        if let Some(mut fresh) = me.0.store.get(&prof.id) {
-                            fresh
-                                .extra
-                                .insert("last_drill_text".into(), text.clone().into());
-                            let _ = me.0.store.upsert(fresh);
+                    if let Ok(guard) = self.try_begin_drill(&p.id) {
+                        if let Some(mut fresh) = self.0.store.get(&p.id) {
+                            fresh.extra.insert("last_drill_at".into(), now_ts.into());
+                            let _ = self.0.store.upsert(fresh);
                         }
-                        if !pass && !skipped {
-                            let _ = kova_core::alerts::AlertLog::new(&me.0.config_dir).push(
-                                kova_core::alerts::Alert {
-                                    at: Local::now().timestamp() as f64,
-                                    profile_id: prof.id.clone(),
-                                    level: "error".into(),
-                                    message: kova_core::friendly::with_hint(&text),
-                                    acknowledged: false,
-                                },
+                        let me = self.clone();
+                        let prof = p.clone();
+                        std::thread::spawn(move || {
+                            let _guard = guard;
+                            let text = kova_core::drill::run(&prof, &std::env::temp_dir());
+                            let pass = text.contains("통과");
+                            let skipped =
+                                text.contains("건너뜁니다") || text.contains("훈련할 수 없습니다");
+                            kova_core::applog::write(
+                                &me.0.config_dir,
+                                if pass || skipped { "INFO" } else { "ERROR" },
+                                &format!("정기 복구 훈련: {text}"),
                             );
-                        }
-                    });
+                            if let Some(mut fresh) = me.0.store.get(&prof.id) {
+                                fresh
+                                    .extra
+                                    .insert("last_drill_text".into(), text.clone().into());
+                                let _ = me.0.store.upsert(fresh);
+                            }
+                            if !pass && !skipped {
+                                let _ = kova_core::alerts::AlertLog::new(&me.0.config_dir).push(
+                                    kova_core::alerts::Alert {
+                                        at: Local::now().timestamp() as f64,
+                                        profile_id: prof.id.clone(),
+                                        level: "error".into(),
+                                        message: kova_core::friendly::with_hint(&text),
+                                        acknowledged: false,
+                                    },
+                                );
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -509,8 +625,9 @@ impl Supervisor {
         // 실패·경고는 알림 기록에 남긴다(화면이 없는 서비스는 기록만, 표시는 앱이 한다). 사용자 취소는 알리지 않는다.
         // 저장소 잠금 충돌(다른 작업이 사용 중)은 일시적이라 알림·웹훅을 보내지 않는다.
         let busy = !ok && message.starts_with(BUSY_PREFIX);
+        let cancelled = message == "취소됨" || message == "cancelled";
         let is_alert = !busy
-            && message != "취소됨"
+            && !cancelled
             && (!ok || message.contains("복제 실패") || message.contains("이상 징후"));
         if is_alert {
             let _ = kova_core::alerts::AlertLog::new(&self.0.config_dir).push(
@@ -527,7 +644,7 @@ impl Supervisor {
         let st = self.0.store.settings();
         let should_notify = !st.webhook_url.trim().is_empty()
             && !busy
-            && message != "취소됨"
+            && !cancelled
             && (is_alert || (st.notify_on_success && ok));
         if should_notify {
             let url = st.webhook_url.clone();
@@ -699,7 +816,10 @@ impl Supervisor {
             && !kova_core::repocrypto::is_enabled(&opts.repo);
         // VSS: 원본 드라이브를 스냅샷해 잠긴 파일도 같은 시점으로 읽는다. 못 만들면(권한·파일시스템) 직접 읽고 메시지에 남긴다
         let mut vss_note = String::new();
-        let shadows = if self.0.store.settings().use_vss && space_check.is_ok() && !encrypt_missing
+        let shadows = if self.0.store.settings().use_vss
+            && space_check.is_ok()
+            && !encrypt_missing
+            && (missing.is_empty() || partial_missing)
         {
             self.mark_vss(
                 job.id,
@@ -737,12 +857,10 @@ impl Supervisor {
         };
         drop(shadows); // 백업이 끝났으니 섀도 복사본 삭제
         self.unmark_vss(job.id);
-        let now = Local::now().timestamp() as f64;
-        // 결과 반영은 최신 파일을 다시 읽어 이 프로파일만 갱신한다 (실행 중 화면에서 바꾼 설정을 덮어쓰지 않음).
-        // 작업 중에 프로파일이 지워졌으면 결과를 다시 써서 되살리지 않는다.
-        let latest = self.0.store.get(&prof.id);
-        let deleted = latest.is_none();
-        let mut prof = latest.unwrap_or(prof);
+        // 보존 정책·오프사이트 설정은 최신 프로파일에서 읽고, 상태·스냅샷·시각 반영은 모든 후속 업로드가 끝난 직전에
+        // 다시 읽어 적용한다(긴 오프사이트/구글 드라이브 업로드 중 바꾼 설정을 덮어쓰거나 삭제된 프로파일을 되살리지 않음).
+        let prof = self.0.store.get(&prof.id).unwrap_or(prof);
+        let mut user_cancelled = false;
         let out = match res {
             Ok(s) => {
                 let had_previous = prof.last_snapshot_id.is_some();
@@ -759,17 +877,6 @@ impl Supervisor {
                     had_previous,
                     &kova_core::anomaly::AnomalyConfig::default(),
                 );
-                prof.last_status = "success".into();
-                prof.last_snapshot_id = Some(s.session_id.clone());
-                prof.extra.insert("retry_count".into(), 0.into());
-                prof.extra.insert("last_success_at".into(), now.into());
-                prof.extra
-                    .entry("last_drill_at")
-                    .or_insert_with(|| now.into());
-                prof.extra
-                    .entry("last_verify_at")
-                    .or_insert_with(|| now.into());
-                prof.extra.entry("last_gc_at").or_insert_with(|| now.into());
                 // 보존 정책: 랜섬웨어 이상 징후가 감지되면 정상 옛 스냅샷이 밀려 삭제되지 않도록 자동 보류한다
                 let ret = if let Some(ref a) = anomaly {
                     kova_core::applog::write(
@@ -967,25 +1074,56 @@ impl Supervisor {
                 (true, msg, Some(s.session_id))
             }
             Err(e) => {
-                prof.last_status = "failed".into();
                 // 사용자 취소는 재시도하지 않는다(서비스 중지로 인한 취소는 다음 시작 후 재시도한다)
-                let rc = if matches!(e, EngineError::Cancelled)
-                    && !self.0.stopping.load(Ordering::SeqCst)
-                {
-                    MAX_AUTO_RETRIES as u64
+                user_cancelled =
+                    matches!(e, EngineError::Cancelled) && !self.0.stopping.load(Ordering::SeqCst);
+                let msg = if matches!(e, EngineError::Cancelled) {
+                    "취소됨".to_string()
                 } else {
-                    prof.extra
-                        .get("retry_count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0)
-                        + 1
+                    e.to_string()
                 };
-                prof.extra.insert("retry_count".into(), rc.into());
-                (false, e.to_string(), None)
+                (false, msg, None)
             }
         };
-        prof.last_run = Some(now);
-        if deleted {
+        let now = Local::now().timestamp() as f64;
+        if let Some(mut fresh) = self.0.store.get(&prof.id) {
+            match &out {
+                (true, _, Some(sid)) => {
+                    fresh.last_status = "success".into();
+                    fresh.last_snapshot_id = Some(sid.clone());
+                    fresh.extra.insert("retry_count".into(), 0.into());
+                    fresh.extra.insert("last_success_at".into(), now.into());
+                    fresh
+                        .extra
+                        .entry("last_drill_at")
+                        .or_insert_with(|| now.into());
+                    fresh
+                        .extra
+                        .entry("last_verify_at")
+                        .or_insert_with(|| now.into());
+                    fresh
+                        .extra
+                        .entry("last_gc_at")
+                        .or_insert_with(|| now.into());
+                }
+                _ => {
+                    fresh.last_status = "failed".into();
+                    let rc = if user_cancelled {
+                        MAX_AUTO_RETRIES as u64
+                    } else {
+                        fresh
+                            .extra
+                            .get("retry_count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            + 1
+                    };
+                    fresh.extra.insert("retry_count".into(), rc.into());
+                }
+            }
+            fresh.last_run = Some(now);
+            let _ = self.0.store.upsert(fresh);
+        } else {
             kova_core::applog::write(
                 &self.0.config_dir,
                 "INFO",
@@ -994,8 +1132,6 @@ impl Supervisor {
                     prof.id
                 ),
             );
-        } else {
-            let _ = self.0.store.upsert(prof);
         }
         out
     }
@@ -1026,7 +1162,10 @@ impl Supervisor {
                     None,
                 );
             }
-            Err(e) => return (false, format!("저장소 잠금 실패: {e}"), None),
+            Err(e) => {
+                self.note_maint_failed(&prof.id);
+                return (false, format!("저장소 잠금 실패: {e}"), None);
+            }
         };
         self.emit(SvcEvent::Progress {
             job_id: job.id,
@@ -1036,6 +1175,7 @@ impl Supervisor {
         // 1시간 미만의 새 블롭은 진행 중 백업 것일 수 있어 보호된다
         match kova_core::gc::prune_orphans(repo, kova_core::gc::DEFAULT_MIN_AGE_SECS) {
             Ok(r) => {
+                self.clear_maint_failed(&prof.id);
                 let now = Local::now().timestamp() as f64;
                 // 최신 프로파일을 다시 읽어 갱신한다(작업 중 바뀐 설정을 덮어쓰거나 지운 프로파일을 되살리지 않음)
                 if let Some(mut p) = self.0.store.get(&prof.id) {
@@ -1056,7 +1196,10 @@ impl Supervisor {
                     None,
                 )
             }
-            Err(e) => (false, e.to_string(), None),
+            Err(e) => {
+                self.note_maint_failed(&prof.id);
+                (false, e.to_string(), None)
+            }
         }
     }
 
@@ -1190,7 +1333,10 @@ impl Supervisor {
                     None,
                 );
             }
-            Err(e) => return (false, format!("저장소 잠금 실패: {e}"), None),
+            Err(e) => {
+                self.note_maint_failed(&prof.id);
+                return (false, format!("저장소 잠금 실패: {e}"), None);
+            }
         };
         let deep = match job.arg.as_str() {
             "deep" => true,
@@ -1235,9 +1381,9 @@ impl Supervisor {
             ),
             Err(e) => (false, e.to_string(), None),
         };
-        let now = Local::now().timestamp() as f64;
         // 화면의 "검증됨/오류 있음" 표시는 스냅샷 기록(metadata.db)을 읽으므로 검증 결과를 거기에 남긴다
         if let Ok(r) = &verify_result {
+            let now = Local::now().timestamp() as f64;
             if let Ok(h) = History::open(repo) {
                 use std::collections::HashMap;
                 let mut bad: HashMap<String, i64> = HashMap::new();
@@ -1266,11 +1412,17 @@ impl Supervisor {
                     }
                 }
             }
-        }
-        let now = Local::now().timestamp() as f64;
-        if let Some(mut p) = self.0.store.get(&prof.id) {
-            p.extra.insert("last_verify_at".into(), now.into());
-            let _ = self.0.store.upsert(p);
+            if r.ok() {
+                self.clear_maint_failed(&prof.id);
+            } else {
+                self.note_maint_failed(&prof.id);
+            }
+            if let Some(mut p) = self.0.store.get(&prof.id) {
+                p.extra.insert("last_verify_at".into(), now.into());
+                let _ = self.0.store.upsert(p);
+            }
+        } else {
+            self.note_maint_failed(&prof.id);
         }
         res
     }
@@ -1453,19 +1605,7 @@ impl kova_ipc::Handler for IpcHandler {
                     .is_some_and(|i| self.0.cancel(i));
                 Reply::Once(vec![Event::Cancelled { job_id, found }])
             }
-            Request::Subscribe => {
-                let rx = self.0.subscribe();
-                // 유한 채널: 연결 쪽이 막히면 여기서 멈추고, 연결이 쓰기 시간 초과로 끊기면 send 가 실패해 끝난다
-                let (tx, out) = sync_channel(256);
-                std::thread::spawn(move || {
-                    while let Ok(e) = rx.recv() {
-                        if tx.send(to_wire(e, base)).is_err() {
-                            break; // 연결이 끝남
-                        }
-                    }
-                });
-                Reply::Stream(out)
-            }
+            Request::Subscribe => Reply::Stream(self.0.subscribe_wire()),
             // 구글 드라이브 토큰: 파일은 SYSTEM·관리자만 열 수 있으므로 일반 권한 앱의 연결·상태·해제를 대신한다.
             // 토큰 내용을 돌려주는 요청은 없고, 토큰은 기록하지 않는다.
             Request::GdriveStatus => Reply::Once(vec![Event::GdriveStatus {
@@ -1571,9 +1711,18 @@ impl kova_ipc::Handler for IpcHandler {
                         message: format!("프로파일 없음: {profile_id}"),
                     }]);
                 };
+                let guard = match self.0.try_begin_drill(&p.id) {
+                    Ok(g) => g,
+                    Err(msg) => {
+                        return Reply::Once(vec![Event::Error {
+                            message: msg.into(),
+                        }]);
+                    }
+                };
                 // 서비스 임시 폴더(SYSTEM 전용)에 복원해 보고 지운다. 오래 걸리므로 따로 돌린다
                 let (tx, rx) = sync_channel(1);
                 std::thread::spawn(move || {
+                    let _guard = guard;
                     let text = kova_core::drill::run(&p, &std::env::temp_dir());
                     let _ = tx.send(Event::Done { message: text });
                 });
@@ -1635,17 +1784,40 @@ impl IpcHandler {
             return err("등록된 프로파일의 저장소만 서비스가 복원합니다".into());
         }
         let repo_path = PathBuf::from(&repo);
-        let target = match target {
-            Some(t) => match kova_core::restore_target::check(&t, &repo_path) {
-                Ok(p) => Some(p),
-                Err(e) => return err(format!("복원하지 않음: {e}")),
-            },
-            None => None,
+        // SYSTEM 권한으로 파일시스템을 조회하지 않도록, 가장 전에는 순수 문자열 형식만 선검사한다.
+        // 실제 존재 여부·비어 있음·저장소 내부 여부는 아래 가장 스레드 안에서 restore_target::check 로 검사한다.
+        if let Some(ref t) = target {
+            let trimmed = t.trim().trim_matches('"').trim();
+            if trimmed.is_empty() {
+                return err(format!(
+                    "복원하지 않음: {}",
+                    kova_core::restore_target::TargetError::Empty
+                ));
+            }
+            let norm = trimmed.replace('/', "\\");
+            if norm.starts_with("\\\\.\\") || norm.starts_with("\\\\?\\") {
+                return err(format!(
+                    "복원하지 않음: {}",
+                    kova_core::restore_target::TargetError::Device
+                ));
+            }
+            let b = norm.as_bytes();
+            let unc = norm.starts_with("\\\\");
+            if !unc && !(b.len() >= 3 && b[1] == b':' && b[2] == b'\\') {
+                return err(format!(
+                    "복원하지 않음: {}",
+                    kova_core::restore_target::TargetError::NotAbsolute
+                ));
+            }
+        }
+        let (guard, cancel) = match self.0.try_begin_restore() {
+            Ok(v) => v,
+            Err(msg) => return err(msg.into()),
         };
         let cfg = self.0 .0.config_dir.clone();
         let (tx, rx) = sync_channel(64);
         std::thread::spawn(move || {
-            let cancel = AtomicBool::new(false);
+            let _guard = guard;
             let run = || -> Result<String, String> {
                 let _lock = match kova_core::lock::RepoLock::acquire_wait(
                     &repo_path,
@@ -1661,12 +1833,6 @@ impl IpcHandler {
                 };
                 // 가장한 스레드는 키 파일을 열 수 없으므로 SYSTEM 으로 미리 읽어 둔다(작업이 끝나면 놓는다)
                 let _key = kova_core::repocrypto::hold_key(&repo_path)?;
-                let opts = kova_engine::ops::RestoreOptions {
-                    repo: repo_path.clone(),
-                    session_id: session_id.clone(),
-                    only,
-                    target: target.clone(),
-                };
                 let on_event = |ev: EngineEvent| {
                     if let EngineEvent::RestoreProgress { done, total } = ev {
                         if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
@@ -1675,28 +1841,43 @@ impl IpcHandler {
                                 total: total as u64,
                             })
                         {
-                            cancel.store(true, Ordering::Relaxed); // 앱이 연결을 끊음
+                            cancel.store(true, Ordering::SeqCst); // 앱이 연결을 끊음
                         }
                     }
                 };
                 let token = Arc::new(token);
-                let s = kova_core::secrets::run_in_setup_pool(
+                kova_core::secrets::run_in_setup_pool(
                     move || token.impersonate_current_thread(),
-                    || kova_engine::ops::run_restore(&opts, &on_event, &cancel),
+                    || -> Result<String, String> {
+                        let checked_target = match target.as_deref() {
+                            Some(t) => Some(
+                                kova_core::restore_target::check(t, &repo_path)
+                                    .map_err(|e| format!("복원하지 않음: {e}"))?,
+                            ),
+                            None => None,
+                        };
+                        let opts = kova_engine::ops::RestoreOptions {
+                            repo: repo_path.clone(),
+                            session_id: session_id.clone(),
+                            only,
+                            target: checked_target.clone(),
+                        };
+                        let s = kova_engine::ops::run_restore(&opts, &on_event, &cancel)
+                            .map_err(|e| e.to_string())?;
+                        Ok(match &checked_target {
+                            Some(t) => format!(
+                                "복원 완료: {} (항목 {}개, {:.0}초)",
+                                t.display(),
+                                s.total_files,
+                                s.elapsed_seconds
+                            ),
+                            None => format!(
+                                "원래 위치로 복원 완료 (항목 {}개, {:.0}초)",
+                                s.total_files, s.elapsed_seconds
+                            ),
+                        })
+                    },
                 )?
-                .map_err(|e| e.to_string())?;
-                Ok(match &target {
-                    Some(t) => format!(
-                        "복원 완료: {} (항목 {}개, {:.0}초)",
-                        t.display(),
-                        s.total_files,
-                        s.elapsed_seconds
-                    ),
-                    None => format!(
-                        "원래 위치로 복원 완료 (항목 {}개, {:.0}초)",
-                        s.total_files, s.elapsed_seconds
-                    ),
-                })
             };
             let r = run();
             kova_core::applog::write(
@@ -1713,6 +1894,7 @@ impl IpcHandler {
             );
             let _ = tx.send(match r {
                 Ok(message) => Event::Done { message },
+                Err(e) if e.starts_with("복원하지 않음:") => Event::Error { message: e },
                 Err(e) => Event::Error {
                     message: format!("복원 실패: {e}"),
                 },
@@ -2850,6 +3032,115 @@ mod tests {
         }
         assert!(s.0.subs.lock().unwrap().is_empty());
         assert_eq!(rx.try_iter().count(), SUB_CAPACITY);
+    }
+
+    #[test]
+    fn cancelled_backup_does_not_push_alert() {
+        let (d, s) = setup(true);
+        let held = kova_core::lock::RepoLock::try_acquire(&d.path().join("repo")).unwrap();
+        let rx = s.subscribe();
+        let Enqueue::Queued(job_id) = s.enqueue("p1", Kind::Backup) else {
+            panic!("백업이 큐에 들어가야 함");
+        };
+        assert!(s.cancel(job_id));
+        drop(held);
+        wait_idle(&s);
+        let evs: Vec<SvcEvent> = rx.try_iter().collect();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                SvcEvent::JobFinished {
+                    ok: false,
+                    ref message,
+                    ..
+                } if message == "취소됨"
+            )),
+            "{evs:?}"
+        );
+        assert!(
+            kova_core::alerts::AlertLog::new(&d.path().join("cfg"))
+                .list()
+                .is_empty(),
+            "취소된 백업은 알림을 남기지 않아야 함"
+        );
+    }
+
+    #[test]
+    fn failed_verify_and_gc_enter_cooldown_and_preserve_last_verify_at() {
+        let (d, s) = setup(true);
+        let store = ConfigStore::new(d.path().join("cfg"));
+        let now = Local::now();
+        let now_ts = now.timestamp() as f64;
+        let eight_days_ago = now_ts - 8.0 * 86_400.0;
+        let mut p = store.get("p1").unwrap();
+        p.auto_backup_enabled = false;
+        p.last_snapshot_id = Some("s1".into());
+        p.last_run = Some(now_ts);
+        p.extra
+            .insert("last_verify_at".into(), eight_days_ago.into());
+        p.extra.insert("last_gc_at".into(), eight_days_ago.into());
+        p.extra.insert("last_drill_at".into(), now_ts.into());
+        store.upsert(p).unwrap();
+
+        // repo/snapshots 를 파일로 만들어 verify_repo 가 Err 를 반환하도록 유도
+        let repo = d.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("snapshots"), b"not-a-dir").unwrap();
+
+        assert_eq!(s.tick(now), 1);
+        wait_idle(&s);
+        let after_verify = store.get("p1").unwrap();
+        assert_eq!(
+            after_verify
+                .extra
+                .get("last_verify_at")
+                .and_then(|v| v.as_f64()),
+            Some(eight_days_ago),
+            "verify_repo 오류 시 last_verify_at 를 갱신하면 안 됨"
+        );
+        assert_eq!(
+            s.tick(now),
+            0,
+            "Verify 실패 후 쿨다운 동안은 다음 틱에서 재큐잉하지 않아야 함"
+        );
+
+        // 이번에는 손상된 매니페스트로 GC 실패를 유도하고 쿨다운 확인
+        fs::remove_file(repo.join("snapshots")).unwrap();
+        fs::create_dir_all(repo.join("snapshots")).unwrap();
+        fs::write(repo.join("snapshots").join("bad.json"), b"{corrupt").unwrap();
+        s.clear_maint_failed("p1");
+        let mut p2 = store.get("p1").unwrap();
+        p2.extra.insert("last_verify_at".into(), now_ts.into());
+        store.upsert(p2).unwrap();
+
+        assert_eq!(s.tick(now), 1);
+        wait_idle(&s);
+        assert_eq!(
+            s.tick(now),
+            0,
+            "Gc 실패 후 쿨다운 동안은 다음 틱에서 재큐잉하지 않아야 함"
+        );
+    }
+
+    #[test]
+    fn shutdown_waits_for_active_bg_and_refuses_new_drill_and_restore() {
+        let (_d, s) = setup(true);
+        let guard = s.try_begin_drill("p1").unwrap();
+        assert!(
+            s.try_begin_drill("p1").is_err(),
+            "같은 프로파일의 중복 훈련은 거부되어야 함"
+        );
+        let (r_guard, r_cancel) = s.try_begin_restore().unwrap();
+        assert!(!s.shutdown(Duration::from_millis(100), || {}));
+        assert!(
+            r_cancel.load(Ordering::SeqCst),
+            "shutdown 은 진행 중 복원의 취소 플래그를 세워야 함"
+        );
+        drop(guard);
+        drop(r_guard);
+        assert!(s.shutdown(Duration::from_secs(2), || {}));
+        assert!(s.try_begin_drill("p1").is_err());
+        assert!(s.try_begin_restore().is_err());
     }
 }
 
