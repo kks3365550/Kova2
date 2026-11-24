@@ -1,0 +1,427 @@
+import { Theme, PickBus } from "theme.slint";
+
+export component Card inherits Rectangle {
+    background: Theme.card;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.line;
+}
+
+export component Heading inherits Text {
+    color: Theme.text;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+export component Hint inherits Text {
+    color: Theme.muted;
+    font-size: 12px;
+    wrap: word-wrap;
+}
+
+// Fluent Button with 3 tactile variants (0: standard subtle, 1: primary accent, 2: danger)
+export component Btn inherits Rectangle {
+    in property <string> text;
+    in property <int> kind: 0;
+    callback clicked();
+    min-width: lbl.preferred-width + 24px;
+    height: 32px;
+    border-radius: 8px;
+    border-width: 1px;
+
+    background: kind == 1
+        ? (ta.has-hover ? (ta.pressed ? Theme.accent : Theme.accent-hi) : Theme.accent)
+        : kind == 2
+            ? (ta.has-hover ? (ta.pressed ? #dc2626 : Theme.danger) : Theme.danger-bg)
+            : (ta.has-hover ? (ta.pressed ? Theme.card-pressed : Theme.card-hi) : Theme.card);
+
+    border-color: kind == 1
+        ? Theme.accent
+        : kind == 2
+            ? (ta.has-hover ? Theme.danger : Theme.danger.with-alpha(0.4))
+            : (ta.has-hover ? Theme.line-focus : Theme.line);
+
+    lbl := Text {
+        text: root.text;
+        color: kind == 1
+            ? #ffffff
+            : kind == 2
+                ? (ta.has-hover ? #ffffff : Theme.danger)
+                : (ta.has-hover ? Theme.text : Theme.text-sub);
+        font-size: 13px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component Toggle inherits Rectangle {
+    in-out property <bool> checked: false;
+    in property <string> on-text: "켜짐";
+    in property <string> off-text: "꺼짐";
+    callback toggled(bool);
+    min-width: tl.preferred-width + 24px;
+    height: 32px;
+    border-radius: 8px;
+    border-width: 1px;
+    background: checked
+        ? (ta.has-hover ? Theme.accent-hi : Theme.accent)
+        : (ta.has-hover ? Theme.card-hi : Theme.card);
+    border-color: checked ? Theme.accent : (ta.has-hover ? Theme.line-focus : Theme.line);
+    tl := Text {
+        text: root.checked ? root.on-text : root.off-text;
+        color: root.checked ? #ffffff : Theme.text-sub;
+        font-size: 13px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+export component Field inherits Rectangle {
+    in-out property <string> text <=> ti.text;
+    in property <string> placeholder;
+    in property <bool> secret: false;
+    height: 36px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: ti.has-focus ? Theme.line-focus : Theme.line;
+    background: Theme.bg-subtle;
+
+    Text {
+        x: 12px;
+        text: root.placeholder;
+        color: Theme.muted;
+        font-size: 13px;
+        vertical-alignment: center;
+        visible: ti.text == "";
+    }
+    ti := TextInput {
+        x: 12px;
+        width: parent.width - 24px;
+        height: parent.height;
+        font-size: 13px;
+        color: Theme.text;
+        vertical-alignment: center;
+        single-line: true;
+        input-type: root.secret ? InputType.password : InputType.text;
+    }
+}
+
+export component PathField inherits HorizontalLayout {
+    in-out property <string> text <=> f.text;
+    in property <string> placeholder;
+    in property <string> kind: "folder";
+    in property <bool> append: false;
+    in property <string> target;
+    callback pick(string, string);
+    property <int> bus-seq: PickBus.seq;
+    changed bus-seq => {
+        if (root.target != "" && PickBus.target == root.target) {
+            f.text = (root.append && f.text != "") ? f.text + ";" + PickBus.value : PickBus.value;
+        }
+    }
+    spacing: 8px;
+    f := Field { placeholder: root.placeholder; horizontal-stretch: 1; }
+    Btn {
+        text: "찾아보기";
+        clicked => { root.pick(root.kind, root.target); }
+    }
+}
+
+export component Badge inherits Rectangle {
+    in property <string> text;
+    in property <color> tone: Theme.muted;
+    height: 24px;
+    border-radius: 12px;
+    background: tone.with-alpha(0.16);
+    border-width: 1px;
+    border-color: tone.with-alpha(0.3);
+    horizontal-stretch: 0;
+    width: bl.preferred-width + 28px;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        alignment: center;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: root.tone;
+            }
+        }
+        bl := Text {
+            text: root.text;
+            color: root.tone;
+            font-size: 11px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component Meter inherits Rectangle {
+    in property <int> pct;
+    in property <color> tone: Theme.accent;
+    height: 8px;
+    border-radius: 4px;
+    background: Theme.bg-subtle;
+    border-width: 1px;
+    border-color: Theme.line;
+    Rectangle {
+        x: 0px;
+        width: parent.width * min(root.pct, 100) / 100;
+        height: parent.height;
+        border-radius: 4px;
+        background: root.tone;
+    }
+}
+
+// Windows 11 Fluent Stepper Nav Item
+export component NavStepItem inherits Rectangle {
+    in property <string> step-num;
+    in property <string> title;
+    in property <string> sub;
+    in property <bool> active;
+    callback clicked();
+
+    height: 60px;
+    border-radius: 10px;
+    background: active ? (Theme.dark ? #ffffff14 : #eff6ff) : (ta.has-hover ? (Theme.dark ? #ffffff0a : #f1f5f9) : transparent);
+    border-width: 1px;
+    border-color: active ? (Theme.dark ? #3b82f688 : #93c5fd) : transparent;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 12px;
+        alignment: stretch;
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 16px;
+                background: active ? Theme.accent : (Theme.dark ? #ffffff18 : #e2e8f0);
+
+                Text {
+                    text: root.step-num;
+                    color: active ? #ffffff : Theme.muted;
+                    font-size: 14px;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.title;
+                color: active ? Theme.text : Theme.text-sub;
+                font-size: 13px;
+                font-weight: active ? 700 : 600;
+                overflow: elide;
+            }
+            Text {
+                text: root.sub;
+                color: Theme.muted;
+                font-size: 11px;
+                overflow: elide;
+            }
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 3 Big Backup Mode Cards for Page 0
+export component ModeCard inherits Rectangle {
+    in property <string> badge-text;
+    in property <string> title;
+    in property <string> desc;
+    in property <string> tag;
+    in property <string> icon-text;
+    in property <string> f1: "";
+    in property <string> f2: "";
+    in property <string> f3: "";
+    in property <bool> selected: false;
+    callback clicked();
+
+    min-height: 290px;
+    border-radius: 14px;
+    background: selected ? (Theme.dark ? #1a2333 : #f0f7ff) : (ta.has-hover ? (Theme.dark ? #1a2230 : #f8fafc) : Theme.card);
+    border-width: selected ? 2px : 1px;
+    border-color: selected ? Theme.accent : (ta.has-hover ? Theme.line-focus : Theme.line);
+
+    animate background { duration: 120ms; }
+    animate border-color { duration: 120ms; }
+
+    VerticalLayout {
+        padding: 22px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            alignment: space-between;
+
+            // Icon Container
+            Rectangle {
+                width: 44px;
+                height: 44px;
+                border-radius: 11px;
+                background: selected ? Theme.accent.with-alpha(0.2) : (Theme.dark ? #222c3d : #f1f5f9);
+                border-width: 1px;
+                border-color: selected ? Theme.accent.with-alpha(0.4) : Theme.line;
+
+                Text {
+                    text: root.icon-text;
+                    font-size: 22px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+
+                if root.badge-text != "": Badge {
+                    text: root.badge-text;
+                    tone: selected ? Theme.accent : Theme.muted;
+                }
+
+                // Radio indicator (Fluent UI style)
+                Rectangle {
+                    width: 20px;
+                    height: 20px;
+                    y: 2px;
+                    border-radius: 10px;
+                    border-width: 2px;
+                    border-color: selected ? Theme.accent : (Theme.dark ? #334155 : #cbd5e1);
+                    background: transparent;
+
+                    if selected: Rectangle {
+                        width: 10px;
+                        height: 10px;
+                        border-radius: 5px;
+                        background: Theme.accent;
+                    }
+                }
+            }
+        }
+
+        // Mode Title
+        Text {
+            height: 24px;
+            text: root.title;
+            color: selected ? (Theme.dark ? #ffffff : #0f172a) : Theme.text;
+            font-size: 18px;
+            font-weight: 800;
+            vertical-alignment: center;
+        }
+
+        // Mode Description
+        Text {
+            height: 56px;
+            text: root.desc;
+            color: selected ? (Theme.dark ? #cbd5e1 : #475569) : Theme.muted;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+
+        Rectangle {
+            height: 1px;
+            background: selected ? Theme.accent.with-alpha(0.25) : Theme.line;
+        }
+
+        // Feature bullet points
+        if root.f1 != "": VerticalLayout {
+            spacing: 8px;
+            HorizontalLayout {
+                height: 20px;
+                spacing: 8px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle { width: 5px; height: 5px; border-radius: 2.5px; background: selected ? Theme.accent : Theme.muted; }
+                }
+                Text { text: root.f1; color: selected ? Theme.text : Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+            }
+            if root.f2 != "": HorizontalLayout {
+                height: 20px;
+                spacing: 8px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle { width: 5px; height: 5px; border-radius: 2.5px; background: selected ? Theme.accent : Theme.muted; }
+                }
+                Text { text: root.f2; color: selected ? Theme.text : Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+            }
+            if root.f3 != "": HorizontalLayout {
+                height: 20px;
+                spacing: 8px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle { width: 5px; height: 5px; border-radius: 2.5px; background: selected ? Theme.accent : Theme.muted; }
+                }
+                Text { text: root.f3; color: selected ? Theme.text : Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        // Tag Pill / Footer
+        if root.tag != "": HorizontalLayout {
+            alignment: start;
+            Rectangle {
+                border-radius: 6px;
+                background: selected ? Theme.accent.with-alpha(0.12) : (Theme.dark ? #1a2230 : #f1f5f9);
+                border-width: 1px;
+                border-color: selected ? Theme.accent.with-alpha(0.3) : transparent;
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 5px;
+                    padding-bottom: 5px;
+
+                    Text {
+                        text: root.tag;
+                        color: selected ? Theme.accent : Theme.muted;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+                }
+            }
+        }
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}

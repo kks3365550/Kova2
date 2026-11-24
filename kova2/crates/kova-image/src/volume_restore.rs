@@ -116,6 +116,36 @@ pub fn check_policy(
     Ok(())
 }
 
+/// 볼륨 복원 진행 단계.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestorePhase {
+    Decrypt,
+    Verify,
+    Write,
+}
+
+/// 볼륨 복원 진행 상태(체인·암호화 복원용).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreProgress {
+    pub phase: RestorePhase,
+    pub link_index: usize,
+    pub link_count: usize,
+    pub stats: Stats,
+}
+
+fn combine_stats(base: &Stats, delta: &Stats, total_raw_bytes: u64) -> Stats {
+    Stats {
+        chunks: base.chunks + delta.chunks,
+        clusters: base.clusters + delta.clusters,
+        raw_bytes: base.raw_bytes + delta.raw_bytes,
+        total_raw_bytes,
+        compressed_bytes: base.compressed_bytes + delta.compressed_bytes,
+        empty_chunks: base.empty_chunks + delta.empty_chunks,
+        empty_clusters: base.empty_clusters + delta.empty_clusters,
+        order_violations: base.order_violations + delta.order_violations,
+    }
+}
+
 /// 핵심 흐름. 이미지 검증이 끝나기 전에는 `open` 을 호출하지 않으므로 깨진 이미지로는 장치를 열지도 않는다.
 /// `open` 은 정책·확인 문구 검사와 장치 열기·잠금을 맡고, 실패하면 아무것도 쓰지 않은 채 오류를 돌려준다.
 pub fn restore_verified<W: Write + Seek, F: FnOnce(&Header) -> Result<W, VolumeError>>(
@@ -147,6 +177,77 @@ pub fn restore_verified<W: Write + Seek, F: FnOnce(&Header) -> Result<W, VolumeE
     })?)
 }
 
+/// 풀+증분 체인의 모든 링크를 먼저 검증한 뒤 `open`으로 연 대상(`Write + Seek`)에 순서대로 쓴다.
+/// 어느 한 링크라도 검증 또는 지오메트리(cluster_size·total_clusters) 검사에 실패하면 `open`을 호출하지 않는다.
+pub fn restore_chain_to_volume_writer<
+    W: Write + Seek,
+    F: FnOnce(&Header) -> Result<W, VolumeError>,
+>(
+    image: &Path,
+    open: F,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(&RestoreProgress),
+) -> Result<(Header, Stats), VolumeError> {
+    let chain = crate::incremental::resolve_chain(image)?;
+    if chain.is_empty() {
+        return Err(QblkError::BadHeaderField("empty chain").into());
+    }
+    let mut files = Vec::with_capacity(chain.len());
+    for p in &chain {
+        files.push(File::open(p)?);
+    }
+    let link_count = files.len();
+    let mut first_geom: Option<(u32, u64)> = None;
+    let mut last_header: Option<Header> = None;
+    let mut verify_accum = Stats::default();
+    let mut total_expected: u64 = 0;
+
+    for (idx, f) in files.iter().enumerate() {
+        let (h, s) = verify(BufReader::with_capacity(8 << 20, f), cancel, &|cur| {
+            progress(&RestoreProgress {
+                phase: RestorePhase::Verify,
+                link_index: idx,
+                link_count,
+                stats: combine_stats(&verify_accum, cur, 0),
+            });
+        })?;
+        if let Some((cs, tc)) = first_geom {
+            if h.cluster_size != cs || h.total_clusters != tc {
+                return Err(QblkError::BadHeaderField("chain geometry mismatch").into());
+            }
+        } else {
+            first_geom = Some((h.cluster_size, h.total_clusters));
+        }
+        verify_accum = combine_stats(&verify_accum, &s, 0);
+        total_expected =
+            total_expected.saturating_add(h.used_clusters.saturating_mul(h.cluster_size as u64));
+        last_header = Some(h);
+    }
+
+    for f in &mut files {
+        f.rewind()?;
+    }
+    let final_header = last_header.ok_or(QblkError::BadHeaderField("empty chain"))?;
+    let mut dev = open(&final_header)?;
+
+    let expected = total_expected.max(1);
+    let mut write_accum = Stats::default();
+    for (idx, f) in files.iter().enumerate() {
+        let src = BufReader::with_capacity(8 << 20, f);
+        let (_, s) = restore_to(src, &mut dev, cancel, &|cur| {
+            progress(&RestoreProgress {
+                phase: RestorePhase::Write,
+                link_index: idx,
+                link_count,
+                stats: combine_stats(&write_accum, cur, expected),
+            });
+        })?;
+        write_accum = combine_stats(&write_accum, &s, expected);
+    }
+    dev.flush()?;
+    Ok((final_header, write_accum))
+}
+
 /// `\\?\E:\x` → `E:\x`, `\\?\UNC\srv\s` → `\\srv\s` (canonicalize 결과를 드라이브 문자로 비교할 수 있게).
 fn normalize_path(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -171,7 +272,9 @@ fn is_unc(p: &Path) -> bool {
 }
 
 #[cfg(windows)]
-pub use win::{restore_image_to_volume, volume_info};
+pub use win::{
+    restore_chain_to_volume, restore_encrypted_to_volume, restore_image_to_volume, volume_info,
+};
 
 #[cfg(windows)]
 mod win {
@@ -300,23 +403,60 @@ mod win {
         guid_of_mount_point(&mp)
     }
 
-    /// 대상 볼륨이 이미지·실행 파일이 실제로 있는 볼륨과 같은지 GUID로 확인한다(문자 비교로 못 잡는 폴더 마운트·링크 대비).
-    fn check_not_source_volume(letter: char, image: &Path) -> Result<(), VolumeError> {
+    fn system_drive() -> char {
+        std::env::var("SystemDrive")
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or('C')
+    }
+
+    fn collect_protected_letters(extra_letters: &[char], paths: &[&Path]) -> Vec<char> {
+        let mut prot: Vec<char> = extra_letters.to_vec();
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        for p in paths {
+            prot.extend(drive_letter_of(&real(p)));
+            prot.extend(drive_letter_of(p));
+        }
+        prot.extend(
+            std::env::current_exe()
+                .ok()
+                .map(|e| real(&e))
+                .as_deref()
+                .and_then(drive_letter_of),
+        );
+        prot
+    }
+
+    /// 대상 볼륨이 이미지·보호 경로·실행 파일이 실제로 있는 볼륨과 같은지 GUID로 확인한다(폴더 마운트·링크 대비).
+    fn check_paths_not_on_volume(
+        letter: char,
+        required_sources: &[&Path],
+        extra_protected: &[&Path],
+    ) -> Result<(), VolumeError> {
         let target = guid_of_mount_point(&format!("{letter}:\\")).ok_or_else(|| {
             VolumeError::Refused(format!("{letter}: 의 볼륨 ID를 확인할 수 없음"))
         })?;
-        match volume_guid_of(image) {
-            Some(g) if g == target => {
+        for src in required_sources {
+            match volume_guid_of(src) {
+                Some(g) if g == target => {
+                    return Err(VolumeError::Refused(format!(
+                        "이미지가 대상 볼륨 {letter}: 안에 있음"
+                    )));
+                }
+                None if !is_unc(src) => {
+                    return Err(VolumeError::Refused(
+                        "이미지가 있는 볼륨을 확인할 수 없음".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for p in extra_protected {
+            if volume_guid_of(p).as_deref() == Some(target.as_str()) {
                 return Err(VolumeError::Refused(format!(
-                    "이미지가 대상 볼륨 {letter}: 안에 있음"
-                )))
+                    "보호 경로가 대상 볼륨 {letter}: 안에 있음"
+                )));
             }
-            None if !is_unc(image) => {
-                return Err(VolumeError::Refused(
-                    "이미지가 있는 볼륨을 확인할 수 없음".into(),
-                ))
-            }
-            _ => {}
         }
         if let Some(g) = std::env::current_exe()
             .ok()
@@ -329,6 +469,55 @@ mod win {
             }
         }
         Ok(())
+    }
+
+    fn open_locked_volume(
+        letter: char,
+        typed: &str,
+        prot: &[char],
+        required_sources: &[&Path],
+        extra_protected: &[&Path],
+        header: &Header,
+    ) -> Result<Flush, VolumeError> {
+        let system = system_drive();
+        // 문자만으로 거부할 수 있는 건 장치를 열기 전에 거부한다
+        check_letter(letter, system, prot)?;
+        let info = volume_info(letter)?;
+        check_paths_not_on_volume(info.letter, required_sources, extra_protected)?;
+        let dev_path = format!(r"\\.\{}:", info.letter);
+        // 크기·확인 문구를 통과하기 전에는 쓰기 권한 핸들을 만들지 않는다(읽기 전용으로 크기만 조회)
+        let probe = OpenOptionsExt::share_mode(
+            std::fs::OpenOptions::new().read(true),
+            3, // FILE_SHARE_READ | FILE_SHARE_WRITE
+        )
+        .open(&dev_path)?;
+        let mut len = [0u8; 8];
+        if !ioctl(&probe, IOCTL_DISK_GET_LENGTH_INFO, &mut len) {
+            return Err(VolumeError::Io(io::Error::last_os_error()));
+        }
+        let volume_bytes = u64::try_from(i64::from_le_bytes(len))
+            .map_err(|_| VolumeError::Refused("음수 볼륨 크기".into()))?;
+        check_policy(info.letter, system, prot, volume_bytes, header)?;
+        check_confirmation(&info, typed)?;
+        drop(probe);
+        let dev = OpenOptionsExt::share_mode(std::fs::OpenOptions::new().read(true).write(true), 3)
+            .open(&dev_path)?;
+        // 잠금 실패 = 파일이 열려 있거나 페이지 파일 등 사용 중 → 쓰지 않고 중단
+        if !ioctl(&dev, FSCTL_LOCK_VOLUME, &mut []) {
+            return Err(VolumeError::Refused(format!(
+                "{}: 를 잠글 수 없음(사용 중인 파일이 있음): {}",
+                info.letter,
+                io::Error::last_os_error()
+            )));
+        }
+        if !ioctl(&dev, FSCTL_DISMOUNT_VOLUME, &mut []) {
+            return Err(VolumeError::Refused(format!(
+                "{}: 마운트 해제 실패: {}",
+                info.letter,
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(Flush(dev))
     }
 
     /// `letter` 볼륨에 image 를 직접 쓴다. `typed` 는 `confirmation_phrase(volume_info(letter))` 와 같아야 한다.
@@ -344,66 +533,125 @@ mod win {
         restore_verified(
             image,
             |header| {
-                let system = std::env::var("SystemDrive")
-                    .ok()
-                    .and_then(|s| s.chars().next())
-                    .unwrap_or('C');
-                let mut prot: Vec<char> = protected.to_vec();
-                // 상대 경로·`\\?\` 경로도 잡히게 실제 경로로 바꾼 뒤 드라이브 문자를 본다
-                let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-                prot.extend(drive_letter_of(&real(image)));
-                prot.extend(
-                    std::env::current_exe()
-                        .ok()
-                        .map(|e| real(&e))
-                        .as_deref()
-                        .and_then(drive_letter_of),
-                );
-                // 문자만으로 거부할 수 있는 건 장치를 열기 전에 거부한다
-                check_letter(letter, system, &prot)?;
-                let info = volume_info(letter)?;
-                check_not_source_volume(info.letter, image)?;
-                let dev_path = format!(r"\\.\{}:", info.letter);
-                // 크기·확인 문구를 통과하기 전에는 쓰기 권한 핸들을 만들지 않는다(읽기 전용으로 크기만 조회)
-                let probe = OpenOptionsExt::share_mode(
-                    std::fs::OpenOptions::new().read(true),
-                    3, // FILE_SHARE_READ | FILE_SHARE_WRITE
-                )
-                .open(&dev_path)?;
-                let mut len = [0u8; 8];
-                if !ioctl(&probe, IOCTL_DISK_GET_LENGTH_INFO, &mut len) {
-                    return Err(VolumeError::Io(io::Error::last_os_error()));
-                }
-                let volume_bytes = u64::try_from(i64::from_le_bytes(len))
-                    .map_err(|_| VolumeError::Refused("음수 볼륨 크기".into()))?;
-                check_policy(info.letter, system, &prot, volume_bytes, header)?;
-                check_confirmation(&info, typed)?;
-                drop(probe);
-                let dev = OpenOptionsExt::share_mode(
-                    std::fs::OpenOptions::new().read(true).write(true),
-                    3,
-                )
-                .open(&dev_path)?;
-                // 잠금 실패 = 파일이 열려 있거나 페이지 파일 등 사용 중 → 쓰지 않고 중단
-                if !ioctl(&dev, FSCTL_LOCK_VOLUME, &mut []) {
-                    return Err(VolumeError::Refused(format!(
-                        "{}: 를 잠글 수 없음(사용 중인 파일이 있음): {}",
-                        info.letter,
-                        io::Error::last_os_error()
-                    )));
-                }
-                if !ioctl(&dev, FSCTL_DISMOUNT_VOLUME, &mut []) {
-                    return Err(VolumeError::Refused(format!(
-                        "{}: 마운트 해제 실패: {}",
-                        info.letter,
-                        io::Error::last_os_error()
-                    )));
-                }
-                Ok(Flush(dev))
+                let prot = collect_protected_letters(protected, &[image]);
+                open_locked_volume(letter, typed, &prot, &[image], &[], header)
             },
             cancel,
             progress,
         )
+    }
+
+    /// 풀+증분 `.qblk` 체인 전체를 검증한 뒤 대상 볼륨을 한 번 잠금·마운트 해제하고 `[base, inc1, ..., target]` 순으로 기록한다.
+    pub fn restore_chain_to_volume(
+        image: &Path,
+        letter: char,
+        typed_confirmation: &str,
+        protected_paths: &[&Path],
+        cancel: &AtomicBool,
+        progress: &dyn Fn(&RestoreProgress),
+    ) -> Result<(Header, Stats), VolumeError> {
+        restore_chain_to_volume_writer(
+            image,
+            |header| {
+                let mut all_paths: Vec<&Path> = Vec::with_capacity(protected_paths.len() + 1);
+                all_paths.push(image);
+                all_paths.extend_from_slice(protected_paths);
+                let prot = collect_protected_letters(&[], &all_paths);
+                open_locked_volume(
+                    letter,
+                    typed_confirmation,
+                    &prot,
+                    &[image],
+                    protected_paths,
+                    header,
+                )
+            },
+            cancel,
+            progress,
+        )
+    }
+
+    struct TempFileGuard(std::path::PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// 암호화된 `.qblk.enc` 이미지를 임시 폴더에 스트리밍 복호화한 뒤 대상 볼륨에 복원한다.
+    /// 복호화 전에 `check_letter`, `volume_info`, `check_confirmation`을 먼저 검증하고 임시 평문 파일은 종료 시 반드시 삭제한다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_encrypted_to_volume(
+        image_enc: &Path,
+        key: &[u8; 32],
+        letter: char,
+        typed_confirmation: &str,
+        protected_paths: &[&Path],
+        temp_dir: &Path,
+        cancel: &AtomicBool,
+        progress: &dyn Fn(&RestoreProgress),
+    ) -> Result<(Header, Stats), VolumeError> {
+        let mut all_paths: Vec<&Path> = Vec::with_capacity(protected_paths.len() + 2);
+        all_paths.push(image_enc);
+        all_paths.push(temp_dir);
+        all_paths.extend_from_slice(protected_paths);
+        let prot = collect_protected_letters(&[], &all_paths);
+        let system = system_drive();
+        // 대용량 복호화 전에 드라이브·볼륨·확인 문구를 먼저 검증한다(fail-fast).
+        check_letter(letter, system, &prot)?;
+        let info = volume_info(letter)?;
+        check_paths_not_on_volume(info.letter, &[image_enc], protected_paths)?;
+        if let Some(target_guid) = guid_of_mount_point(&format!("{}:\\", info.letter)) {
+            if volume_guid_of(temp_dir).as_deref() == Some(target_guid.as_str()) {
+                return Err(VolumeError::Refused(format!(
+                    "임시 복호화 폴더가 대상 볼륨 {}: 안에 있음",
+                    info.letter
+                )));
+            }
+        }
+        check_confirmation(&info, typed_confirmation)?;
+
+        std::fs::create_dir_all(temp_dir)?;
+        let mut rand_bytes = [0u8; 8];
+        getrandom::getrandom(&mut rand_bytes)
+            .map_err(|e| VolumeError::Io(io::Error::other(e.to_string())))?;
+        let rand_u64 = u64::from_le_bytes(rand_bytes);
+        static DEC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = DEC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = temp_dir.join(format!(
+            "kova_dec_{}_{}_{:016x}.qblk",
+            std::process::id(),
+            seq,
+            rand_u64
+        ));
+        let guard = TempFileGuard(tmp_path);
+
+        progress(&RestoreProgress {
+            phase: RestorePhase::Decrypt,
+            link_index: 0,
+            link_count: 1,
+            stats: Stats::default(),
+        });
+
+        crate::crypto::decrypt_file(image_enc, &guard.0, key, cancel).map_err(|e| match e {
+            crate::crypto::ImageCryptoError::Io(io_err) => VolumeError::Io(io_err),
+            crate::crypto::ImageCryptoError::Cancelled => VolumeError::Image(QblkError::Cancelled),
+            other => VolumeError::Refused(other.to_string()),
+        })?;
+
+        restore_image_to_volume(&guard.0, letter, typed_confirmation, &prot, cancel, &|s| {
+            let phase = if s.total_raw_bytes == 0 {
+                RestorePhase::Verify
+            } else {
+                RestorePhase::Write
+            };
+            progress(&RestoreProgress {
+                phase,
+                link_index: 0,
+                link_count: 1,
+                stats: s.clone(),
+            });
+        })
     }
 
     /// 쓰기를 마치고 닫기 전에 장치 버퍼를 비운다(`flush` 가 호출될 때마다 `sync_all`).
@@ -617,5 +865,132 @@ mod tests {
             &|_| {},
         );
         assert!(matches!(r, Err(VolumeError::Refused(_))));
+    }
+
+    #[test]
+    fn restore_chain_to_volume_writer_restores_two_link_chain_exact_bytes() {
+        use crate::incremental::{
+            save_block_map, save_chain_meta, write_incremental_image, BlockMap, ChainMeta,
+        };
+        use std::collections::BTreeMap;
+        use std::io::Cursor;
+        use std::sync::Mutex;
+
+        let d = tempfile::tempdir().unwrap();
+        let cs = 4096usize;
+        let total_clusters = 8u64;
+        let bitmap = [0xFFu8];
+        let mut disk = vec![0u8; cs * total_clusters as usize];
+        for i in 0..8 {
+            disk[i * cs..(i + 1) * cs].fill((i as u8) + 10);
+        }
+        let no = AtomicBool::new(false);
+        let h_tmpl = Header {
+            version: crate::qblk::VERSION,
+            cluster_size: cs as u32,
+            total_clusters,
+            used_clusters: 0,
+            vsn: "1234-5678".into(),
+            source_label: "VOL".into(),
+        };
+
+        // Link 0: base (2-cluster blocks)
+        let base_path = d.path().join("base.qblk");
+        let base_map = {
+            let f = File::create(&base_path).unwrap();
+            let seed = BlockMap {
+                version: 2,
+                cluster_size: cs as u32,
+                total_clusters,
+                block_clusters: 2,
+                hashes: BTreeMap::new(),
+            };
+            let (_, inc, map, _) = write_incremental_image(
+                &mut Cursor::new(&disk),
+                f,
+                &mut h_tmpl.clone(),
+                &bitmap,
+                Some(&seed),
+                1,
+                &no,
+                &|_| {},
+            )
+            .unwrap();
+            assert_eq!(inc.changed_clusters, 8);
+            save_block_map(&base_path, &map).unwrap();
+            map
+        };
+
+        // Link 1: inc modifying clusters 2..4 and 6..8
+        disk[2 * cs..4 * cs].fill(0xCC);
+        disk[6 * cs..8 * cs].fill(0xDD);
+        let inc_path = d.path().join("inc1.qblk");
+        {
+            let f = File::create(&inc_path).unwrap();
+            let (_, inc, map, _) = write_incremental_image(
+                &mut Cursor::new(&disk),
+                f,
+                &mut h_tmpl.clone(),
+                &bitmap,
+                Some(&base_map),
+                1,
+                &no,
+                &|_| {},
+            )
+            .unwrap();
+            assert_eq!(inc.changed_clusters, 4);
+            assert_eq!(inc.skipped_clusters, 4);
+            save_block_map(&inc_path, &map).unwrap();
+            save_chain_meta(
+                &inc_path,
+                &ChainMeta {
+                    version: 1,
+                    parent: "base.qblk".into(),
+                    changed_clusters: inc.changed_clusters,
+                    skipped_clusters: inc.skipped_clusters,
+                },
+            )
+            .unwrap();
+        }
+
+        // Target preallocated volume file with stale bytes
+        let dev_path = d.path().join("target_vol.img");
+        fs::write(&dev_path, vec![0x55u8; cs * total_clusters as usize]).unwrap();
+        let open_count = Cell::new(0usize);
+        let phases = Mutex::new(Vec::<(RestorePhase, usize, usize)>::new());
+
+        let (hdr, st) = restore_chain_to_volume_writer(
+            &inc_path,
+            |_| {
+                open_count.set(open_count.get() + 1);
+                Ok(fs::OpenOptions::new().write(true).open(&dev_path).unwrap())
+            },
+            &no,
+            &|p| {
+                phases
+                    .lock()
+                    .unwrap()
+                    .push((p.phase, p.link_index, p.link_count));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(open_count.get(), 1, "볼륨 장치는 한 번만 열어야 함");
+        assert_eq!(hdr.total_clusters, total_clusters);
+        assert_eq!(st.clusters, 12); // 8(base) + 4(inc1)
+        assert_eq!(fs::read(&dev_path).unwrap(), disk);
+
+        let phases = phases.into_inner().unwrap();
+        let first_write = phases
+            .iter()
+            .position(|(ph, _, _)| *ph == RestorePhase::Write)
+            .expect("Write 단계 진행 보고가 있어야 함");
+        assert!(first_write > 0);
+        assert!(phases[..first_write]
+            .iter()
+            .all(|(ph, _, cnt)| *ph == RestorePhase::Verify && *cnt == 2));
+        assert!(phases[first_write..]
+            .iter()
+            .all(|(ph, _, cnt)| *ph == RestorePhase::Write && *cnt == 2));
     }
 }

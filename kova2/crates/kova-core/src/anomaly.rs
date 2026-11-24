@@ -4,7 +4,6 @@
 use kova_engine::storage::{self, SnapshotManifest};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
 use std::path::Path;
 
 pub const SUSPECT_EXTENSIONS: &[&str] = &[
@@ -88,8 +87,53 @@ pub struct ManifestDelta {
 }
 
 fn load_manifest(path: &Path) -> Option<SnapshotManifest> {
-    let f = fs::File::open(path).ok()?;
-    serde_json::from_reader(io::BufReader::new(f)).ok()
+    let raw = fs::read(kova_engine::longpath::to_extended(path)).ok()?;
+    let plain = if storage::is_encrypted_manifest_bytes(&raw) {
+        let repo = path.parent()?.parent()?;
+        let sid = path.file_stem()?.to_string_lossy();
+        storage::CasStorage::new(repo)
+            .ok()?
+            .read_manifest_bytes(path, &sid)
+            .ok()?
+    } else {
+        raw
+    };
+    serde_json::from_slice(&plain).ok()
+}
+
+fn find_recent_manifest_decoded(
+    snapshots_dir: &Path,
+    exclude: Option<&str>,
+    pred: &dyn Fn(&SnapshotManifest) -> bool,
+) -> Option<SnapshotManifest> {
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    if let Ok(rd) = fs::read_dir(kova_engine::longpath::to_extended(snapshots_dir)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file()
+                && p.extension().is_some_and(|x| x == "json")
+                && exclude.is_none_or(|x| p.file_stem().is_none_or(|s| s.to_string_lossy() != x))
+            {
+                let mtime = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                entries.push((mtime, p));
+            }
+        }
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, path) in entries {
+        let Some(m) = load_manifest(&path) else {
+            continue;
+        };
+        let count =
+            m.files.as_ref().map_or(0, |f| f.len()) + m.entries.as_ref().map_or(0, |e| e.len());
+        if count > 0 && pred(&m) {
+            return Some(m);
+        }
+    }
+    None
 }
 
 /// (원본 경로, 상대 경로) → 내용 지문(크기 + 청크 해시). 원본을 확정할 수 없는 항목은 뺀다.
@@ -123,7 +167,7 @@ pub fn manifest_delta(manifest_path: &Path) -> Option<ManifestDelta> {
     let pid = cur.profile_id.clone();
     let sources = storage::manifest_sources(&cur);
     let dir = manifest_path.parent()?;
-    let prev = storage::find_recent_manifest(dir, Some(&sid), &|m| {
+    let prev = find_recent_manifest_decoded(dir, Some(&sid), &|m| {
         storage::is_baseline_for(m, pid.as_deref(), &sources)
     });
     let cur_map = file_map(cur);

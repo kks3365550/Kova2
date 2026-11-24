@@ -54,9 +54,14 @@ pub fn verify_repo(repo: &Path, deep: bool) -> io::Result<VerifyReport> {
             continue;
         }
         let name = p.file_name().unwrap().to_string_lossy().to_string();
-        let manifest: SnapshotManifest = match fs::File::open(&p)
+        let sid_stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let manifest: SnapshotManifest = match cas
+            .read_manifest_bytes(&p, &sid_stem)
             .map_err(|e| e.to_string())
-            .and_then(|f| serde_json::from_reader(io::BufReader::new(f)).map_err(|e| e.to_string()))
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
         {
             Ok(m) => m,
             Err(reason) => {

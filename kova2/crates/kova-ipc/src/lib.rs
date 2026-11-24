@@ -10,6 +10,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\kova";
+/// IPC 프로토콜 버전.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 클라이언트가 읽지 않아 쓰기가 막히면 이 시간 뒤 연결을 끊는다(구독이 서비스 쪽에 쌓이지 않게).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,11 +75,81 @@ pub enum Request {
         /// None 이면 원래 위치
         target: Option<String>,
         only: Option<Vec<String>>,
+        /// 오프라인/재해 복구 시 서비스 저장소 키 대신 직접 전달하는 복구 코드(생략 가능).
+        #[serde(default)]
+        recovery_code: Option<Secret>,
     },
     /// 프로파일의 최근 스냅샷을 서비스 임시 폴더에 복원해 보고 지운다(복구 훈련). 답: `Done` / `Error`.
     Drill {
         profile_id: String,
     },
+    /// 프로토콜·서비스 버전 정보 조회. 답: `Info`.
+    Info,
+    /// S3 호환 클라우드 설정 상태 조회(관리자 전용). 답: `S3Status`.
+    S3Status,
+    /// S3 호환 클라우드 설정·자격 증명 저장(관리자 전용). 답: `Done` / `Error`.
+    S3SaveConfig {
+        endpoint: String,
+        region: String,
+        bucket: String,
+        prefix: String,
+        access_key: String,
+        secret_key: Secret,
+    },
+    /// S3 호환 클라우드 설정 삭제(관리자 전용). 답: `Done` / `Error`.
+    S3DeleteConfig,
+    /// 저장된 S3 호환 클라우드 연결 시험(관리자 전용). 답: `Done` / `Error`.
+    S3TestConnection,
+    /// 저장된 SMB/NAS 자격 증명 목록 조회(관리자 전용). 답: `SmbCreds`.
+    SmbListCreds,
+    /// SMB/NAS 공유 자격 증명 저장(관리자 전용). 답: `Done` / `Error`.
+    SmbSaveCred {
+        share: String,
+        username: String,
+        password: Secret,
+    },
+    /// SMB/NAS 공유 자격 증명 삭제(관리자 전용). 답: `Done` / `Error`.
+    SmbDeleteCred {
+        share: String,
+    },
+    /// 클라우드 저장소에서 로컬 저장소로 풀/복구. 답: `RestoreProgress`… 뒤 `Done` / `Error`.
+    CloudPull {
+        provider: String,
+        dest_repo: String,
+    },
+    /// 원격 클라우드 저장소 정리(GC). 답: `Done` / `Error`.
+    CloudPrune {
+        profile_id: String,
+    },
+    /// SMTP 이메일 알림 설정 조회. 답: `SmtpStatus`.
+    SmtpStatus,
+    /// SMTP 이메일 알림 설정 저장. 답: `Done` / `Error`.
+    SmtpSaveConfig {
+        host: String,
+        port: u16,
+        username: String,
+        password: Secret,
+        from: String,
+        to: String,
+        use_tls: bool,
+    },
+    /// SMTP 이메일 알림 설정 삭제. 답: `Done` / `Error`.
+    SmtpDeleteConfig,
+    /// 저장된 SMTP 설정으로 시험 메일 전송. 답: `Done` / `Error`.
+    SmtpTest,
+    /// 최근 작업 실행 이력 조회. 답: `JobHistory`.
+    JobHistory {
+        limit: usize,
+    },
+    /// 두 스냅샷 간 변경 사항 비교. 답: `DiffResult`.
+    DiffSnapshots {
+        repo: String,
+        base_id: String,
+        target_id: String,
+        limit: usize,
+    },
+    /// 플릿/노드 상태 요약 조회. 답: `FleetStatus`.
+    FleetStatus,
 }
 
 /// 복구 키트 한 줄.
@@ -86,6 +158,36 @@ pub struct RecoveryEntry {
     pub name: String,
     pub repo: String,
     pub code: Secret,
+}
+
+/// 저장된 SMB/NAS 자격 증명 요약(비밀번호 제외).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SmbCredInfo {
+    pub share: String,
+    pub username: String,
+}
+
+/// 작업 실행 이력 한 줄.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobRunRow {
+    pub id: i64,
+    pub started_at: f64,
+    pub finished_at: f64,
+    pub profile_id: String,
+    pub kind: String,
+    pub ok: bool,
+    pub message: String,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// 스냅샷 비교 결과 한 항목.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffEntryRow {
+    pub path: String,
+    pub size: u64,
+    pub old_size: u64,
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -143,6 +245,48 @@ pub enum Event {
     RestoreProgress {
         done: u64,
         total: u64,
+    },
+    Info {
+        protocol_version: u32,
+        service_version: String,
+    },
+    S3Status {
+        configured: bool,
+        endpoint: String,
+        region: String,
+        bucket: String,
+        prefix: String,
+    },
+    SmbCreds {
+        creds: Vec<SmbCredInfo>,
+    },
+    SmtpStatus {
+        configured: bool,
+        host: String,
+        port: u16,
+        username: String,
+        from: String,
+        to: String,
+        use_tls: bool,
+    },
+    JobHistory {
+        rows: Vec<JobRunRow>,
+    },
+    DiffResult {
+        added: Vec<DiffEntryRow>,
+        modified: Vec<DiffEntryRow>,
+        deleted: Vec<DiffEntryRow>,
+        unchanged_count: usize,
+    },
+    FleetStatus {
+        hostname: String,
+        service_version: String,
+        profiles_total: usize,
+        healthy: usize,
+        stale: usize,
+        last_backup_at: Option<f64>,
+        unacked_alerts: usize,
+        fleet_endpoint: String,
     },
 }
 
@@ -856,5 +1000,257 @@ mod tests {
             let evs = h.await.unwrap().unwrap();
             assert!(matches!(evs.first(), Some(Event::Pong { .. })), "{evs:?}");
         }
+    }
+
+    #[test]
+    fn new_request_variants_json_roundtrip_and_secret_redaction() {
+        let requests = [
+            Request::Info,
+            Request::Restore {
+                repo: r"D:\Repo".into(),
+                session_id: "snap-1".into(),
+                target: Some(r"C:\Restore".into()),
+                only: Some(vec!["docs/a.txt".into()]),
+                recovery_code: None,
+            },
+            Request::Restore {
+                repo: r"D:\Repo".into(),
+                session_id: "snap-2".into(),
+                target: None,
+                only: None,
+                recovery_code: Some(Secret("rec-secret-001".into())),
+            },
+            Request::S3Status,
+            Request::S3SaveConfig {
+                endpoint: "https://s3.example.com".into(),
+                region: "ap-northeast-2".into(),
+                bucket: "kova-backups".into(),
+                prefix: "prod/".into(),
+                access_key: "AKIAEXAMPLE".into(),
+                secret_key: Secret("s3-secret-002".into()),
+            },
+            Request::S3DeleteConfig,
+            Request::S3TestConnection,
+            Request::SmbListCreds,
+            Request::SmbSaveCred {
+                share: r"\\nas\backup".into(),
+                username: "backup_user".into(),
+                password: Secret("smb-secret-003".into()),
+            },
+            Request::SmbDeleteCred {
+                share: r"\\nas\backup".into(),
+            },
+            Request::CloudPull {
+                provider: "s3".into(),
+                dest_repo: r"D:\PulledRepo".into(),
+            },
+            Request::CloudPrune {
+                profile_id: "prof-1".into(),
+            },
+            Request::SmtpStatus,
+            Request::SmtpSaveConfig {
+                host: "smtp.example.com".into(),
+                port: 587,
+                username: "alerts@example.com".into(),
+                password: Secret("smtp-secret-004".into()),
+                from: "alerts@example.com".into(),
+                to: "ops@example.com".into(),
+                use_tls: true,
+            },
+            Request::SmtpDeleteConfig,
+            Request::SmtpTest,
+            Request::JobHistory { limit: 50 },
+            Request::DiffSnapshots {
+                repo: r"D:\Repo".into(),
+                base_id: "snap-1".into(),
+                target_id: "snap-2".into(),
+                limit: 200,
+            },
+            Request::FleetStatus,
+        ];
+
+        for req in &requests {
+            let json = serde_json::to_string(req).unwrap();
+            let decoded: Request = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, req);
+        }
+
+        let secret_cases = [
+            (
+                Request::Restore {
+                    repo: r"D:\Repo".into(),
+                    session_id: "snap-2".into(),
+                    target: None,
+                    only: None,
+                    recovery_code: Some(Secret("rec-secret-001".into())),
+                },
+                "rec-secret-001",
+            ),
+            (
+                Request::S3SaveConfig {
+                    endpoint: "https://s3.example.com".into(),
+                    region: "ap-northeast-2".into(),
+                    bucket: "kova-backups".into(),
+                    prefix: "prod/".into(),
+                    access_key: "AKIAEXAMPLE".into(),
+                    secret_key: Secret("s3-secret-002".into()),
+                },
+                "s3-secret-002",
+            ),
+            (
+                Request::SmbSaveCred {
+                    share: r"\\nas\backup".into(),
+                    username: "backup_user".into(),
+                    password: Secret("smb-secret-003".into()),
+                },
+                "smb-secret-003",
+            ),
+            (
+                Request::SmtpSaveConfig {
+                    host: "smtp.example.com".into(),
+                    port: 587,
+                    username: "alerts@example.com".into(),
+                    password: Secret("smtp-secret-004".into()),
+                    from: "alerts@example.com".into(),
+                    to: "ops@example.com".into(),
+                    use_tls: true,
+                },
+                "smtp-secret-004",
+            ),
+        ];
+
+        for (req, secret) in &secret_cases {
+            let json = serde_json::to_string(req).unwrap();
+            assert!(json.contains(*secret), "JSON must carry secret: {json}");
+            let dbg = format!("{req:?}");
+            assert!(!dbg.contains(*secret), "Debug leaked secret: {dbg}");
+            assert!(
+                dbg.contains("Secret(***)"),
+                "Debug missing redaction: {dbg}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_event_variants_json_roundtrip() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+
+        let events = [
+            Event::Info {
+                protocol_version: PROTOCOL_VERSION,
+                service_version: "2.0.0".into(),
+            },
+            Event::S3Status {
+                configured: true,
+                endpoint: "https://s3.example.com".into(),
+                region: "ap-northeast-2".into(),
+                bucket: "kova-backups".into(),
+                prefix: "prod/".into(),
+            },
+            Event::SmbCreds {
+                creds: vec![SmbCredInfo {
+                    share: r"\\nas\backup".into(),
+                    username: "backup_user".into(),
+                }],
+            },
+            Event::SmtpStatus {
+                configured: true,
+                host: "smtp.example.com".into(),
+                port: 587,
+                username: "alerts@example.com".into(),
+                from: "alerts@example.com".into(),
+                to: "ops@example.com".into(),
+                use_tls: true,
+            },
+            Event::JobHistory {
+                rows: vec![JobRunRow {
+                    id: 42,
+                    started_at: 1_700_000_000.5,
+                    finished_at: 1_700_000_120.25,
+                    profile_id: "prof-1".into(),
+                    kind: "backup".into(),
+                    ok: true,
+                    message: "완료".into(),
+                    bytes: 1_048_576,
+                    files: 128,
+                }],
+            },
+            Event::DiffResult {
+                added: vec![DiffEntryRow {
+                    path: "new.txt".into(),
+                    size: 100,
+                    old_size: 0,
+                    is_dir: false,
+                }],
+                modified: vec![DiffEntryRow {
+                    path: "changed.txt".into(),
+                    size: 250,
+                    old_size: 200,
+                    is_dir: false,
+                }],
+                deleted: vec![DiffEntryRow {
+                    path: "old_dir".into(),
+                    size: 0,
+                    old_size: 0,
+                    is_dir: true,
+                }],
+                unchanged_count: 99,
+            },
+            Event::FleetStatus {
+                hostname: "PLANT-PC-01".into(),
+                service_version: "2.0.0".into(),
+                profiles_total: 3,
+                healthy: 2,
+                stale: 1,
+                last_backup_at: Some(1_700_000_120.25),
+                unacked_alerts: 1,
+                fleet_endpoint: "https://fleet.example.com".into(),
+            },
+            Event::FleetStatus {
+                hostname: "PLANT-PC-02".into(),
+                service_version: "2.0.0".into(),
+                profiles_total: 0,
+                healthy: 0,
+                stale: 0,
+                last_backup_at: None,
+                unacked_alerts: 0,
+                fleet_endpoint: String::new(),
+            },
+        ];
+
+        for ev in &events {
+            let json = serde_json::to_string(ev).unwrap();
+            let decoded: Event = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, ev);
+            assert_eq!(parse(&json).as_ref(), Some(ev));
+        }
+    }
+
+    #[test]
+    fn restore_request_deserializes_without_recovery_code() {
+        let legacy_minimal =
+            r#"{"cmd":"Restore","repo":"D:\\Repo","session_id":"s1","target":null,"only":null}"#;
+        assert_eq!(
+            serde_json::from_str::<Request>(legacy_minimal).unwrap(),
+            Request::Restore {
+                repo: r"D:\Repo".into(),
+                session_id: "s1".into(),
+                target: None,
+                only: None,
+                recovery_code: None,
+            }
+        );
+
+        let legacy_with_fields = r#"{"cmd":"Restore","repo":"D:\\Repo","session_id":"s2","target":"C:\\Out","only":["a.txt","b.txt"]}"#;
+        assert_eq!(
+            serde_json::from_str::<Request>(legacy_with_fields).unwrap(),
+            Request::Restore {
+                repo: r"D:\Repo".into(),
+                session_id: "s2".into(),
+                target: Some(r"C:\Out".into()),
+                only: Some(vec!["a.txt".into(), "b.txt".into()]),
+                recovery_code: None,
+            }
+        );
     }
 }

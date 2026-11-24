@@ -176,8 +176,11 @@ pub fn run_in_setup_pool<R: Send>(
 pub fn migrate(config_dir: &Path) -> Vec<Result<String, String>> {
     let mut out = Vec::new();
     let token = config_dir.join(crate::gdrive::TOKEN_FILE);
+    let smb = config_dir.join(crate::smb::CREDS_FILE);
+    let s3 = config_dir.join(crate::s3::CONFIG_FILE);
+    let smtp = config_dir.join(crate::smtp::CONFIG_FILE);
     let keys = crate::repocrypto::key_dir();
-    for p in [token, keys] {
+    for p in [token, smb, s3, smtp, keys] {
         if p.exists() {
             out.push(harden(&p).map(|()| format!("비밀 파일 접근 제한 적용: {}", p.display())));
         }

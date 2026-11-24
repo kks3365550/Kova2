@@ -48,8 +48,12 @@ pub fn referenced_hashes(repo: &Path) -> io::Result<HashSet<String>> {
         if p.extension().is_none_or(|x| x != "json") {
             continue;
         }
-        let f = fs::File::open(&p)?;
-        let m: SnapshotManifest = serde_json::from_reader(io::BufReader::new(f)).map_err(|e| {
+        let sid = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let plain = crate::repocrypto::read_manifest_plain(repo, &p, &sid)?;
+        let m: SnapshotManifest = serde_json::from_slice(&plain).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}: {}", p.display(), e),

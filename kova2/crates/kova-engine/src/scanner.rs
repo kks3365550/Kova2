@@ -14,7 +14,17 @@ pub struct ScannedItem {
     pub modified: u64,
     /// 원본 경로 번호(--source 순서). 원위치 복원에서 파일의 원래 위치를 찾는 데 쓴다.
     pub src: u32,
+    /// 파일·폴더 생성 시각(Unix epoch 기준 밀리초).
+    pub created: Option<i64>,
+    /// 복원 가능한 Windows 파일 속성 마스크(`0x27`: READONLY|HIDDEN|SYSTEM|ARCHIVE).
+    pub attributes: Option<u32>,
+    /// Windows NTFS DACL SDDL 문자열(요청 시 수집).
+    pub acl_sddl: Option<String>,
 }
+
+/// 복원 가능한 Windows 파일 속성 비트 마스크:
+/// `FILE_ATTRIBUTE_READONLY (0x01) | FILE_ATTRIBUTE_HIDDEN (0x02) | FILE_ATTRIBUTE_SYSTEM (0x04) | FILE_ATTRIBUTE_ARCHIVE (0x20)`
+pub const RESTORABLE_ATTR_MASK: u32 = 0x27;
 
 /// Name-based exclude filter mirroring core/filter.py (PathFilter).
 #[derive(Debug, Default)]
@@ -53,10 +63,22 @@ pub struct ScanReport {
 }
 
 fn rel_of(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
+    let p = crate::longpath::strip_extended(path);
+    let r = crate::longpath::strip_extended(root);
+    p.strip_prefix(&r)
+        .unwrap_or(&p)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn strip_rel(path: &Path, clean_root: &Path) -> Option<String> {
+    let p = crate::longpath::strip_extended(path);
+    let rel = p
+        .strip_prefix(clean_root)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    (!rel.is_empty()).then_some(rel)
 }
 
 fn glob_match(p: &[char], s: &[char]) -> bool {
@@ -187,25 +209,31 @@ pub fn scan_directory_report(
     filter: &ExcludeFilter,
 ) -> std::io::Result<(Vec<ScannedItem>, ScanReport)> {
     let mut report = ScanReport::default();
-    let root_meta = match fs::metadata(source_root) {
+    let ext_root = crate::longpath::to_extended(source_root);
+    let clean_root =
+        crate::longpath::strip_extended(&crate::longpath::to_extended_always(source_root));
+    let root_meta = match fs::metadata(&ext_root) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), report)),
         Err(e) => return Err(e),
     };
     // A source that is a single file: use the file name as its relative path.
     if root_meta.is_file() {
-        let name = match source_root.file_name() {
+        let name = match clean_root.file_name() {
             Some(n) => n.to_string_lossy().to_string(),
             None => return Ok((Vec::new(), report)),
         };
         return Ok((
             vec![ScannedItem {
-                path: source_root.to_path_buf(),
+                path: clean_root,
                 rel_path: name,
                 is_dir: false,
                 size: root_meta.len(),
                 modified: mtime_ms(&root_meta),
                 src: 0,
+                created: ctime_ms(&root_meta),
+                attributes: file_attrs(&root_meta),
+                acl_sddl: None,
             }],
             report,
         ));
@@ -219,7 +247,7 @@ pub fn scan_directory_report(
     let mut top_files = Vec::new();
     let mut top_subdirs = Vec::new();
 
-    for entry in fs::read_dir(source_root)? {
+    for entry in fs::read_dir(&ext_root)? {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -236,7 +264,7 @@ pub fn scan_directory_report(
             Err(e) => {
                 report
                     .errors
-                    .push(format!("{} ({e})", rel_of(&path, source_root)));
+                    .push(format!("{} ({e})", rel_of(&path, &clean_root)));
                 continue;
             }
         };
@@ -253,7 +281,7 @@ pub fn scan_directory_report(
 
         if file_type.is_dir() {
             if is_default_excluded_dir(&name) {
-                report.default_excluded.push(rel_of(&path, source_root));
+                report.default_excluded.push(rel_of(&path, &clean_root));
             }
             if !filter.is_dir_excluded(&name) {
                 top_subdirs.push(path);
@@ -261,21 +289,24 @@ pub fn scan_directory_report(
         } else if !filter.is_file_excluded(&name) {
             match meta_res {
                 Ok(metadata) => {
-                    let rel_path = rel_of(&path, source_root);
+                    let rel_path = rel_of(&path, &clean_root);
                     if !rel_path.is_empty() {
                         top_files.push(ScannedItem {
-                            path,
+                            path: crate::longpath::strip_extended(&path),
                             rel_path,
                             is_dir: false,
                             size: metadata.len(),
                             modified: mtime_ms(&metadata),
                             src: 0,
+                            created: ctime_ms(&metadata),
+                            attributes: file_attrs(&metadata),
+                            acl_sddl: None,
                         });
                     }
                 }
                 Err(e) => report
                     .errors
-                    .push(format!("{} ({e})", rel_of(&path, source_root))),
+                    .push(format!("{} ({e})", rel_of(&path, &clean_root))),
             }
         }
     }
@@ -288,25 +319,26 @@ pub fn scan_directory_report(
             let mut items = Vec::new();
             let mut rep = ScanReport::default();
             let excluded_here = std::cell::RefCell::new(Vec::new());
+            let ext_subdir = crate::longpath::to_extended_always(&subdir);
 
             // Include the subdir itself if metadata is available
-            if let Ok(m) = fs::symlink_metadata(&subdir) {
-                if let Ok(rel) = subdir.strip_prefix(source_root) {
-                    let rel_path = rel.to_string_lossy().replace('\\', "/");
-                    if !rel_path.is_empty() {
-                        items.push(ScannedItem {
-                            path: subdir.clone(),
-                            rel_path,
-                            is_dir: true,
-                            size: 0,
-                            modified: mtime_ms(&m),
-                            src: 0,
-                        });
-                    }
+            if let Ok(m) = fs::symlink_metadata(&ext_subdir) {
+                if let Some(rel_path) = strip_rel(&ext_subdir, &clean_root) {
+                    items.push(ScannedItem {
+                        path: crate::longpath::strip_extended(&ext_subdir),
+                        rel_path,
+                        is_dir: true,
+                        size: 0,
+                        modified: mtime_ms(&m),
+                        src: 0,
+                        created: ctime_ms(&m),
+                        attributes: file_attrs(&m),
+                        acl_sddl: None,
+                    });
                 }
             }
 
-            let entries: Vec<_> = WalkDir::new(&subdir)
+            let entries: Vec<_> = WalkDir::new(&ext_subdir)
                 .into_iter()
                 .filter_entry(|e| {
                     if e.depth() == 0 {
@@ -321,7 +353,7 @@ pub fn scan_directory_report(
                         if is_default_excluded_dir(&name) {
                             excluded_here
                                 .borrow_mut()
-                                .push(rel_of(e.path(), source_root));
+                                .push(rel_of(e.path(), &clean_root));
                         }
                         !filter.is_dir_excluded(&name)
                     } else {
@@ -334,8 +366,8 @@ pub fn scan_directory_report(
                         // 접근 거부 등으로 못 읽은 폴더·파일은 조용히 넘기지 않고 보고한다
                         let at = err
                             .path()
-                            .map(|p| rel_of(p, source_root))
-                            .unwrap_or_else(|| rel_of(&subdir, source_root));
+                            .map(|p| rel_of(p, &clean_root))
+                            .unwrap_or_else(|| rel_of(&ext_subdir, &clean_root));
                         rep.errors.push(format!("{at} ({err})"));
                         None
                     }
@@ -353,7 +385,7 @@ pub fn scan_directory_report(
                         Ok(m) => m,
                         Err(err) => {
                             rep.errors
-                                .push(format!("{} ({err})", rel_of(entry.path(), source_root)));
+                                .push(format!("{} ({err})", rel_of(entry.path(), &clean_root)));
                             return None;
                         }
                     };
@@ -363,25 +395,22 @@ pub fn scan_directory_report(
                     let is_dir = metadata.is_dir();
                     let size = if is_dir { 0 } else { metadata.len() };
                     let modified = mtime_ms(&metadata);
+                    let created = ctime_ms(&metadata);
+                    let attributes = file_attrs(&metadata);
 
-                    let path = entry.into_path();
-                    let rel_path = path
-                        .strip_prefix(source_root)
-                        .ok()?
-                        .to_string_lossy()
-                        .replace('\\', "/");
-
-                    if rel_path.is_empty() {
-                        return None;
-                    }
+                    let raw_path = entry.into_path();
+                    let rel_path = strip_rel(&raw_path, &clean_root)?;
 
                     Some(ScannedItem {
-                        path,
+                        path: crate::longpath::strip_extended(&raw_path),
                         rel_path,
                         is_dir,
                         size,
                         modified,
                         src: 0,
+                        created,
+                        attributes,
+                        acl_sddl: None,
                     })
                 })
                 .collect();
@@ -412,6 +441,102 @@ fn mtime_ms(m: &fs::Metadata) -> u64 {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn ctime_ms(m: &fs::Metadata) -> Option<i64> {
+    let t = m.created().ok()?;
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).ok(),
+        Err(e) => i64::try_from(e.duration().as_millis()).ok().map(|v| -v),
+    }
+}
+
+fn file_attrs(m: &fs::Metadata) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some(m.file_attributes() & RESTORABLE_ATTR_MASK)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = m;
+        None
+    }
+}
+
+/// Windows NTFS 파일·폴더의 DACL을 SDDL 문자열로 읽는다.
+/// 권한 부족·미지원 파일시스템·비-Windows에서는 `None` 을 돌려주며 백업을 실패시키지 않는다.
+pub fn read_acl_sddl(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+        use windows::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        struct LocalGuard(*mut c_void);
+        impl Drop for LocalGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        let _ = LocalFree(HLOCAL(self.0));
+                    }
+                }
+            }
+        }
+
+        let ext = crate::longpath::to_extended(path);
+        let wide: Vec<u16> = ext
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let err = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                None,
+                &mut sd,
+            )
+        };
+        if err != ERROR_SUCCESS || sd.0.is_null() {
+            return None;
+        }
+        let _sd_guard = LocalGuard(sd.0);
+
+        let mut sddl_ptr = PWSTR::null();
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl_ptr,
+                None,
+            )
+        };
+        if ok.is_err() || sddl_ptr.is_null() {
+            return None;
+        }
+        let _sddl_guard = LocalGuard(sddl_ptr.0.cast());
+        let s = unsafe { sddl_ptr.to_string().ok()? };
+        (!s.is_empty()).then_some(s)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 #[cfg(test)]

@@ -337,6 +337,62 @@ pub fn restore_chain_to_file(
     res
 }
 
+/// `images_dir` 안에서 `<DRIVE>_*.qblk` 패턴에 맞는 가장 최신 이미지를 찾는다.
+/// 유효한 `.qmap.json`(v2)이 존재하고 현재 체인 길이가 `max_chain_depth` 미만인 후보만 반환한다.
+pub fn find_latest_base_image(
+    images_dir: &Path,
+    drive: char,
+    max_chain_depth: usize,
+) -> Option<PathBuf> {
+    if !drive.is_ascii_alphabetic() || max_chain_depth == 0 {
+        return None;
+    }
+    let prefix = format!("{}_", drive.to_ascii_uppercase());
+    let entries = fs::read_dir(images_dir).ok()?;
+    let mut candidates: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_qblk = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("qblk"));
+        if !is_qblk {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let prefix_ok = name
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|b| b.eq_ignore_ascii_case(prefix.as_bytes()));
+        if !prefix_ok {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((modified, name.to_string(), path));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, _, path) in candidates {
+        let map_ok = load_block_map(&path)
+            .is_ok_and(|m| m.version == 2 && m.cluster_size > 0 && m.total_clusters > 0);
+        if !map_ok {
+            continue;
+        }
+        let chain_ok = resolve_chain(&path).is_ok_and(|chain| chain.len() < max_chain_depth);
+        if chain_ok {
+            return Some(path);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +752,52 @@ mod tests {
         let target = d.path().join("mismatch.img");
         assert!(restore_chain_to_file(&inc_path, &target, &no, &|_| {}).is_err());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn find_latest_base_image_filters_drive_map_and_chain_depth() {
+        let d = tempfile::tempdir().unwrap();
+        let make_map = || BlockMap {
+            version: 2,
+            cluster_size: 4096,
+            total_clusters: 8,
+            block_clusters: 256,
+            hashes: BTreeMap::new(),
+        };
+        // 다른 드라이브(D_)와 한국어 파일명, 맵 없는 C_ 이미지는 무시되어야 한다
+        fs::write(d.path().join("D_20261124_01.qblk"), b"x").unwrap();
+        save_block_map(&d.path().join("D_20261124_01.qblk"), &make_map()).unwrap();
+        fs::write(d.path().join("한글.qblk"), b"x").unwrap();
+        let c_nomap = d.path().join("C_20261124_99.qblk");
+        fs::write(&c_nomap, b"x").unwrap();
+
+        // 유효한 base(깊이 1)와 inc(깊이 2)
+        let c_base = d.path().join("C_20261124_01.qblk");
+        fs::write(&c_base, b"x").unwrap();
+        save_block_map(&c_base, &make_map()).unwrap();
+
+        let c_inc = d.path().join("C_20261124_02.qblk");
+        fs::write(&c_inc, b"x").unwrap();
+        save_block_map(&c_inc, &make_map()).unwrap();
+        save_chain_meta(
+            &c_inc,
+            &ChainMeta {
+                version: 1,
+                parent: "C_20261124_01.qblk".into(),
+                changed_clusters: 1,
+                skipped_clusters: 7,
+            },
+        )
+        .unwrap();
+
+        // max_chain_depth = 14 → 최신 c_inc(깊이 2) 선택
+        assert_eq!(
+            find_latest_base_image(d.path(), 'c', 14),
+            Some(c_inc.clone())
+        );
+        // max_chain_depth = 2 → c_inc(깊이 2)은 제외되고 c_base(깊이 1) 선택
+        assert_eq!(find_latest_base_image(d.path(), 'C', 2), Some(c_base));
+        // max_chain_depth = 1 → 모두 깊이 >= 1 이므로 None
+        assert_eq!(find_latest_base_image(d.path(), 'C', 1), None);
     }
 }

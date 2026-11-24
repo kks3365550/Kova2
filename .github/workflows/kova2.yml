@@ -29,5 +29,30 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build
         run: cargo build --workspace --locked
+      - name: PowerShell Syntax Check
+        shell: pwsh
+        run: |
+          $scripts = @(
+            "installer/make_pe.ps1",
+            "installer/make_update.ps1",
+            "installer/make_checksums.ps1"
+          )
+          foreach ($rel in $scripts) {
+            if (-not (Test-Path $rel)) { throw "Missing script: $rel" }
+            $full = (Resolve-Path $rel).Path
+            $text = [IO.File]::ReadAllText($full, [Text.UTF8Encoding]::new($false))
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseInput($text, $full, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              foreach ($e in $errors) {
+                Write-Error ("{0}:{1}: {2}" -f $rel, $e.Extent.StartLineNumber, $e.Message)
+              }
+              throw "PowerShell syntax check failed for $rel"
+            }
+            Write-Host "OK: $rel"
+          }
       - name: Test
         run: cargo test --workspace --locked
+      - name: E2E Commercial Integration Tests
+        run: cargo test -p kova-service --test e2e_commercial --locked -- --nocapture

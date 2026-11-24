@@ -1,0 +1,165 @@
+export struct ProfileRow {
+    id: string,
+    name: string,
+    last: string,
+    detail: string,
+    next: string,
+    stale: bool,
+    size: string,
+}
+
+export struct ProgPick {
+    name: string,
+    sub: string,
+    checked: bool,
+}
+
+export struct SrcRow {
+    kind: int,
+    title: string,
+    sub: string,
+    key: string,
+}
+
+export struct SnapRow {
+    id: string,
+    profile-id: string,
+    repo: string,
+    when: string,
+    name: string,
+    summary: string,
+    verified: string,
+}
+
+export struct OffsiteRow {
+    id: string,
+    name: string,
+    dir: string,
+}
+
+export struct AlertRow {
+    when: string,
+    level: string,
+    message: string,
+    full: string,
+    ack: bool,
+}
+
+export struct BrowseRow {
+    name: string,
+    path: string,
+    is-dir: bool,
+    info: string,
+    selected: bool,
+}
+
+export struct DriveRow {
+    name: string,
+    pct: int,
+    used: string,
+    free: string,
+    repo: bool,
+    sys: bool,
+}
+
+export struct ImageRow {
+    name: string,
+    path: string,
+    size: string,
+    when: string,
+    verified: bool,
+    encrypted: bool,
+    chained: bool,
+}
+
+export struct RunRow {
+    id: int,
+    name: string,
+    pct: int,
+    current: string,
+    cancellable: bool,
+    kind: string,
+    label: string,
+}
+
+export struct GlobalFileRow {
+    filename: string,
+    rel-path: string,
+    repo: string,
+    snapshot-id: string,
+    versions: string,
+    info: string,
+}
+
+export struct JobHistoryRow {
+    when: string,
+    profile: string,
+    kind: string,
+    ok: bool,
+    summary: string,
+    message: string,
+}
+
+export struct DiffRow {
+    kind: string,
+    path: string,
+    detail: string,
+}
+
+export struct SmbCredRow {
+    share: string,
+    username: string,
+}
+
+export struct ImgBrowseRow {
+    name: string,
+    path: string,
+    is-dir: bool,
+    info: string,
+}
+
+// '찾아보기' 결과 전달: 선택 창은 별도 스레드에서 열고, 끝나면 앱이 target 이 같은 PathField 에 값을 넣는다(seq 증가로 알림).
+export global PickBus {
+    in-out property <int> seq;
+    in-out property <string> target;
+    in-out property <string> value;
+}
+
+export global Theme {
+    in-out property <bool> dark: true;
+
+    // Windows 11 Fluent Mica / Slate canvas
+    out property <color> bg: dark ? #0b0f17 : #f8fafc;
+    out property <color> bg-subtle: dark ? #111722 : #f1f5f9;
+
+    // Frosted surfaces & Sidebars
+    out property <color> side: dark ? #0f1520 : #ffffff;
+
+    // Acrylic Elevated Cards
+    out property <color> card: dark ? #161e2b : #ffffff;
+    out property <color> card-hi: dark ? #1e2838 : #f8fafc;
+    out property <color> card-pressed: dark ? #121924 : #edf2f7;
+
+    // Refined micro-borders
+    out property <color> line: dark ? #ffffff14 : #e2e8f0;
+    out property <color> line-focus: dark ? #3b82f6 : #2563eb;
+
+    // Typography hierarchy (WCAG AAA compliant)
+    out property <color> text: dark ? #f8fafc : #0f172a;
+    out property <color> text-sub: dark ? #cbd5e1 : #334155;
+    out property <color> muted: dark ? #94a3b8 : #64748b;
+
+    // Vibrant & accessible semantic accents
+    out property <color> accent: dark ? #3b82f6 : #2563eb;
+    out property <color> accent-hi: dark ? #60a5fa : #1d4ed8;
+    out property <color> accent-bg: dark ? #3b82f61a : #eff6ff;
+
+    out property <color> ok: dark ? #22c55e : #15803d;
+    out property <color> ok-bg: dark ? #22c55e1a : #f0fdf4;
+
+    out property <color> warn: dark ? #eab308 : #b45309;
+    out property <color> warn-bg: dark ? #eab3081a : #fefce8;
+
+    out property <color> danger: #ef4444;
+    out property <color> danger-bg: dark ? #ef44441a : #fef2f2;
+}

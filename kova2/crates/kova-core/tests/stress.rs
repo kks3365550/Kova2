@@ -94,6 +94,7 @@ fn opts(src: &Path, repo: &Path, id: &str) -> BackupOptions {
         exclude: vec![],
         profile_id: None,
         scan_from: None,
+        ..Default::default()
     }
 }
 

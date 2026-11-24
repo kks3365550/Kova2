@@ -161,6 +161,25 @@ pub(crate) mod dpapi {
     }
 }
 
+pub(crate) fn dpapi_protect(plain: &[u8]) -> Result<Vec<u8>, String> {
+    dpapi::protect(plain)
+}
+
+pub(crate) fn dpapi_unprotect(cipher: &[u8]) -> Result<Vec<u8>, String> {
+    dpapi::unprotect(cipher)
+}
+
+/// 스냅샷 매니페스트 파일을 읽는다. `ENC\x01` 암호화 헤더면 `CasStorage::read_manifest_bytes` 로 투명 복호화한다.
+pub(crate) fn read_manifest_plain(repo: &Path, path: &Path, sid: &str) -> std::io::Result<Vec<u8>> {
+    let raw = fs::read(kova_engine::longpath::to_extended(path))?;
+    if kova_engine::storage::is_encrypted_manifest_bytes(&raw) {
+        let cas = kova_engine::storage::CasStorage::new(repo)?;
+        cas.read_manifest_bytes(path, sid)
+    } else {
+        Ok(raw)
+    }
+}
+
 fn store_key(repo_id: &str, key: &[u8; 32]) -> Result<(), String> {
     let enc = dpapi::protect(key)?;
     fs::create_dir_all(key_dir()).map_err(|e| format!("키 폴더 만들기: {e}"))?;
@@ -359,6 +378,27 @@ pub fn restore_key(repo: &Path, code: &str) -> Result<(), String> {
         return Err("복구 코드가 이 저장소의 것이 아닙니다".into());
     }
     store_key(&m.repo_id, &key)
+}
+
+/// 복구 코드가 지정 저장소(`repo/crypto.json` 의 `key_check`)와 일치하는지 확인한다(키 파일을 쓰지 않는다).
+/// 일반 권한 사용자의 암호화 저장소 복원 인가 검증 등에 사용한다.
+pub fn verify_recovery_code_for_repo(repo: &Path, code: &str) -> Result<bool, String> {
+    let m = read_marker(repo)?;
+    let clean: String = code.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let Some(raw) = unhex(&clean) else {
+        return Ok(false);
+    };
+    let Ok(key): Result<[u8; 32], _> = raw.try_into() else {
+        return Ok(false);
+    };
+    let expected = key_check(&key);
+    let eq = expected.len() == m.key_check.len()
+        && expected
+            .bytes()
+            .zip(m.key_check.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    Ok(eq)
 }
 
 /// 이 PC에 보관된 암호화 저장소 키를 복구 코드(8자리 그룹 16진수)로 내보낸다.
@@ -575,6 +615,7 @@ mod tests {
             exclude: vec![],
             profile_id: None,
             scan_from: None,
+            ..Default::default()
         };
         ops::run_backup(&opts, &|_| {}, &AtomicBool::new(false)).unwrap();
     }
@@ -850,5 +891,37 @@ mod tests {
         )
         .unwrap();
         assert!(!has_encrypted_blobs(plain_repo.path()));
+    }
+
+    #[test]
+    fn verify_recovery_code_for_repo_checks_key_check_without_modifying_keys() {
+        let _g = TEST_KEY_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = tempfile::tempdir().unwrap();
+        std::env::set_var("KOVA2_KEY_DIR", keys.path());
+
+        let plain_repo = tempfile::tempdir().unwrap();
+        assert!(verify_recovery_code_for_repo(plain_repo.path(), "00").is_err());
+
+        let repo = tempfile::tempdir().unwrap();
+        let code = enable(repo.path()).unwrap().expect("새로 켜짐");
+        // 키 파일을 지워도 crypto.json 의 key_check 만으로 검증할 수 있어야 한다
+        for f in fs::read_dir(keys.path()).unwrap() {
+            fs::remove_file(f.unwrap().path()).unwrap();
+        }
+        assert!(verify_recovery_code_for_repo(repo.path(), &code).unwrap());
+        assert!(verify_recovery_code_for_repo(repo.path(), &code.to_uppercase()).unwrap());
+        assert!(verify_recovery_code_for_repo(
+            repo.path(),
+            &format!("  {}  ", code.replace('-', " "))
+        )
+        .unwrap());
+        // 길이는 맞지만 다른 키
+        let wrong = "0".repeat(64);
+        assert!(!verify_recovery_code_for_repo(repo.path(), &wrong).unwrap());
+        // 형식/길이 불일치
+        assert!(!verify_recovery_code_for_repo(repo.path(), "short").unwrap());
+        assert!(!verify_recovery_code_for_repo(repo.path(), "").unwrap());
+        // 키 파일이 새로 생성되지 않았어야 한다
+        assert_eq!(fs::read_dir(keys.path()).unwrap().count(), 0);
     }
 }

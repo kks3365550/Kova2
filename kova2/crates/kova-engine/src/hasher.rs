@@ -8,7 +8,7 @@ pub fn hash_bytes(data: &[u8]) -> String {
 }
 
 pub fn hash_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
+    let mut file = File::open(crate::longpath::to_extended(path))?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 65536];
     loop {

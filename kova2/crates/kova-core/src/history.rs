@@ -1,7 +1,7 @@
 //! 이력 DB (core/metadata_db.py 이식). 저장소의 `metadata.db` 는 스냅샷 매니페스트(진실의 원천)의
 //! 재생성 가능한 색인이다. 손상되면 격리하고 매니페스트에서 다시 만든다.
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -169,7 +169,7 @@ impl History {
                 if old.is_some_and(|o| (o - mtime).abs() < 1e-6) {
                     continue;
                 }
-                let parsed = fs::read(&p)
+                let parsed = crate::repocrypto::read_manifest_plain(&self.repo, &p, &id)
                     .ok()
                     .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
                 let Some(v) = parsed else {
@@ -314,6 +314,126 @@ impl History {
     }
 }
 
+/// 백업·복원·검증·정리 작업 실행 이력 한 건.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobRunRecord {
+    pub id: i64,
+    pub started_at: f64,
+    pub finished_at: f64,
+    pub profile_id: String,
+    pub kind: String,
+    pub ok: bool,
+    pub message: String,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+const JOB_HISTORY_FILE: &str = "job_history.db";
+const JOB_HISTORY_CAP: i64 = 1000;
+
+const JOB_HISTORY_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS job_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at REAL NOT NULL,
+    finished_at REAL NOT NULL,
+    profile_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',
+    ok INTEGER NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT '',
+    bytes INTEGER NOT NULL DEFAULT 0,
+    files INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_job_runs_finished ON job_runs(finished_at DESC, id DESC);";
+
+/// 서비스 작업 실행 이력 DB(`config_dir/job_history.db`, 최근 1,000건 유지).
+pub struct JobHistoryDb {
+    conn: Connection,
+}
+
+impl JobHistoryDb {
+    pub fn open(config_dir: &Path) -> Result<Self, String> {
+        fs::create_dir_all(config_dir).map_err(|e| format!("설정 폴더 생성 실패: {e}"))?;
+        let db = config_dir.join(JOB_HISTORY_FILE);
+        if db.exists() && !is_healthy(&db) {
+            let ms = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            for ext in ["-wal", "-shm"] {
+                let _ = fs::remove_file(config_dir.join(format!("{JOB_HISTORY_FILE}{ext}")));
+            }
+            let _ = fs::rename(
+                &db,
+                config_dir.join(format!("{JOB_HISTORY_FILE}.corrupt_{ms}")),
+            );
+        }
+        let conn = Connection::open(&db).map_err(|e| format!("작업 이력 DB 열기 실패: {e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))
+            .map_err(|e| format!("작업 이력 DB 설정 실패: {e}"))?;
+        let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()));
+        conn.execute_batch(JOB_HISTORY_SCHEMA)
+            .map_err(|e| format!("작업 이력 스키마 초기화 실패: {e}"))?;
+        Ok(Self { conn })
+    }
+
+    /// 작업 실행 이력을 한 건 기록하고, 최근 1,000건만 남기고 오래된 행을 정리한다.
+    pub fn record(&self, rec: &JobRunRecord) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO job_runs (started_at, finished_at, profile_id, kind, ok, message, bytes, files)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    rec.started_at,
+                    rec.finished_at,
+                    rec.profile_id,
+                    rec.kind,
+                    rec.ok as i64,
+                    rec.message,
+                    rec.bytes as i64,
+                    rec.files as i64,
+                ],
+            )
+            .map_err(|e| format!("작업 이력 기록 실패: {e}"))?;
+        let row_id = self.conn.last_insert_rowid();
+        let _ = self.conn.execute(
+            "DELETE FROM job_runs WHERE id NOT IN (SELECT id FROM job_runs ORDER BY id DESC LIMIT ?1)",
+            params![JOB_HISTORY_CAP],
+        );
+        Ok(row_id)
+    }
+
+    /// 최근 실행 이력을 최신순으로 최대 `limit` 건 돌려준다.
+    pub fn list(&self, limit: usize) -> Result<Vec<JobRunRecord>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT id, started_at, finished_at, profile_id, kind, ok, message, bytes, files
+                 FROM job_runs ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| format!("작업 이력 조회 준비 실패: {e}"))?;
+        let rows = st
+            .query_map(params![limit as i64], |r| {
+                Ok(JobRunRecord {
+                    id: r.get(0)?,
+                    started_at: r.get(1)?,
+                    finished_at: r.get(2)?,
+                    profile_id: r.get(3)?,
+                    kind: r.get(4)?,
+                    ok: r.get::<_, i64>(5)? != 0,
+                    message: r.get(6)?,
+                    bytes: r.get::<_, i64>(7)?.max(0) as u64,
+                    files: r.get::<_, i64>(8)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| format!("작업 이력 조회 실패: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("작업 이력 행 읽기 실패: {e}"))?);
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +573,39 @@ mod tests {
         let bad_ts = h.get_snapshot("bad_ts").unwrap().unwrap();
         assert!(bad_ts.created_at > 1_000_000_000.0);
         assert!((bad_ts.created_at - bad_ts.file_mtime).abs() < 1e-6);
+    }
+
+    #[test]
+    fn job_history_db_records_lists_and_caps_at_1000_rows() {
+        let d = tempfile::tempdir().unwrap();
+        let db = JobHistoryDb::open(d.path()).unwrap();
+        assert!(db.list(10).unwrap().is_empty());
+
+        for i in 0..1015u64 {
+            let id = db
+                .record(&JobRunRecord {
+                    id: 0,
+                    started_at: 1000.0 + i as f64,
+                    finished_at: 1005.0 + i as f64,
+                    profile_id: "p1".into(),
+                    kind: "backup".into(),
+                    ok: i.is_multiple_of(2),
+                    message: format!("run #{i}"),
+                    bytes: i * 1024,
+                    files: i,
+                })
+                .unwrap();
+            assert!(id > 0);
+        }
+
+        let top5 = db.list(5).unwrap();
+        assert_eq!(top5.len(), 5);
+        assert_eq!(top5[0].message, "run #1014");
+        assert_eq!(top5[4].message, "run #1010");
+
+        let all = db.list(2000).unwrap();
+        assert_eq!(all.len(), 1000);
+        assert_eq!(all.first().unwrap().message, "run #1014");
+        assert_eq!(all.last().unwrap().message, "run #15");
     }
 }

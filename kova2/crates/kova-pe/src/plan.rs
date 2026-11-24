@@ -68,8 +68,18 @@ pub fn disk_selected_ok(
     image_disks: &[u32],
     image_bytes: u64,
 ) -> Result<(), String> {
-    // 이미지가 놓인 디스크를 못 알아냈으면 어느 디스크도 지우지 않는다(이미지 디스크를 지우는 것을 막을 수 없으므로)
-    if image_disks.is_empty() {
+    disk_selected_ok_ext(disk, image_disks, image_bytes, false)
+}
+
+pub fn disk_selected_ok_ext(
+    disk: &DiskEntry,
+    image_disks: &[u32],
+    image_bytes: u64,
+    allow_remote_image: bool,
+) -> Result<(), String> {
+    // 이미지가 놓인 디스크를 못 알아냈으면 어느 디스크도 지우지 않는다(이미지 디스크를 지우는 것을 막을 수 없으므로).
+    // 단, SMB 등 원격 공유 이미지는 로컬 물리 디스크가 없으므로 allow_remote_image=true 일 때 빈 목록을 허용한다.
+    if image_disks.is_empty() && !allow_remote_image {
         return Err(
             "could not determine which disk holds the restore image; refusing to erase any disk"
                 .into(),
@@ -95,6 +105,33 @@ pub fn disk_selected_ok(
         ));
     }
     Ok(())
+}
+
+/// 64자리 16진수 AES-256 키 문자열을 파싱한다(공백·하이픈 구분 허용).
+pub fn parse_hex_key(input: &str) -> Result<[u8; 32], String> {
+    let mut hex = Vec::with_capacity(64);
+    for ch in input.chars() {
+        if ch.is_whitespace() || ch == '-' {
+            continue;
+        }
+        if !ch.is_ascii_hexdigit() {
+            return Err(format!("invalid hex character in key: {ch:?}"));
+        }
+        hex.push(ch as u8);
+    }
+    if hex.len() != 64 {
+        return Err(format!(
+            "invalid key length: expected 64 hex characters, got {}",
+            hex.len()
+        ));
+    }
+    let mut key = [0u8; 32];
+    for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
+        let s = std::str::from_utf8(pair).map_err(|_| "invalid utf8 in key".to_string())?;
+        key[i] =
+            u8::from_str_radix(s, 16).map_err(|e| format!("failed to parse hex byte {i}: {e}"))?;
+    }
+    Ok(key)
 }
 
 pub fn confirm_phrase(disk: u32) -> String {
@@ -149,6 +186,162 @@ pub fn script_mbr(disk: u32, sys: char, os: char) -> String {
     format!(
         "select disk {disk}\nclean\nconvert mbr\ncreate partition primary size=500\nformat quick fs=ntfs label=\"SYSTEM\"\nassign letter={sys}\nactive\ncreate partition primary\nformat quick fs=ntfs label=\"KOVA_TARGET\"\nassign letter={os}\nexit\n"
     )
+}
+
+/// 저장된 파티션 레이아웃(`.qlayout.json`)을 바탕으로 diskpart 스크립트를 생성한다.
+/// 레이아웃이 비어 있거나 GPT/MBR이 아니거나 대상 디스크가 레이아웃을 수용할 수 없으면 `None`을 반환한다.
+pub fn script_from_layout(
+    disk: u32,
+    layout: &kova_image::layout::DiskLayout,
+    sys: char,
+    os: char,
+    disk_bytes: u64,
+) -> Option<String> {
+    if !sys.is_ascii_alphabetic()
+        || !os.is_ascii_alphabetic()
+        || sys.eq_ignore_ascii_case(&os)
+        || layout.partitions.is_empty()
+        || disk_bytes == 0
+    {
+        return None;
+    }
+    let sys = sys.to_ascii_uppercase();
+    let os = os.to_ascii_uppercase();
+    let disk_mb = disk_bytes >> 20;
+
+    let os_part = layout
+        .partitions
+        .iter()
+        .find(|p| {
+            p.kind.eq_ignore_ascii_case("Basic")
+                && p.size_bytes > 0
+                && p.drive_letter
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&layout.captured_drive))
+        })
+        .or_else(|| {
+            layout
+                .partitions
+                .iter()
+                .filter(|p| p.kind.eq_ignore_ascii_case("Basic") && p.size_bytes > 0)
+                .max_by_key(|p| p.size_bytes)
+        })?;
+    let os_min_mb = os_part.size_bytes.div_ceil(1 << 20).max(1);
+
+    let recovery_mb = layout
+        .partitions
+        .iter()
+        .find(|p| p.kind.eq_ignore_ascii_case("Recovery") && p.size_bytes > 0)
+        .map(|p| (p.size_bytes >> 20).clamp(256, 4096));
+
+    const OVERHEAD_MB: u64 = 16;
+
+    if layout.partition_style.eq_ignore_ascii_case("GPT") {
+        let efi_mb = layout
+            .partitions
+            .iter()
+            .find(|p| p.kind.eq_ignore_ascii_case("EFI") && p.size_bytes > 0)
+            .map(|p| (p.size_bytes >> 20).clamp(100, 1024))
+            .unwrap_or(260);
+        let msr_mb: u64 = 16;
+
+        let min_without_rec = efi_mb
+            .checked_add(msr_mb)?
+            .checked_add(os_min_mb)?
+            .checked_add(OVERHEAD_MB)?;
+        if disk_mb < min_without_rec {
+            return None;
+        }
+
+        let include_rec = recovery_mb.filter(|&rec_mb| {
+            min_without_rec
+                .checked_add(rec_mb)
+                .and_then(|v| v.checked_add(OVERHEAD_MB))
+                .is_some_and(|need| disk_mb >= need)
+        });
+
+        let mut s = format!(
+            "select disk {disk}\nclean\nconvert gpt\n\
+             create partition efi size={efi_mb}\n\
+             format quick fs=fat32 label=\"EFI\"\n\
+             assign letter={sys}\n\
+             create partition msr size={msr_mb}\n"
+        );
+        if let Some(rec_mb) = include_rec {
+            let os_size_mb = disk_mb - efi_mb - msr_mb - rec_mb - OVERHEAD_MB;
+            s.push_str(&format!(
+                "create partition primary size={os_size_mb}\n\
+                 format quick fs=ntfs label=\"KOVA_TARGET\"\n\
+                 assign letter={os}\n\
+                 create partition primary\n\
+                 format quick fs=ntfs label=\"Recovery\"\n\
+                 set id=\"de94bba4-06d1-4d40-a16a-bfd50179d6ac\"\n\
+                 gpt attributes=0x8000000000000001\n\
+                 exit\n"
+            ));
+        } else {
+            s.push_str(&format!(
+                "create partition primary\n\
+                 format quick fs=ntfs label=\"KOVA_TARGET\"\n\
+                 assign letter={os}\n\
+                 exit\n"
+            ));
+        }
+        Some(s)
+    } else if layout.partition_style.eq_ignore_ascii_case("MBR") {
+        let sys_mb = layout
+            .partitions
+            .iter()
+            .find(|p| {
+                p.number != os_part.number
+                    && !p.kind.eq_ignore_ascii_case("Recovery")
+                    && p.size_bytes > 0
+                    && p.size_bytes <= (2u64 << 30)
+            })
+            .map(|p| (p.size_bytes >> 20).clamp(100, 1024))
+            .unwrap_or(500);
+
+        let min_without_rec = sys_mb.checked_add(os_min_mb)?.checked_add(OVERHEAD_MB)?;
+        if disk_mb < min_without_rec {
+            return None;
+        }
+
+        let include_rec = recovery_mb.filter(|&rec_mb| {
+            min_without_rec
+                .checked_add(rec_mb)
+                .and_then(|v| v.checked_add(OVERHEAD_MB))
+                .is_some_and(|need| disk_mb >= need)
+        });
+
+        let mut s = format!(
+            "select disk {disk}\nclean\nconvert mbr\n\
+             create partition primary size={sys_mb}\n\
+             format quick fs=ntfs label=\"SYSTEM\"\n\
+             assign letter={sys}\n\
+             active\n"
+        );
+        if let Some(rec_mb) = include_rec {
+            let os_size_mb = disk_mb - sys_mb - rec_mb - OVERHEAD_MB;
+            s.push_str(&format!(
+                "create partition primary size={os_size_mb}\n\
+                 format quick fs=ntfs label=\"KOVA_TARGET\"\n\
+                 assign letter={os}\n\
+                 create partition primary\n\
+                 format quick fs=ntfs label=\"Recovery\"\n\
+                 set id=27\n\
+                 exit\n"
+            ));
+        } else {
+            s.push_str(&format!(
+                "create partition primary\n\
+                 format quick fs=ntfs label=\"KOVA_TARGET\"\n\
+                 assign letter={os}\n\
+                 exit\n"
+            ));
+        }
+        Some(s)
+    } else {
+        None
+    }
 }
 
 pub fn script_detail_volume(letter: char) -> String {
@@ -214,6 +407,18 @@ pub fn dism_export_driver_args(dest: &std::path::Path) -> Vec<String> {
         "/online".into(),
         "/export-driver".into(),
         format!("/destination:{}", dest.display()),
+    ]
+}
+
+/// 오프라인 복원된 Windows 볼륨에 서드파티 드라이버(.inf)를 주입하기 위한 dism.exe 인자 생성
+pub fn dism_inject_offline_args(os_letter: char, drivers_dir: &std::path::Path) -> Vec<String> {
+    let letter = os_letter.to_ascii_uppercase();
+    vec![
+        format!("/Image:{letter}:\\"),
+        "/Add-Driver".into(),
+        format!("/Driver:{}", drivers_dir.display()),
+        "/Recurse".into(),
+        "/ForceUnsigned".into(),
     ]
 }
 
@@ -511,5 +716,178 @@ Type   : NVMe
         assert!(disk_selected_ok(&dm[0], &[1], 1 << 30).is_err());
         assert_eq!(parse_size("99999999999999999", "TB"), None);
         assert!(disk_selected_ok(&d[0], &[1], u64::MAX).is_err());
+    }
+
+    #[test]
+    fn test_parse_hex_key() {
+        let raw = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let expected: [u8; 32] = core::array::from_fn(|i| i as u8);
+        assert_eq!(parse_hex_key(raw), Ok(expected));
+
+        let formatted =
+            " 0001-0203 0405-0607\t0809-0A0B 0C0D-0E0F\n1011-1213 1415-1617 1819-1A1B 1C1D-1E1F ";
+        assert_eq!(parse_hex_key(formatted), Ok(expected));
+
+        // 너무 짧거나 긴 키
+        assert!(parse_hex_key("").is_err());
+        assert!(parse_hex_key("00112233").is_err());
+        assert!(parse_hex_key(&format!("{raw}00")).is_err());
+        // 16진수가 아닌 문자 포함
+        let bad_char = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1z";
+        assert!(parse_hex_key(bad_char).is_err());
+    }
+
+    #[test]
+    fn test_script_from_layout() {
+        use kova_image::layout::{DiskLayout, PartitionInfo, LAYOUT_VERSION};
+
+        let gpt_layout = DiskLayout {
+            version: LAYOUT_VERSION,
+            disk_number: 0,
+            partition_style: "GPT".into(),
+            disk_size_bytes: 256 << 30,
+            captured_drive: 'C',
+            partitions: vec![
+                PartitionInfo {
+                    number: 1,
+                    offset_bytes: 1 << 20,
+                    size_bytes: 200 << 20,
+                    style: "GPT".into(),
+                    kind: "EFI".into(),
+                    drive_letter: None,
+                    label: "SYSTEM".into(),
+                    file_system: "FAT32".into(),
+                },
+                PartitionInfo {
+                    number: 2,
+                    offset_bytes: 201 << 20,
+                    size_bytes: 16 << 20,
+                    style: "GPT".into(),
+                    kind: "MSR".into(),
+                    drive_letter: None,
+                    label: String::new(),
+                    file_system: String::new(),
+                },
+                PartitionInfo {
+                    number: 3,
+                    offset_bytes: 217 << 20,
+                    size_bytes: 100 << 30,
+                    style: "GPT".into(),
+                    kind: "Basic".into(),
+                    drive_letter: Some('C'),
+                    label: "Windows".into(),
+                    file_system: "NTFS".into(),
+                },
+                PartitionInfo {
+                    number: 4,
+                    offset_bytes: (100 << 30) + (217 << 20),
+                    size_bytes: 900 << 20,
+                    style: "GPT".into(),
+                    kind: "Recovery".into(),
+                    drive_letter: None,
+                    label: "Recovery".into(),
+                    file_system: "NTFS".into(),
+                },
+            ],
+        };
+
+        // GPT + EFI + MSR + Basic + Recovery (충분한 디스크 크기)
+        let s = script_from_layout(1, &gpt_layout, 's', 't', 256 << 30)
+            .expect("GPT layout should produce script");
+        assert!(s.contains("select disk 1\nclean\nconvert gpt"));
+        assert!(s.contains("create partition efi size=200"));
+        assert!(s.contains("assign letter=S"));
+        assert!(s.contains("create partition msr size=16"));
+        assert!(s.contains("assign letter=T"));
+        assert!(s.contains("set id=\"de94bba4-06d1-4d40-a16a-bfd50179d6ac\""));
+        assert!(s.contains("gpt attributes=0x8000000000000001"));
+
+        // 대상 디스크가 OS 파티션보다 작으면 None (oversized layout fallback)
+        assert_eq!(script_from_layout(1, &gpt_layout, 'S', 'T', 50 << 30), None);
+
+        // Recovery 공간만 빠듯한 경우 Recovery 없이 OS 파티션만 생성
+        let tight_bytes = (100 << 30) + (300 << 20);
+        let s_tight = script_from_layout(1, &gpt_layout, 'S', 'T', tight_bytes)
+            .expect("tight disk should still fit without recovery");
+        assert!(!s_tight.contains("de94bba4-06d1-4d40-a16a-bfd50179d6ac"));
+        assert!(s_tight.contains("assign letter=T"));
+
+        // MBR 레이아웃
+        let mbr_layout = DiskLayout {
+            version: LAYOUT_VERSION,
+            disk_number: 0,
+            partition_style: "MBR".into(),
+            disk_size_bytes: 120 << 30,
+            captured_drive: 'C',
+            partitions: vec![
+                PartitionInfo {
+                    number: 1,
+                    offset_bytes: 1 << 20,
+                    size_bytes: 350 << 20,
+                    style: "MBR".into(),
+                    kind: "Basic".into(),
+                    drive_letter: None,
+                    label: "System Reserved".into(),
+                    file_system: "NTFS".into(),
+                },
+                PartitionInfo {
+                    number: 2,
+                    offset_bytes: 351 << 20,
+                    size_bytes: 80 << 30,
+                    style: "MBR".into(),
+                    kind: "Basic".into(),
+                    drive_letter: Some('C'),
+                    label: "Windows".into(),
+                    file_system: "NTFS".into(),
+                },
+            ],
+        };
+        let sm = script_from_layout(2, &mbr_layout, 'S', 'T', 120 << 30)
+            .expect("MBR layout should produce script");
+        assert!(sm.contains("select disk 2\nclean\nconvert mbr"));
+        assert!(sm.contains("create partition primary size=350"));
+        assert!(sm.contains("assign letter=S\nactive"));
+        assert!(sm.contains("assign letter=T"));
+        assert_eq!(script_from_layout(2, &mbr_layout, 'S', 'T', 40 << 30), None);
+
+        // 알 수 없는 스타일은 None
+        let mut bad = mbr_layout.clone();
+        bad.partition_style = "RAW".into();
+        assert_eq!(script_from_layout(2, &bad, 'S', 'T', 120 << 30), None);
+    }
+
+    #[test]
+    fn test_disk_selected_ok_ext() {
+        let d = DiskEntry {
+            num: 0,
+            status: "Online".into(),
+            bytes: 100 << 30,
+        };
+        // 로컬 이미지(allow_remote_image=false)는 image_disks가 비어 있으면 거부
+        assert!(disk_selected_ok_ext(&d, &[], 20 << 30, false).is_err());
+        // 원격 SMB 이미지(allow_remote_image=true)는 image_disks가 비어 있어도 허용
+        assert!(disk_selected_ok_ext(&d, &[], 20 << 30, true).is_ok());
+        // 원격 이미지라도 오프라인/용량 부족 디스크는 여전히 거부
+        let off = DiskEntry {
+            status: "Offline".into(),
+            ..d.clone()
+        };
+        assert!(disk_selected_ok_ext(&off, &[], 20 << 30, true).is_err());
+        assert!(disk_selected_ok_ext(&d, &[], 100 << 30, true).is_err());
+    }
+
+    #[test]
+    fn test_dism_inject_offline_args() {
+        let dir = std::path::Path::new("D:\\KovaDrivers");
+        assert_eq!(
+            dism_inject_offline_args('t', dir),
+            vec![
+                "/Image:T:\\",
+                "/Add-Driver",
+                "/Driver:D:\\KovaDrivers",
+                "/Recurse",
+                "/ForceUnsigned",
+            ]
+        );
     }
 }

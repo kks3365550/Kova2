@@ -103,6 +103,7 @@ mod tests {
             exclude: vec![],
             profile_id: None,
             scan_from: None,
+            ..Default::default()
         };
         run_backup(&opts, &|_| {}, &AtomicBool::new(false)).unwrap();
         let mut p = Profile::new("p", "훈련");
@@ -146,6 +147,7 @@ mod tests {
             exclude: vec![],
             profile_id: Some("prof_a".into()),
             scan_from: None,
+            ..Default::default()
         };
         run_backup(&opts, &|_| {}, &AtomicBool::new(false)).unwrap();
 

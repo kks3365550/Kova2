@@ -200,9 +200,13 @@ pub fn replicate_with_limit(
             rep.failures
                 .push(format!("{}: {why}", name.to_string_lossy()));
         };
-        let m: SnapshotManifest = match fs::File::open(&mp)
+        let sid_stem = mp
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let m: SnapshotManifest = match crate::repocrypto::read_manifest_plain(repo, &mp, &sid_stem)
             .map_err(|e| e.to_string())
-            .and_then(|f| serde_json::from_reader(io::BufReader::new(f)).map_err(|e| e.to_string()))
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
         {
             Ok(m) => m,
             Err(e) => {
@@ -290,6 +294,7 @@ mod tests {
             exclude: vec![],
             profile_id: None,
             scan_from: None,
+            ..Default::default()
         };
         run_backup(&opts, &|_| {}, &AtomicBool::new(false)).unwrap();
         repo
@@ -459,6 +464,7 @@ mod tests {
             exclude: vec![],
             profile_id: None,
             scan_from: None,
+            ..Default::default()
         };
         run_backup(&opts, &|_| {}, &AtomicBool::new(false)).unwrap();
         let dest = d.path().join("offsite");

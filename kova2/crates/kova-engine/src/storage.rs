@@ -30,6 +30,11 @@ where
     }
 }
 
+/// 암호화된 매니페스트(또는 블롭) 바이너리 헤더(`ENC\x01`)인지 확인한다.
+pub fn is_encrypted_manifest_bytes(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"ENC\x01")
+}
+
 /// 블롭 해시 문자열이 16진수인지(경로 조각·`&hash[0..2]` 로 써도 안전한지) 확인한다.
 pub fn is_valid_hash(hash: &str) -> bool {
     (2..=128).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_hexdigit())
@@ -103,7 +108,7 @@ pub fn is_baseline_for(m: &SnapshotManifest, profile_id: Option<&str>, sources: 
 /// 매니페스트 파일 목록(최신 수정 시각 순).
 fn manifest_paths_newest_first(snapshots_dir: &Path) -> Vec<PathBuf> {
     let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    if let Ok(dir_entries) = fs::read_dir(snapshots_dir) {
+    if let Ok(dir_entries) = fs::read_dir(crate::longpath::to_extended(snapshots_dir)) {
         for entry in dir_entries.flatten() {
             let path = entry.path();
             if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
@@ -135,8 +140,8 @@ pub fn find_recent_manifest(
         let parsed: Vec<Option<SnapshotManifest>> = batch
             .par_iter()
             .map(|path| {
-                let m: SnapshotManifest =
-                    serde_json::from_reader(BufReader::new(File::open(path).ok()?)).ok()?;
+                let f = File::open(crate::longpath::to_extended(path)).ok()?;
+                let m: SnapshotManifest = serde_json::from_reader(BufReader::new(f)).ok()?;
                 let count = m.files.as_ref().map_or(0, |f| f.len())
                     + m.entries.as_ref().map_or(0, |e| e.len());
                 (count > 0 && pred(&m)).then_some(m)
@@ -180,6 +185,15 @@ pub struct FileEntry {
     /// 원본 경로 번호(매니페스트 sources 배열의 인덱스). 원위치 복원용. 구형 스냅샷에는 없다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub src: Option<u32>,
+    /// 생성 시각(Unix epoch 기준 밀리초). 구형 스냅샷에는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<i64>,
+    /// Windows 복원 가능 파일 속성 마스크(`0x27`). 구형 스냅샷에는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<u32>,
+    /// Windows NTFS DACL SDDL 문자열. 구형 스냅샷에는 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acl_sddl: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -215,6 +229,9 @@ pub struct SnapshotManifest {
     pub files: Option<Vec<FileEntry>>,
     #[serde(default)]
     pub entries: Option<Vec<FileEntry>>,
+    /// 백업 시점의 볼륨별 NTFS USN 저널 체크포인트(지원 환경에서만 기록).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usn_checkpoints: Option<Vec<crate::usn::UsnCheckpoint>>,
 }
 
 impl SnapshotManifest {
@@ -282,8 +299,8 @@ struct Stage {
 impl CasStorage {
     pub fn new<P: AsRef<Path>>(repo_root: P) -> io::Result<Self> {
         let root = repo_root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("blobs"))?;
-        fs::create_dir_all(root.join("snapshots"))?;
+        fs::create_dir_all(crate::longpath::to_extended(&root.join("blobs")))?;
+        fs::create_dir_all(crate::longpath::to_extended(&root.join("snapshots")))?;
         let codec = crate::codec::resolve(&root).map_err(io::Error::other)?;
         Ok(Self {
             repo_root: root,
@@ -340,7 +357,7 @@ impl CasStorage {
             .unwrap_or_else(|e| e.into_inner())
             .contains(hash)
             || self.pack_index().contains_key(hash)
-            || self.blob_path(hash).exists()
+            || crate::longpath::to_extended(&self.blob_path(hash)).exists()
     }
 
     /// 새 블롭을 모아 두었다가 `STAGE_LIMIT` 이 차면 팩 하나로 쓴다(블롭마다 파일을 만들지 않아 빠르다).
@@ -417,7 +434,7 @@ impl CasStorage {
     pub fn try_get_all_blob_hashes(&self) -> io::Result<std::collections::HashSet<String>> {
         use rayon::prelude::*;
 
-        let blobs_dir = self.repo_root.join("blobs");
+        let blobs_dir = crate::longpath::to_extended(&self.repo_root.join("blobs"));
         let packed: Vec<String> = self.pack_index().keys().cloned().collect();
         if !blobs_dir.is_dir() {
             return Ok(packed.into_iter().collect());
@@ -435,7 +452,7 @@ impl CasStorage {
             .par_iter()
             .map(|dir| {
                 let mut dir_hashes = Vec::new();
-                for entry in fs::read_dir(dir)? {
+                for entry in fs::read_dir(crate::longpath::to_extended(dir))? {
                     let p = entry?.path();
                     if p.extension().is_some_and(|ext| ext == "blob") {
                         if let Some(stem) = p.file_stem() {
@@ -462,7 +479,7 @@ impl CasStorage {
                 "invalid blob hash",
             ));
         }
-        let target_path = self.blob_path(hash);
+        let target_path = crate::longpath::to_extended(&self.blob_path(hash));
         if target_path.exists() || self.pack_index().contains_key(hash) {
             return Ok(false);
         }
@@ -473,11 +490,11 @@ impl CasStorage {
 
         // 같은 내용(같은 해시)을 여러 스레드가 동시에 저장할 수 있으므로 임시 파일 이름은 호출마다 다르게 한다
         static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tmp_path = target_path.with_extension(format!(
+        let tmp_path = crate::longpath::to_extended(&self.blob_path(hash).with_extension(format!(
             "{}.{}.tmp",
             std::process::id(),
             TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        )));
         let write_res = (|| -> io::Result<()> {
             let mut file = File::create(&tmp_path)?;
             file.write_all(compressed_data)?;
@@ -513,9 +530,8 @@ impl CasStorage {
         let handle = match cached {
             Some(h) => h,
             None => {
-                let h = std::sync::Arc::new(File::open(crate::pack::pack_file(
-                    &self.repo_root,
-                    &entry.pack,
+                let h = std::sync::Arc::new(File::open(crate::longpath::to_extended(
+                    &crate::pack::pack_file(&self.repo_root, &entry.pack),
                 ))?);
                 let mut m = self.open_packs.write().unwrap_or_else(|e| e.into_inner());
                 if m.len() >= OPEN_PACKS_MAX {
@@ -543,7 +559,7 @@ impl CasStorage {
         if let Some(entry) = self.pack_index().get(hash) {
             return self.read_packed(entry);
         }
-        let target_path = self.blob_path(hash);
+        let target_path = crate::longpath::to_extended(&self.blob_path(hash));
         match File::open(target_path) {
             Ok(mut file) => {
                 let mut data = Vec::new();
@@ -566,9 +582,20 @@ impl CasStorage {
         }
     }
 
-    pub fn save_manifest(&self, manifest: &SnapshotManifest) -> io::Result<()> {
+    pub fn save_manifest(&self, manifest: &SnapshotManifest) -> io::Result<PathBuf> {
+        self.save_manifest_encrypted(manifest, false)
+    }
+
+    /// 스냅샷 매니페스트를 원자적으로 저장한다.
+    /// `encrypt == true` 이면 등록된 암호화 코덱으로 암호화(`ENC\x01`)해 기록하며,
+    /// 코덱이 없으면 평문으로 기록하지 않고 `InvalidInput` 오류를 돌려준다.
+    pub fn save_manifest_encrypted(
+        &self,
+        manifest: &SnapshotManifest,
+        encrypt: bool,
+    ) -> io::Result<PathBuf> {
         let snapshots_dir = self.repo_root.join("snapshots");
-        fs::create_dir_all(&snapshots_dir)?;
+        fs::create_dir_all(crate::longpath::to_extended(&snapshots_dir))?;
         let sid = manifest.session_id();
         if !valid_session_id(&sid) {
             return Err(io::Error::new(
@@ -584,16 +611,33 @@ impl CasStorage {
             TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
 
-        let json = serde_json::to_string(manifest)
+        let json_bytes = serde_json::to_vec(manifest)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        let payload = if encrypt {
+            let Some(ref codec) = self.codec else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "암호화 코덱 없이 매니페스트를 암호화할 수 없습니다",
+                ));
+            };
+            codec
+                .encode(&json_bytes, &sid, 3)
+                .map_err(io::Error::other)?
+        } else {
+            json_bytes
+        };
+
+        let ext_tmp = crate::longpath::to_extended(&tmp_path);
+        let ext_target = crate::longpath::to_extended(&target_path);
+
         // 내용을 디스크까지 내린 뒤에 이름을 놓는다(정전 시 빈/잘린 매니페스트 방지)
-        let written = File::create(&tmp_path).and_then(|mut f| {
-            f.write_all(json.as_bytes())?;
+        let written = File::create(&ext_tmp).and_then(|mut f| {
+            f.write_all(&payload)?;
             f.sync_all()
         });
         if let Err(e) = written {
-            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&ext_tmp);
             return Err(e);
         }
         let exists = || {
@@ -603,14 +647,42 @@ impl CasStorage {
             )
         };
         // 같은 ID 의 기존 스냅샷은 절대 덮어쓰지 않는다. 하드 링크는 대상이 있으면 원자적으로 실패한다.
-        let placed = match fs::hard_link(&tmp_path, &target_path) {
+        let placed = match fs::hard_link(&ext_tmp, &ext_target) {
             Ok(()) => Ok(()),
-            Err(_) if target_path.exists() => Err(exists()),
+            Err(_) if ext_target.exists() => Err(exists()),
             // 하드 링크를 못 쓰는 파일 시스템(FAT 등): 확인 후 이름 바꾸기
-            Err(_) => fs::rename(&tmp_path, &target_path),
+            Err(_) => fs::rename(&ext_tmp, &ext_target),
         };
-        let _ = fs::remove_file(&tmp_path);
-        placed
+        let _ = fs::remove_file(&ext_tmp);
+        placed.map(|()| target_path)
+    }
+
+    /// 매니페스트 파일의 평문 JSON 바이트를 읽는다.
+    /// `ENC\x01` 헤더로 시작하면 등록된 코덱으로 투명 복호화하고, 코덱이 없으면 실패한다(fail closed).
+    pub fn read_manifest_bytes(&self, path: &Path, session_id: &str) -> io::Result<Vec<u8>> {
+        let raw = fs::read(crate::longpath::to_extended(path))?;
+        if is_encrypted_manifest_bytes(&raw) {
+            let Some(ref codec) = self.codec else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "암호화된 매니페스트를 복호화할 코덱이 없습니다",
+                ));
+            };
+            codec
+                .decode(&raw, session_id)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        } else {
+            Ok(raw)
+        }
+    }
+
+    fn load_manifest_from_path(&self, path: &Path) -> io::Result<SnapshotManifest> {
+        let sid = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let plain = self.read_manifest_bytes(path, &sid)?;
+        serde_json::from_slice(&plain).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     pub fn load_manifest(&self, session_id: &str) -> io::Result<SnapshotManifest> {
@@ -623,10 +695,9 @@ impl CasStorage {
         let target_path = self
             .repo_root
             .join("snapshots")
-            .join(format!("{}.json", session_id));
-        let file = File::open(target_path)?;
-        let reader = BufReader::new(file);
-        let manifest: SnapshotManifest = serde_json::from_reader(reader)
+            .join(format!("{session_id}.json"));
+        let plain = self.read_manifest_bytes(&target_path, session_id)?;
+        let manifest: SnapshotManifest = serde_json::from_slice(&plain)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(manifest)
     }
@@ -637,9 +708,23 @@ impl CasStorage {
         profile_id: Option<&str>,
         sources: &[String],
     ) -> Option<SnapshotManifest> {
-        find_recent_manifest(&self.repo_root.join("snapshots"), None, &|m| {
-            is_baseline_for(m, profile_id, sources)
-        })
+        use rayon::prelude::*;
+        let paths = manifest_paths_newest_first(&self.repo_root.join("snapshots"));
+        for batch in paths.chunks(16) {
+            let parsed: Vec<Option<SnapshotManifest>> = batch
+                .par_iter()
+                .map(|path| {
+                    let m = self.load_manifest_from_path(path).ok()?;
+                    let count = m.files.as_ref().map_or(0, |f| f.len())
+                        + m.entries.as_ref().map_or(0, |e| e.len());
+                    (count > 0 && is_baseline_for(&m, profile_id, sources)).then_some(m)
+                })
+                .collect();
+            if let Some(m) = parsed.into_iter().flatten().next() {
+                return Some(m);
+            }
+        }
+        None
     }
 
     pub fn get_recent_manifests(&self, limit: usize) -> Vec<SnapshotManifest> {
@@ -652,29 +737,14 @@ impl CasStorage {
         profile_id: Option<&str>,
     ) -> Vec<SnapshotManifest> {
         let snapshots_dir = self.repo_root.join("snapshots");
-        if !snapshots_dir.is_dir() || limit == 0 {
+        if !crate::longpath::to_extended(&snapshots_dir).is_dir() || limit == 0 {
             return Vec::new();
         }
 
-        let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-        if let Ok(dir_entries) = fs::read_dir(snapshots_dir) {
-            for entry in dir_entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-                    let mtime = entry
-                        .metadata()
-                        .and_then(|m| m.modified())
-                        .unwrap_or(std::time::UNIX_EPOCH);
-                    entries.push((mtime, path));
-                }
-            }
-        }
-
-        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let paths = manifest_paths_newest_first(&snapshots_dir);
 
         // Parse candidate manifests in parallel batches (newest first, order preserved).
         use rayon::prelude::*;
-        let paths: Vec<PathBuf> = entries.into_iter().map(|(_, p)| p).collect();
         let mut manifests: Vec<SnapshotManifest> = Vec::new();
         let batch_size = if profile_id.is_some() {
             limit.max(16)
@@ -684,43 +754,31 @@ impl CasStorage {
         for batch in paths.chunks(batch_size) {
             let parsed: Vec<Option<SnapshotManifest>> = batch
                 .par_iter()
-                .map(|path| match File::open(path) {
-                    Ok(file) => {
-                        match serde_json::from_reader::<_, SnapshotManifest>(BufReader::new(file)) {
-                            Ok(m) => {
-                                let count = m.files.as_ref().map_or(0, |f| f.len())
-                                    + m.entries.as_ref().map_or(0, |e| e.len());
-                                if count > 0 {
-                                    if let Some(pid) = profile_id {
-                                        if !pid.is_empty() {
-                                            if m.profile_id.as_deref() == Some(pid) {
-                                                Some(m)
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            Some(m)
-                                        }
-                                    } else {
+                .map(|path| match self.load_manifest_from_path(path) {
+                    Ok(m) => {
+                        let count = m.files.as_ref().map_or(0, |f| f.len())
+                            + m.entries.as_ref().map_or(0, |e| e.len());
+                        if count > 0 {
+                            if let Some(pid) = profile_id {
+                                if !pid.is_empty() {
+                                    if m.profile_id.as_deref() == Some(pid) {
                                         Some(m)
+                                    } else {
+                                        None
                                     }
                                 } else {
-                                    None
+                                    Some(m)
                                 }
+                            } else {
+                                Some(m)
                             }
-                            Err(e) => {
-                                eprintln!(
-                                    "[KOVA-FAST-DEBUG] Failed to parse manifest {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                                None
-                            }
+                        } else {
+                            None
                         }
                     }
                     Err(e) => {
                         eprintln!(
-                            "[KOVA-FAST-DEBUG] Failed to open manifest file {}: {}",
+                            "[KOVA-FAST-DEBUG] Failed to load manifest {}: {}",
                             path.display(),
                             e
                         );
@@ -910,5 +968,130 @@ mod tests {
         fs::write(d.path().join("crypto.json"), r#"{"id":"secret"}"#).unwrap();
         let err = cas.load_manifest("../crypto").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    struct MockXorCodec;
+
+    impl crate::codec::BlobCodec for MockXorCodec {
+        fn encode(&self, plain: &[u8], hash: &str, _level: i32) -> Result<Vec<u8>, String> {
+            let key = blake3::hash(hash.as_bytes());
+            let kb = key.as_bytes();
+            let mut out = Vec::with_capacity(4 + plain.len());
+            out.extend_from_slice(b"ENC\x01");
+            for (i, &b) in plain.iter().enumerate() {
+                out.push(b ^ kb[i % kb.len()]);
+            }
+            Ok(out)
+        }
+
+        fn decode(&self, blob: &[u8], hash: &str) -> Result<Vec<u8>, String> {
+            let Some(body) = blob.strip_prefix(b"ENC\x01") else {
+                return Err("missing ENC magic".into());
+            };
+            let key = blake3::hash(hash.as_bytes());
+            let kb = key.as_bytes();
+            let out: Vec<u8> = body
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b ^ kb[i % kb.len()])
+                .collect();
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn encrypted_manifest_roundtrips_and_fails_closed_without_codec() {
+        let d = tempfile::tempdir().unwrap();
+        let plain_cas = CasStorage::new(d.path()).unwrap();
+        let manifest = SnapshotManifest {
+            id: Some("enc_snap_1".into()),
+            session_id: Some("enc_snap_1".into()),
+            profile_id: Some("p1".into()),
+            files: Some(vec![FileEntry {
+                path: "hr/secret_payroll_2026.xlsx".into(),
+                size: 4096,
+                modified: 1_700_000_000_000,
+                created: Some(1_699_000_000_000),
+                attributes: Some(0x22),
+                acl_sddl: Some("D:(A;;FA;;;SY)".into()),
+                ..Default::default()
+            }]),
+            usn_checkpoints: Some(vec![crate::usn::UsnCheckpoint {
+                volume: "C:".into(),
+                journal_id: 12345,
+                next_usn: 67890,
+            }]),
+            ..Default::default()
+        };
+
+        // 코덱 없이는 암호화 저장 불가
+        let err = plain_cas
+            .save_manifest_encrypted(&manifest, true)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // 코덱이 있으면 ENC\x01 헤더로 저장되며 평문 파일명이 노출되지 않는다
+        let enc_cas = CasStorage {
+            repo_root: d.path().to_path_buf(),
+            codec: Some(std::sync::Arc::new(MockXorCodec)),
+            packs: std::sync::OnceLock::new(),
+            stage: Default::default(),
+            staged: Default::default(),
+            stage_err: Default::default(),
+            open_packs: Default::default(),
+        };
+        let saved_path = enc_cas.save_manifest_encrypted(&manifest, true).unwrap();
+        let raw = fs::read(&saved_path).unwrap();
+        assert!(is_encrypted_manifest_bytes(&raw));
+        let raw_lossy = String::from_utf8_lossy(&raw);
+        assert!(
+            !raw_lossy.contains("secret_payroll_2026"),
+            "암호화된 매니페스트에 평문 파일명이 노출됨"
+        );
+
+        // 코덱이 있는 저장소는 투명하게 복호화·로드한다
+        let loaded = enc_cas.load_manifest("enc_snap_1").unwrap();
+        assert_eq!(loaded.session_id(), "enc_snap_1");
+        assert_eq!(
+            loaded.usn_checkpoints.as_ref().unwrap()[0].journal_id,
+            12345
+        );
+        let files = loaded.files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "hr/secret_payroll_2026.xlsx");
+        assert_eq!(files[0].created, Some(1_699_000_000_000));
+        assert_eq!(files[0].attributes, Some(0x22));
+        assert_eq!(files[0].acl_sddl.as_deref(), Some("D:(A;;FA;;;SY)"));
+
+        // read_manifest_bytes 도 코덱 유무에 따라 정상 복호화 / fail-closed
+        let plain_bytes = enc_cas
+            .read_manifest_bytes(&saved_path, "enc_snap_1")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&plain_bytes).contains("secret_payroll_2026"));
+
+        let no_codec_err = plain_cas.load_manifest("enc_snap_1").unwrap_err();
+        assert_eq!(no_codec_err.kind(), io::ErrorKind::PermissionDenied);
+        let no_codec_bytes_err = plain_cas
+            .read_manifest_bytes(&saved_path, "enc_snap_1")
+            .unwrap_err();
+        assert_eq!(no_codec_bytes_err.kind(), io::ErrorKind::PermissionDenied);
+
+        // 평문 매니페스트도 같은 저장소에서 함께 읽힌다
+        let plain_manifest = SnapshotManifest {
+            id: Some("plain_snap_1".into()),
+            session_id: Some("plain_snap_1".into()),
+            files: Some(vec![FileEntry {
+                path: "public.txt".into(),
+                size: 10,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let p = enc_cas.save_manifest(&plain_manifest).unwrap();
+        assert!(!is_encrypted_manifest_bytes(&fs::read(&p).unwrap()));
+        assert_eq!(
+            enc_cas.load_manifest("plain_snap_1").unwrap().files().len(),
+            1
+        );
     }
 }

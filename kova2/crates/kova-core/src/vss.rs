@@ -10,6 +10,8 @@ pub const DEFAULT_VSS_RETRY_DELAY: Duration = Duration::from_secs(2);
 pub struct ShadowSet {
     /// (드라이브 "X:" 대문자, 섀도 ID, 장치 경로)
     shadows: Vec<(String, String, String)>,
+    /// `shadow_ids()` 슬라이스 반환용 ID 목록
+    ids: Vec<String>,
 }
 
 /// `C:\dir\x` → "C:" (드라이브 문자 경로가 아니면 None).
@@ -69,6 +71,32 @@ impl ShadowSet {
     pub fn count(&self) -> usize {
         self.shadows.len()
     }
+
+    /// 현재 유지 중인 섀도 복사본 GUID 목록(충돌 복구용 기록 등에 사용).
+    pub fn shadow_ids(&self) -> &[String] {
+        &self.ids
+    }
+}
+
+pub(crate) fn is_valid_guid(id: &str) -> bool {
+    id.len() >= 36
+        && id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, '-' | '{' | '}'))
+}
+
+/// 비정상 종료 등으로 남은 고아 VSS 섀도 복사본 GUID 들을 정리한다.
+/// 유효한 GUID 형식만 `imp::delete` 로 삭제 시도하며, 처리한 유효 GUID 개수를 돌려준다.
+pub fn cleanup_orphaned_shadows(ids: &[String]) -> usize {
+    let mut cleaned = 0usize;
+    for raw in ids {
+        let id = raw.trim();
+        if is_valid_guid(id) {
+            imp::delete(id);
+            cleaned += 1;
+        }
+    }
+    cleaned
 }
 
 impl Drop for ShadowSet {
@@ -90,11 +118,17 @@ where
 {
     let mut last_err = String::new();
     for attempt in 1..=attempts.max(1) {
-        let mut set = ShadowSet { shadows: vec![] };
+        let mut set = ShadowSet {
+            shadows: vec![],
+            ids: vec![],
+        };
         let mut failed = None;
         for d in drives {
             match creator(d) {
-                Ok((id, device)) => set.shadows.push((d.clone(), id, device)),
+                Ok((id, device)) => {
+                    set.ids.push(id.clone());
+                    set.shadows.push((d.clone(), id, device));
+                }
                 Err(e) => {
                     failed = Some(e);
                     break;
@@ -211,7 +245,9 @@ mod tests {
             .contains('/'));
         let set = ShadowSet {
             shadows: vec![("C:".into(), "x".into(), dev.into())],
+            ids: vec!["x".into()],
         };
+        assert_eq!(set.shadow_ids(), &["x".to_string()]);
         assert_eq!(set.map(Path::new("D:\\q")), PathBuf::from("D:\\q"));
         assert!(ShadowSet::create_for(&[PathBuf::from("\\\\srv\\s")]).is_err());
         std::mem::forget(set); // 가짜 ID 를 지우려고 PowerShell 을 부르지 않게 한다
@@ -234,7 +270,23 @@ mod tests {
         .unwrap();
         assert_eq!(calls, 3);
         assert_eq!(set.count(), 1);
+        assert_eq!(
+            set.shadow_ids(),
+            &["{11111111-1111-1111-1111-111111111111}".to_string()]
+        );
         std::mem::forget(set);
+    }
+
+    #[test]
+    fn cleanup_orphaned_shadows_ignores_invalid_guids() {
+        let bad = vec![
+            String::new(),
+            "short".into(),
+            "'; Remove-Item C:\\ -Recurse".into(),
+        ];
+        assert_eq!(cleanup_orphaned_shadows(&bad), 0);
+        assert!(is_valid_guid("{11111111-1111-1111-1111-111111111111}"));
+        assert!(!is_valid_guid("not-a-guid"));
     }
 
     #[test]

@@ -275,13 +275,13 @@ pub fn search_snapshots(
     let query_chosung = (enable_chosung && is_chosung_query(q_clean)).then_some(q_clean);
 
     let snapshots_dir = repo_dir.join("snapshots");
-    if !snapshots_dir.is_dir() || max_snapshots == 0 {
+    if !crate::longpath::to_extended(&snapshots_dir).is_dir() || max_snapshots == 0 {
         return Ok(Vec::new());
     }
 
     // Collect candidate snapshot files sorted by modification time descending
     let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    if let Ok(dir_entries) = std::fs::read_dir(&snapshots_dir) {
+    if let Ok(dir_entries) = std::fs::read_dir(crate::longpath::to_extended(&snapshots_dir)) {
         for entry in dir_entries.flatten() {
             let path = entry.path();
             if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
@@ -305,13 +305,26 @@ pub fn search_snapshots(
         return Ok(Vec::new());
     }
 
+    let cas_opt = if repo_dir.join(crate::codec::MARKER).is_file() {
+        crate::storage::CasStorage::new(repo_dir).ok()
+    } else {
+        None
+    };
+
     // Parse manifests in parallel using mmap and lightweight SearchManifest (ignoring chunks)
     let parsed_manifests: Vec<SearchManifest> = target_paths
         .par_iter()
         .filter_map(|path| {
-            let file = File::open(path).ok()?;
+            let file = File::open(crate::longpath::to_extended(path)).ok()?;
             let mmap = unsafe { Mmap::map(&file).ok()? };
-            serde_json::from_slice::<SearchManifest>(&mmap).ok()
+            if crate::storage::is_encrypted_manifest_bytes(&mmap) {
+                let cas = cas_opt.as_ref()?;
+                let sid = path.file_stem()?.to_string_lossy();
+                let plain = cas.read_manifest_bytes(path, &sid).ok()?;
+                serde_json::from_slice::<SearchManifest>(&plain).ok()
+            } else {
+                serde_json::from_slice::<SearchManifest>(&mmap).ok()
+            }
         })
         .collect();
 

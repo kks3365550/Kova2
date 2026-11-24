@@ -59,10 +59,22 @@ pub fn check(target: &str, repo: &Path) -> Result<PathBuf, TargetError> {
     if t.is_empty() {
         return Err(TargetError::Empty);
     }
-    let norm = t.replace('/', "\\");
-    if norm.starts_with("\\\\.\\") || norm.starts_with("\\\\?\\") {
+    let raw_norm = t.replace('/', "\\");
+    if raw_norm.starts_with("\\\\.\\") {
         return Err(TargetError::Device);
     }
+    let norm = if let Some(rest) = raw_norm.strip_prefix("\\\\?\\") {
+        let rb = rest.as_bytes();
+        if rb.len() >= 3 && rb[0].is_ascii_alphabetic() && rb[1] == b':' && rb[2] == b'\\' {
+            rest.to_string()
+        } else if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("UNC\\") {
+            format!("\\\\{}", &rest[4..])
+        } else {
+            return Err(TargetError::Device);
+        }
+    } else {
+        raw_norm
+    };
     let b = norm.as_bytes();
     let unc = norm.starts_with("\\\\");
     if !unc && !(b.len() >= 3 && b[1] == b':' && b[2] == b'\\') {
@@ -75,19 +87,28 @@ pub fn check(target: &str, repo: &Path) -> Result<PathBuf, TargetError> {
         return Err(TargetError::DriveRoot);
     }
     let lower = |x: &Path| {
-        lexical_normalize(&x.to_string_lossy().replace('/', "\\"))
-            .trim_end_matches('\\')
-            .to_lowercase()
+        let s = x.to_string_lossy().replace('/', "\\");
+        let s = if let Some(rest) = s.strip_prefix("\\\\?\\") {
+            if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("UNC\\") {
+                format!("\\\\{}", &rest[4..])
+            } else {
+                rest.to_string()
+            }
+        } else {
+            s
+        };
+        lexical_normalize(&s).trim_end_matches('\\').to_lowercase()
     };
     let (tl, rl) = (lower(&p), lower(repo));
     if !rl.is_empty() && (tl == rl || tl.starts_with(&format!("{rl}\\"))) {
         return Err(TargetError::InsideRepo);
     }
-    if p.is_file() {
+    let ext_p = kova_engine::longpath::to_extended(&p);
+    if ext_p.is_file() {
         return Err(TargetError::IsFile);
     }
-    if p.is_dir()
-        && std::fs::read_dir(&p)
+    if ext_p.is_dir()
+        && std::fs::read_dir(&ext_p)
             .map(|mut d| d.next().is_some())
             .unwrap_or(true)
     {
@@ -155,5 +176,33 @@ mod tests {
             lexical_normalize(r"\\srv\share\a\..\..\b"),
             r"\\srv\share\b"
         );
+    }
+
+    #[test]
+    fn long_paths_over_260_chars_are_allowed_while_devices_and_roots_stay_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let long_target = d
+            .path()
+            .join("a".repeat(120))
+            .join("b".repeat(120))
+            .join("restore_out");
+        let long_str = long_target.to_string_lossy().to_string();
+        assert!(long_str.len() > 260);
+        assert_eq!(check(&long_str, &repo).unwrap(), long_target);
+        assert_eq!(
+            check(&format!("\\\\?\\{long_str}"), &repo).unwrap(),
+            long_target
+        );
+        assert_eq!(
+            check(r"\\.\PhysicalDrive0", &repo),
+            Err(TargetError::Device)
+        );
+        assert_eq!(
+            check(r"\\?\Volume{1234}\out", &repo),
+            Err(TargetError::Device)
+        );
+        assert_eq!(check(r"\\?\D:\", &repo), Err(TargetError::DriveRoot));
     }
 }

@@ -16,6 +16,7 @@ fn main() {
                 exclude: vec![],
                 profile_id: Some("rt".into()),
                 scan_from: None,
+                ..Default::default()
             };
             let s = run_backup(&o, &|_| {}, &cancel).unwrap();
             println!(

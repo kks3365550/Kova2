@@ -8,6 +8,7 @@ use crate::storage::{
 };
 use crate::{chunker, hasher, scanner};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File};
@@ -15,7 +16,7 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 #[derive(Debug)]
 pub enum EngineError {
@@ -84,6 +85,29 @@ pub struct BackupOptions {
     pub profile_id: Option<String>,
     /// Some: `sources` 와 같은 순서로, 실제로 읽을 경로(VSS 섀도 복사본 안의 같은 경로). 매니페스트에는 `sources` 가 기록된다
     pub scan_from: Option<Vec<PathBuf>>,
+    /// true 이고 저장소에 암호화 코덱이 있으면 매니페스트도 암호화(`ENC\x01`)해 저장한다.
+    pub encrypt_manifest: bool,
+    /// true 이면 생성 시각·Windows 파일 속성(숨김/읽기전용 등)을 매니페스트에 기록한다(기본 true).
+    pub preserve_metadata: bool,
+    /// true 이면 신규·변경 파일의 Windows NTFS DACL(SDDL)도 매니페스트에 기록한다(기본 false).
+    pub preserve_acl: bool,
+}
+
+impl Default for BackupOptions {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            repo: PathBuf::new(),
+            session_id: None,
+            zstd_level: 3,
+            exclude: Vec::new(),
+            profile_id: None,
+            scan_from: None,
+            encrypt_manifest: false,
+            preserve_metadata: true,
+            preserve_acl: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,9 +227,12 @@ fn run_backup_inner(
         None => new_session_id(&snapshots_dir),
     };
     // 이미 있는 스냅샷을 덮어쓰지 않는다(지정한 ID 가 겹치면 시작 전에 거부)
-    if snapshots_dir.join(format!("{sid}.json")).exists() {
+    if crate::longpath::to_extended(&snapshots_dir.join(format!("{sid}.json"))).exists() {
         return Err(msg(format!("snapshot id already exists: {sid}")));
     }
+
+    // 스캔 시작 전 시점의 볼륨별 NTFS USN 저널 체크포인트를 최선 노력으로 수집한다(권한 부족·비-NTFS면 빈 목록)
+    let usn_checkpoints = crate::usn::collect_checkpoints(sources);
 
     on_event(Event::Phase {
         phase: "scanning",
@@ -386,6 +413,22 @@ fn run_backup_inner(
                         processed_files.fetch_add(1, Ordering::Relaxed) + 1,
                         &item.rel_path,
                     );
+                    let (created, attributes, acl_sddl) = if opts.preserve_metadata {
+                        let acl = if opts.preserve_acl {
+                            prev.acl_sddl
+                                .clone()
+                                .or_else(|| scanner::read_acl_sddl(&item.path))
+                        } else {
+                            prev.acl_sddl.clone()
+                        };
+                        (
+                            item.created.or(prev.created),
+                            item.attributes.or(prev.attributes),
+                            acl,
+                        )
+                    } else {
+                        (None, None, None)
+                    };
                     return Some(FileEntry {
                         path: item.rel_path,
                         size: prev.size,
@@ -395,6 +438,9 @@ fn run_backup_inner(
                         blob_id: prev.blob_id.clone(),
                         sha256: prev.sha256.clone(),
                         src: Some(item.src),
+                        created,
+                        attributes,
+                        acl_sddl,
                     });
                 }
                 modified_files.fetch_add(1, Ordering::Relaxed);
@@ -458,6 +504,21 @@ fn run_backup_inner(
                 processed_files.fetch_add(1, Ordering::Relaxed) + 1,
                 &item.rel_path,
             );
+            let created = if opts.preserve_metadata {
+                item.created
+            } else {
+                None
+            };
+            let attributes = if opts.preserve_metadata {
+                item.attributes
+            } else {
+                None
+            };
+            let acl_sddl = if opts.preserve_acl {
+                scanner::read_acl_sddl(&item.path)
+            } else {
+                None
+            };
             Some(FileEntry {
                 path: item.rel_path,
                 size: file_size,
@@ -467,6 +528,9 @@ fn run_backup_inner(
                 blob_id: None,
                 sha256: None,
                 src: Some(item.src),
+                created,
+                attributes,
+                acl_sddl,
             })
         })
         .collect();
@@ -482,6 +546,21 @@ fn run_backup_inner(
 
     let mut all_entries = file_entries;
     for dir in dirs {
+        let created = if opts.preserve_metadata {
+            dir.created
+        } else {
+            None
+        };
+        let attributes = if opts.preserve_metadata {
+            dir.attributes
+        } else {
+            None
+        };
+        let acl_sddl = if opts.preserve_acl {
+            scanner::read_acl_sddl(&dir.path)
+        } else {
+            None
+        };
         all_entries.push(FileEntry {
             path: dir.rel_path,
             size: 0,
@@ -491,6 +570,9 @@ fn run_backup_inner(
             blob_id: None,
             sha256: None,
             src: Some(dir.src),
+            created,
+            attributes,
+            acl_sddl,
         });
     }
 
@@ -531,16 +613,18 @@ fn run_backup_inner(
         compressed_bytes: cmp_b,
         files: Some(all_entries),
         entries: None,
+        usn_checkpoints: (!usn_checkpoints.is_empty()).then_some(usn_checkpoints),
     };
     // 같은 ID 가 그 사이에 생겼으면(동시 실행) 자동 ID 는 새로 만들어 다시 쓰고, 지정 ID 는 거부한다
     loop {
-        match cas.save_manifest(&manifest) {
+        match cas.save_manifest_encrypted(&manifest, opts.encrypt_manifest) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && opts.session_id.is_none() => {
                 sid = new_session_id(&snapshots_dir);
                 manifest.id = Some(sid.clone());
                 manifest.session_id = Some(sid.clone());
             }
-            r => break r?,
+            Ok(_) => break,
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -801,7 +885,7 @@ pub fn run_restore(
             }
         }
         Some(t) => {
-            fs::create_dir_all(t)?;
+            fs::create_dir_all(crate::longpath::to_extended(t))?;
             RestoreBase {
                 target: Some(t.clone()),
                 sources,
@@ -827,7 +911,8 @@ pub fn run_restore(
         });
     }
     for e in entries.iter().filter(|e| e.is_dir) {
-        fs::create_dir_all(resolve_restore_path(&base, e).map_err(msg)?)?;
+        let dir_path = resolve_restore_path(&base, e).map_err(msg)?;
+        fs::create_dir_all(crate::longpath::to_extended(&dir_path))?;
     }
 
     let total = entries.iter().filter(|e| !e.is_dir).count();
@@ -866,6 +951,18 @@ pub fn run_restore(
             total,
             errs.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
         )));
+    }
+    // 파일 복원이 모두 끝난 뒤 폴더 메타데이터(ACL·속성)를 최선 노력으로 복원한다
+    for e in entries.iter().filter(|e| e.is_dir) {
+        if let Ok(dir_path) = resolve_restore_path(&base, e) {
+            let ext_dir = crate::longpath::to_extended(&dir_path);
+            if let Some(ref sddl) = e.acl_sddl {
+                apply_acl_sddl(&ext_dir, sddl);
+            }
+            if let Some(attrs) = e.attributes {
+                apply_file_attributes(&ext_dir, attrs);
+            }
+        }
     }
     Ok(RestoreSummary {
         total_files: total,
@@ -936,14 +1033,24 @@ fn restore_one(cas: &CasStorage, base: &RestoreBase, entry: &FileEntry) -> Resul
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     );
     let tmp_path = file_path.with_file_name(tmp_name);
-    let result = write_restored(cas, entry, &file_path, &tmp_path).and_then(|()| {
-        fs::rename(&tmp_path, &file_path)
+    let ext_tmp = crate::longpath::to_extended(&tmp_path);
+    let ext_file = crate::longpath::to_extended(&file_path);
+    let result = write_restored(cas, entry, &file_path, &ext_tmp).and_then(|()| {
+        fs::rename(&ext_tmp, &ext_file)
             .map_err(|e| format!("Cannot replace file {}: {}", file_path.display(), e))
     });
     if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&ext_tmp);
+        return result;
     }
-    result
+    // 파일 교체 완료 후 NTFS ACL → 파일 속성 순으로 적용(실패해도 복원 자체는 성공)
+    if let Some(ref sddl) = entry.acl_sddl {
+        apply_acl_sddl(&ext_file, sddl);
+    }
+    if let Some(attrs) = entry.attributes {
+        apply_file_attributes(&ext_file, attrs);
+    }
+    Ok(())
 }
 
 /// 복원 내용을 `tmp_path` 에 쓰고 청크 해시·길이·전체 크기를 검증한다(성공하면 파일은 닫힌 상태).
@@ -1016,11 +1123,295 @@ fn write_restored(
             ));
         }
     }
-    // 원래 수정 시각 복원 (실패해도 복원 자체는 성공)
-    if entry.modified > 0 {
-        let _ = file.set_modified(UNIX_EPOCH + Duration::from_millis(entry.modified));
-    }
+    // 원래 생성·수정 시각 복원 (실패해도 복원 자체는 성공)
+    apply_file_times(&file, entry.created, entry.modified);
     Ok(())
+}
+
+#[cfg(windows)]
+fn unix_ms_to_filetime(ms: i64) -> Option<windows::Win32::Foundation::FILETIME> {
+    // Windows FILETIME(1601-01-01 기준 100ns 틱)과 Unix epoch(1970-01-01)의 차이
+    const EPOCH_DIFF_TICKS: i128 = 116_444_736_000_000_000;
+    let ticks = EPOCH_DIFF_TICKS + (ms as i128) * 10_000;
+    let ticks = u64::try_from(ticks).ok()?;
+    if ticks == 0 {
+        return None;
+    }
+    Some(windows::Win32::Foundation::FILETIME {
+        dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    })
+}
+
+fn apply_file_times(file: &File, created_ms: Option<i64>, modified_ms: u64) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::SetFileTime;
+
+        let ft_created = created_ms.and_then(unix_ms_to_filetime);
+        let ft_modified = if modified_ms > 0 {
+            i64::try_from(modified_ms)
+                .ok()
+                .and_then(unix_ms_to_filetime)
+        } else {
+            None
+        };
+        if ft_created.is_some() || ft_modified.is_some() {
+            let handle = HANDLE(file.as_raw_handle());
+            let c_ptr = ft_created.as_ref().map(std::ptr::from_ref);
+            let m_ptr = ft_modified.as_ref().map(std::ptr::from_ref);
+            unsafe {
+                let _ = SetFileTime(handle, c_ptr, None, m_ptr);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use std::time::{Duration, UNIX_EPOCH};
+        let _ = created_ms;
+        if modified_ms > 0 {
+            let _ = file.set_modified(UNIX_EPOCH + Duration::from_millis(modified_ms));
+        }
+    }
+}
+
+fn apply_file_attributes(path: &Path, attrs: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            SetFileAttributesW, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
+        };
+
+        let masked = attrs & scanner::RESTORABLE_ATTR_MASK;
+        let flags = if masked == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            FILE_FLAGS_AND_ATTRIBUTES(masked)
+        };
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let _ = SetFileAttributesW(PCWSTR(wide.as_ptr()), flags);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, attrs);
+    }
+}
+
+fn apply_acl_sddl(path: &Path, sddl: &str) {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{LocalFree, BOOL, HLOCAL};
+        use windows::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows::Win32::Security::{
+            GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        };
+
+        struct LocalGuard(*mut c_void);
+        impl Drop for LocalGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        let _ = LocalFree(HLOCAL(self.0));
+                    }
+                }
+            }
+        }
+
+        let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let conv = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl_w.as_ptr()),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+        };
+        if conv.is_err() || sd.0.is_null() {
+            return;
+        }
+        let _guard = LocalGuard(sd.0);
+
+        let mut dacl_present = BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut dacl_defaulted = BOOL(0);
+        let ok = unsafe {
+            GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut dacl_defaulted)
+        };
+        if ok.is_err() || dacl_present.0 == 0 {
+            return;
+        }
+
+        let path_w: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let dacl_opt = if dacl.is_null() {
+            None
+        } else {
+            Some(dacl.cast_const())
+        };
+        unsafe {
+            let _ = SetNamedSecurityInfoW(
+                PCWSTR(path_w.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                PSID::default(),
+                PSID::default(),
+                dacl_opt,
+                None,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, sddl);
+    }
+}
+
+// ───────────────────────────── 스냅샷 비교 ─────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffItem {
+    pub path: String,
+    pub size: u64,
+    pub old_size: u64,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotDiff {
+    pub base_id: String,
+    pub target_id: String,
+    pub added: Vec<DiffItem>,
+    pub modified: Vec<DiffItem>,
+    pub deleted: Vec<DiffItem>,
+    pub unchanged_count: usize,
+}
+
+fn entry_modified(old: &FileEntry, new: &FileEntry) -> bool {
+    if old.is_dir != new.is_dir {
+        return true;
+    }
+    if old.is_dir && new.is_dir {
+        return false;
+    }
+    if old.size != new.size {
+        return true;
+    }
+    if !old.chunks.is_empty() || !new.chunks.is_empty() {
+        if old.chunks.len() != new.chunks.len()
+            || old
+                .chunks
+                .iter()
+                .zip(new.chunks.iter())
+                .any(|(a, b)| a.hash != b.hash)
+        {
+            return true;
+        }
+        return old.modified != new.modified;
+    }
+    old.modified != new.modified || old.sha256 != new.sha256 || old.blob_id != new.blob_id
+}
+
+fn manifest_entry_map(m: SnapshotManifest) -> std::collections::BTreeMap<String, FileEntry> {
+    let base = browse_base(&m);
+    let mut map = std::collections::BTreeMap::new();
+    for e in m.files() {
+        let key = virtual_path(&base, &e).unwrap_or_else(|| e.path.replace('\\', "/"));
+        map.insert(key, e);
+    }
+    map
+}
+
+/// 두 스냅샷(`base_id` → `target_id`)의 변경 사항(추가·변경·삭제·미변경 건수)을 비교한다.
+/// 암호화 매니페스트도 투명하게 지원하며 `limit > 0` 이면 각 범주를 최대 `limit` 건으로 자른다.
+pub fn diff_snapshots(
+    repo: &Path,
+    base_id: &str,
+    target_id: &str,
+    limit: usize,
+) -> Result<SnapshotDiff, EngineError> {
+    if !valid_session_id(base_id) {
+        return Err(msg(format!("invalid session id: {base_id}")));
+    }
+    if !valid_session_id(target_id) {
+        return Err(msg(format!("invalid session id: {target_id}")));
+    }
+    let cas = CasStorage::new(repo)?;
+    let base_map = manifest_entry_map(cas.load_manifest(base_id)?);
+    let target_map = manifest_entry_map(cas.load_manifest(target_id)?);
+
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    let mut deleted = Vec::new();
+    let mut unchanged_count = 0usize;
+
+    for (path, new_entry) in &target_map {
+        match base_map.get(path) {
+            None => added.push(DiffItem {
+                path: path.clone(),
+                size: new_entry.size,
+                old_size: 0,
+                is_dir: new_entry.is_dir,
+            }),
+            Some(old_entry) => {
+                if entry_modified(old_entry, new_entry) {
+                    modified.push(DiffItem {
+                        path: path.clone(),
+                        size: new_entry.size,
+                        old_size: old_entry.size,
+                        is_dir: new_entry.is_dir,
+                    });
+                } else {
+                    unchanged_count += 1;
+                }
+            }
+        }
+    }
+
+    for (path, old_entry) in &base_map {
+        if !target_map.contains_key(path) {
+            deleted.push(DiffItem {
+                path: path.clone(),
+                size: 0,
+                old_size: old_entry.size,
+                is_dir: old_entry.is_dir,
+            });
+        }
+    }
+
+    if limit > 0 {
+        added.truncate(limit);
+        modified.truncate(limit);
+        deleted.truncate(limit);
+    }
+
+    Ok(SnapshotDiff {
+        base_id: base_id.to_string(),
+        target_id: target_id.to_string(),
+        added,
+        modified,
+        deleted,
+        unchanged_count,
+    })
 }
 
 #[cfg(test)]
@@ -1028,6 +1419,7 @@ mod tests {
     use super::*;
     use crate::compressor;
     use std::collections::BTreeMap;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn no_events(_: Event) {}
 
@@ -1077,6 +1469,7 @@ mod tests {
                 exclude: vec![],
                 profile_id: None,
                 scan_from: None,
+                ..Default::default()
             },
             &no_events,
             &AtomicBool::new(false),
@@ -1176,6 +1569,7 @@ mod tests {
                 exclude: vec![],
                 profile_id: None,
                 scan_from: None,
+                ..Default::default()
             },
             &no_events,
             &AtomicBool::new(false),
@@ -1362,6 +1756,7 @@ mod tests {
                 exclude: vec![],
                 profile_id: None,
                 scan_from: None,
+                ..Default::default()
             },
             &no_events,
             &AtomicBool::new(true),
@@ -1506,6 +1901,7 @@ mod tests {
                 exclude: vec![],
                 profile_id: None,
                 scan_from: None,
+                ..Default::default()
             },
             &no_events,
             &AtomicBool::new(false),
@@ -1527,6 +1923,7 @@ mod tests {
             exclude: vec![],
             profile_id: pid.map(String::from),
             scan_from: None,
+            ..Default::default()
         }
     }
 
@@ -1801,6 +2198,7 @@ mod tests {
                 exclude: vec![],
                 profile_id: None,
                 scan_from: None,
+                ..Default::default()
             },
             &no_events,
             &AtomicBool::new(false),
@@ -1826,5 +2224,156 @@ mod tests {
             fs::read_to_string(out.join("002_B").join("same.txt")).unwrap(),
             "from B"
         );
+    }
+
+    #[test]
+    fn metadata_created_attributes_and_acl_roundtrip() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let f = src.join("meta.txt");
+        fs::write(&f, "metadata test content").unwrap();
+
+        let target_ctime_ms: i64 = 1_650_000_000_000;
+        let target_mtime_ms: u64 = 1_660_000_000_000;
+        {
+            let fh = File::options().write(true).open(&f).unwrap();
+            apply_file_times(&fh, Some(target_ctime_ms), target_mtime_ms);
+        }
+        // Windows: HIDDEN (0x02) | ARCHIVE (0x20)
+        const HIDDEN_ATTR: u32 = 0x02;
+        apply_file_attributes(&f, HIDDEN_ATTR | 0x20);
+        let src_sddl = scanner::read_acl_sddl(&f);
+
+        let repo = d.path().join("repo");
+        run_backup(
+            &BackupOptions {
+                sources: vec![src.clone()],
+                repo: repo.clone(),
+                session_id: Some("meta1".into()),
+                preserve_metadata: true,
+                preserve_acl: true,
+                ..Default::default()
+            },
+            &no_events,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let cas = CasStorage::new(&repo).unwrap();
+        let manifest = cas.load_manifest("meta1").unwrap();
+        let entry = manifest
+            .files()
+            .into_iter()
+            .find(|e| e.path == "meta.txt")
+            .unwrap();
+        assert!(entry.created.is_some());
+        #[cfg(windows)]
+        {
+            assert_eq!(entry.created, Some(target_ctime_ms));
+            assert!(
+                entry.attributes.is_some_and(|a| (a & HIDDEN_ATTR) != 0),
+                "attributes={:?}",
+                entry.attributes
+            );
+            assert_eq!(entry.acl_sddl, src_sddl);
+        }
+        #[cfg(not(windows))]
+        let _ = src_sddl;
+
+        let out = d.path().join("out");
+        run_restore(
+            &RestoreOptions {
+                repo,
+                session_id: "meta1".into(),
+                only: None,
+                target: Some(out.clone()),
+            },
+            &no_events,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let restored = out.join("meta.txt");
+        assert_eq!(
+            fs::read_to_string(&restored).unwrap(),
+            "metadata test content"
+        );
+        let meta = fs::metadata(&restored).unwrap();
+        assert_eq!(
+            meta.modified().unwrap(),
+            UNIX_EPOCH + Duration::from_millis(target_mtime_ms)
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            assert_eq!(
+                meta.created().unwrap(),
+                UNIX_EPOCH + Duration::from_millis(target_ctime_ms as u64)
+            );
+            assert_ne!(
+                meta.file_attributes() & HIDDEN_ATTR,
+                0,
+                "FILE_ATTRIBUTE_HIDDEN should be restored"
+            );
+            if entry.acl_sddl.is_some() {
+                assert!(scanner::read_acl_sddl(&restored).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn diff_snapshots_classifies_added_modified_deleted_and_unchanged() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("keep.txt"), "unchanged").unwrap();
+        fs::write(src.join("edit.txt"), "v1").unwrap();
+        fs::write(src.join("remove.txt"), "bye").unwrap();
+        set_mtime(&src.join("keep.txt"), 1_700_000_000);
+        set_mtime(&src.join("edit.txt"), 1_700_000_000);
+        set_mtime(&src.join("remove.txt"), 1_700_000_000);
+
+        let repo = d.path().join("repo");
+        backup(&src, &repo, "s1");
+
+        fs::write(src.join("edit.txt"), "version-2-longer").unwrap();
+        set_mtime(&src.join("edit.txt"), 1_700_000_100);
+        fs::remove_file(src.join("remove.txt")).unwrap();
+        fs::write(src.join("added.txt"), "hello").unwrap();
+        fs::write(src.join("extra.txt"), "world!").unwrap();
+
+        backup(&src, &repo, "s2");
+
+        let diff = diff_snapshots(&repo, "s1", "s2", 100).unwrap();
+        assert_eq!(diff.base_id, "s1");
+        assert_eq!(diff.target_id, "s2");
+        assert_eq!(diff.unchanged_count, 1);
+
+        let added_paths: Vec<&str> = diff.added.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(added_paths, vec!["added.txt", "extra.txt"]);
+        assert!(diff.added.iter().all(|i| i.old_size == 0 && !i.is_dir));
+
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].path, "edit.txt");
+        assert_eq!(diff.modified[0].old_size, 2);
+        assert_eq!(diff.modified[0].size, 16);
+        assert!(!diff.modified[0].is_dir);
+
+        assert_eq!(diff.deleted.len(), 1);
+        assert_eq!(diff.deleted[0].path, "remove.txt");
+        assert_eq!(diff.deleted[0].size, 0);
+        assert_eq!(diff.deleted[0].old_size, 3);
+        assert!(!diff.deleted[0].is_dir);
+
+        // limit 적용 확인
+        let capped = diff_snapshots(&repo, "s1", "s2", 1).unwrap();
+        assert_eq!(capped.added.len(), 1);
+        assert_eq!(capped.modified.len(), 1);
+        assert_eq!(capped.deleted.len(), 1);
+
+        // 잘못된 세션 ID 거부
+        assert!(diff_snapshots(&repo, "../bad", "s2", 10).is_err());
+        assert!(diff_snapshots(&repo, "s1", "../bad", 10).is_err());
     }
 }

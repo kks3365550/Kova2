@@ -174,6 +174,7 @@ fn run_backup(
         exclude: exclude.to_vec(),
         profile_id: None,
         scan_from: None,
+        ..Default::default()
     };
     let on_event = move |ev: ops::Event| match ev {
         ops::Event::Phase { phase, message } => {

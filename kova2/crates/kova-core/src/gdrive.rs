@@ -6,7 +6,7 @@
 //! - 업로드: 이어올리기(resumable) 세션, 폴더별 목록 캐시로 이름·크기가 같으면 건너뛴다.
 #![allow(clippy::result_large_err)] // ureq::Error 가 커서 클로저 반환형에서 경고
 use crate::repocrypto::dpapi;
-use kova_engine::storage::SnapshotManifest;
+use kova_engine::storage::{CasStorage, SnapshotManifest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ const CHUNK: usize = 8 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_WORKERS: usize = 8;
 pub(crate) const TOKEN_FILE: &str = "gdrive_token.bin";
 const CLIENT_FILE: &str = "gdrive_client.json";
+const RESUME_FILE: &str = "gdrive_resume.json";
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {
@@ -397,6 +398,21 @@ impl DriveReplicaReport {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DrivePullReport {
+    pub crypto_downloaded: bool,
+    pub snapshots_downloaded: usize,
+    pub packs_downloaded: usize,
+    pub blobs_downloaded: usize,
+    pub bytes_downloaded: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DrivePruneReport {
+    pub trashed_files: usize,
+    pub freed_bytes: u64,
+}
+
 pub struct DriveClient {
     ep: Endpoints,
     creds: ClientCreds,
@@ -409,6 +425,10 @@ pub struct DriveClient {
     workers: usize,
     /// 이어올리기 조각 크기(시험에서 줄인다)
     chunk: usize,
+    /// 업로드 대역폭 상한(바이트/초). 0 이면 무제한.
+    bw_limit_bytes_per_sec: u64,
+    /// 중단된 이어올리기 세션 캐시(`{parent}/{name}:{size}` → session URL).
+    resume_sessions: Mutex<HashMap<String, String>>,
 }
 
 /// 올릴 파일 하나(계획 단계에서 폴더·목록을 처리해 둔 결과).
@@ -418,6 +438,43 @@ struct Job {
     local: PathBuf,
     size: u64,
     existing: Option<String>,
+}
+
+fn load_resume_cache(dir: &Path) -> HashMap<String, String> {
+    fs::read_to_string(dir.join(RESUME_FILE))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_resume_cache(dir: &Path, map: &HashMap<String, String>) {
+    let path = dir.join(RESUME_FILE);
+    if map.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(map) {
+        let _ = fs::create_dir_all(dir);
+        let _ = crate::secrets::write_private(&path, &bytes);
+    }
+}
+
+fn jitter_ms() -> u64 {
+    let mut b = [0u8; 2];
+    if getrandom::getrandom(&mut b).is_ok() {
+        (u16::from_le_bytes(b) as u64) % 500
+    } else {
+        0
+    }
+}
+
+fn parse_range_next_offset(resp: &ureq::Response) -> u64 {
+    resp.header("Range")
+        .and_then(|r| r.trim().strip_prefix("bytes="))
+        .and_then(|r| r.split_once('-'))
+        .and_then(|(_, e)| e.trim().parse::<u64>().ok())
+        .and_then(|e| e.checked_add(1))
+        .unwrap_or(0)
 }
 
 impl DriveClient {
@@ -433,12 +490,46 @@ impl DriveClient {
             retry_base: Duration::from_secs(2),
             workers: DEFAULT_UPLOAD_WORKERS,
             chunk: CHUNK,
+            bw_limit_bytes_per_sec: 0,
+            resume_sessions: Mutex::new(load_resume_cache(dir)),
         })
     }
 
     /// 동시 업로드 수(1이면 순차). 1~16 로 제한한다.
     pub fn set_workers(&mut self, n: usize) {
         self.workers = n.clamp(1, 16);
+    }
+
+    /// 업로드 대역폭 상한(MB/s). 0 이면 무제한.
+    pub fn set_bw_limit_mbps(&mut self, mbps: u32) {
+        self.bw_limit_bytes_per_sec = (mbps as u64).saturating_mul(1024 * 1024);
+    }
+
+    fn resume_get(&self, key: &str) -> Option<String> {
+        self.resume_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    fn resume_set(&self, key: &str, url: &str) {
+        let mut g = self
+            .resume_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        g.insert(key.to_string(), url.to_string());
+        save_resume_cache(&self.dir, &g);
+    }
+
+    fn resume_remove(&self, key: &str) {
+        let mut g = self
+            .resume_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if g.remove(key).is_some() {
+            save_resume_cache(&self.dir, &g);
+        }
     }
 
     /// 드라이브 저장 용량: (한도 바이트, 사용 바이트). 한도가 없는 계정이면 한도는 None.
@@ -558,14 +649,17 @@ impl DriveClient {
         Ok(())
     }
 
-    /// 429/5xx/전송 오류 재시도 대기: 지수 백오프, 서버가 Retry-After(초)를 주면 더 큰 쪽(최대 60초).
-    fn backoff(&self, tries: u32, resp: Option<&ureq::Response>) -> Duration {
+    /// 403(rateLimit)/429/5xx/전송 오류 재시도 대기: 지수 백오프 + 0..500ms 지터,
+    /// 서버가 Retry-After(초)를 주면 더 큰 쪽(최대 60초).
+    fn backoff(&self, tries: u32, retry_after_secs: Option<u64>) -> Duration {
         let base = self.retry_base * (1 << (tries - 1));
-        let ra = resp
-            .and_then(|r| r.header("Retry-After"))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|s| Duration::from_secs(s.min(60)));
-        ra.map_or(base, |d| d.max(base))
+        let ra = retry_after_secs.map(|s| Duration::from_secs(s.min(60)));
+        let wait = ra.map_or(base, |d| d.max(base));
+        if wait.is_zero() {
+            wait
+        } else {
+            wait + Duration::from_millis(jitter_ms())
+        }
     }
 
     fn call(
@@ -581,9 +675,29 @@ impl DriveClient {
                     refreshed = true;
                     self.refresh_after_401(&tok)?;
                 }
+                Err(ureq::Error::Status(403, r)) => {
+                    let ra = r
+                        .header("Retry-After")
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    let b = r.into_string().unwrap_or_default();
+                    if (b.contains("rateLimitExceeded") || b.contains("userRateLimitExceeded"))
+                        && tries < 4
+                    {
+                        tries += 1;
+                        std::thread::sleep(self.backoff(tries, ra));
+                        continue;
+                    }
+                    return Err(format!(
+                        "Drive HTTP 403: {}",
+                        b.chars().take(300).collect::<String>()
+                    ));
+                }
                 Err(ureq::Error::Status(c, r)) if (c == 429 || c >= 500) && tries < 4 => {
+                    let ra = r
+                        .header("Retry-After")
+                        .and_then(|v| v.trim().parse::<u64>().ok());
                     tries += 1;
-                    std::thread::sleep(self.backoff(tries, Some(&r)));
+                    std::thread::sleep(self.backoff(tries, ra));
                 }
                 Err(ureq::Error::Transport(_)) if tries < 4 => {
                     tries += 1;
@@ -827,6 +941,75 @@ impl DriveClient {
         Ok(buf)
     }
 
+    /// 1 MiB 제한 없이 드라이브 파일을 로컬 파일로 스트리밍 다운로드한다(`.tmp` → `sync_all` → `rename`).
+    fn download_to_file_atomic(
+        &self,
+        id: &str,
+        dest: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<u64, String> {
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let url = format!("{}/files/{id}", self.ep.api);
+        let resp = self.call(|a, t| {
+            a.get(&url)
+                .set("Authorization", &format!("Bearer {t}"))
+                .query("alt", "media")
+                .call()
+        })?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(kova_engine::longpath::to_extended(parent))
+                .map_err(|e| format!("폴더 생성 실패: {e}"))?;
+        }
+        let name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "drive".into());
+        let tmp = dest.with_file_name(format!(
+            "{name}.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let ext_tmp = kova_engine::longpath::to_extended(&tmp);
+        let ext_dest = kova_engine::longpath::to_extended(dest);
+        let write_res = (|| -> Result<u64, String> {
+            let mut reader = resp.into_reader();
+            let mut file =
+                fs::File::create(&ext_tmp).map_err(|e| format!("임시 파일 생성 실패: {e}"))?;
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut total = 0u64;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("취소됨".into());
+                }
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| format!("Drive 스트림 읽기 실패({id}): {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])
+                    .map_err(|e| format!("디스크 쓰기 실패({id}): {e}"))?;
+                total += n as u64;
+            }
+            file.flush().map_err(|e| format!("플러시 실패: {e}"))?;
+            file.sync_all().map_err(|e| format!("동기화 실패: {e}"))?;
+            drop(file);
+            if let Err(e) = fs::rename(&ext_tmp, &ext_dest) {
+                if ext_dest.exists() {
+                    let _ = crate::worm::remove_protected(dest);
+                    fs::rename(&ext_tmp, &ext_dest)
+                        .map_err(|e2| format!("파일 교체 실패({id}): {e2}"))?;
+                } else {
+                    return Err(format!("파일 교체 실패({id}): {e}"));
+                }
+            }
+            Ok(total)
+        })();
+        write_res.inspect_err(|_| {
+            let _ = fs::remove_file(&ext_tmp);
+        })
+    }
+
     fn upload(
         &self,
         existing: Option<String>,
@@ -835,40 +1018,95 @@ impl DriveClient {
         local: &Path,
         size: u64,
     ) -> Result<String, String> {
-        let (method, url, meta) = match &existing {
-            Some(id) => (
-                "PATCH",
-                format!(
-                    "{}/files/{id}?uploadType=resumable&fields=id",
-                    self.ep.upload
-                ),
-                "{}".to_string(),
-            ),
-            None => (
-                "POST",
-                format!("{}/files?uploadType=resumable&fields=id", self.ep.upload),
-                serde_json::json!({"name": name, "parents": [parent]}).to_string(),
-            ),
+        let resume_key = format!("{parent}/{name}:{size}");
+        let mut resumed: Option<(String, u64)> = None;
+        if let Some(saved_url) = self.resume_get(&resume_key) {
+            let probe_range = format!("bytes */{size}");
+            match self.call(|a, t| {
+                a.put(&saved_url)
+                    .set("Authorization", &format!("Bearer {t}"))
+                    .set("Content-Range", &probe_range)
+                    .send_bytes(&[])
+            }) {
+                Ok(resp) if matches!(resp.status(), 200 | 201) => {
+                    self.resume_remove(&resume_key);
+                    let v: serde_json::Value =
+                        serde_json::from_str(&resp.into_string().map_err(|e| e.to_string())?)
+                            .map_err(|e| format!("업로드 완료 응답 오류: {e}"))?;
+                    if let Some(id) = v["id"].as_str().filter(|s| !s.is_empty()) {
+                        return Ok(id.to_string());
+                    }
+                }
+                Ok(resp) if resp.status() == 308 => {
+                    let got = parse_range_next_offset(&resp);
+                    if got <= size {
+                        resumed = Some((saved_url, got));
+                    } else {
+                        self.resume_remove(&resume_key);
+                    }
+                }
+                _ => {
+                    self.resume_remove(&resume_key);
+                }
+            }
+        }
+
+        let (session, mut start) = match resumed {
+            Some((url, off)) => (url, off),
+            None => {
+                let (method, url, meta) = match &existing {
+                    Some(id) => (
+                        "PATCH",
+                        format!(
+                            "{}/files/{id}?uploadType=resumable&fields=id",
+                            self.ep.upload
+                        ),
+                        "{}".to_string(),
+                    ),
+                    None => (
+                        "POST",
+                        format!("{}/files?uploadType=resumable&fields=id", self.ep.upload),
+                        serde_json::json!({"name": name, "parents": [parent]}).to_string(),
+                    ),
+                };
+                let init = self.call(|a, t| {
+                    a.request(method, &url)
+                        .set("Authorization", &format!("Bearer {t}"))
+                        .set("Content-Type", "application/json; charset=UTF-8")
+                        .set("X-Upload-Content-Length", &size.to_string())
+                        .send_string(&meta)
+                })?;
+                let session = init
+                    .header("Location")
+                    .ok_or("업로드 세션 주소를 받지 못했습니다")?
+                    .to_string();
+                self.resume_set(&resume_key, &session);
+                (session, 0u64)
+            }
         };
-        let init = self.call(|a, t| {
-            a.request(method, &url)
-                .set("Authorization", &format!("Bearer {t}"))
-                .set("Content-Type", "application/json; charset=UTF-8")
-                .set("X-Upload-Content-Length", &size.to_string())
-                .send_string(&meta)
-        })?;
-        let session = init
-            .header("Location")
-            .ok_or("업로드 세션 주소를 받지 못했습니다")?
-            .to_string();
+
         let mut f = fs::File::open(local).map_err(|e| format!("{}: {e}", local.display()))?;
-        let mut start = 0u64;
         let mut stalls = 0u32;
+        let started = Instant::now();
+        let mut sent_this_call = 0u64;
+        let per_worker_bps = if self.bw_limit_bytes_per_sec > 0 {
+            (self.bw_limit_bytes_per_sec / (self.workers.max(1) as u64)).max(1)
+        } else {
+            0
+        };
+        let eff_chunk = if per_worker_bps > 0 && self.chunk >= 256 * 1024 {
+            let target = (per_worker_bps as usize).clamp(256 * 1024, self.chunk);
+            // 구글 드라이브 이어올리기 조각은 256 KiB 배수여야 한다
+            (target / (256 * 1024)).max(1) * (256 * 1024)
+        } else {
+            self.chunk
+        };
+
         loop {
             use std::io::Seek;
             f.seek(io::SeekFrom::Start(start))
                 .map_err(|e| e.to_string())?;
-            let len = ((size - start) as usize).min(self.chunk);
+            let len = ((size - start) as usize).min(eff_chunk);
             let mut buf = vec![0u8; len];
             f.read_exact(&mut buf).map_err(|e| e.to_string())?;
             let range = if size == 0 {
@@ -876,14 +1114,32 @@ impl DriveClient {
             } else {
                 format!("bytes {start}-{}/{size}", start + len as u64 - 1)
             };
-            let resp = self.call(|a, t| {
+            let resp = match self.call(|a, t| {
                 a.put(&session)
                     .set("Authorization", &format!("Bearer {t}"))
                     .set("Content-Range", &range)
                     .send_bytes(&buf)
-            })?;
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    if e.starts_with("Drive HTTP 404:") || e.starts_with("Drive HTTP 410:") {
+                        self.resume_remove(&resume_key);
+                    }
+                    return Err(e);
+                }
+            };
+            sent_this_call = sent_this_call.saturating_add(len as u64);
+            if per_worker_bps > 0 && sent_this_call > 0 {
+                let expected =
+                    Duration::from_secs_f64(sent_this_call as f64 / per_worker_bps as f64);
+                let elapsed = started.elapsed();
+                if expected > elapsed {
+                    std::thread::sleep((expected - elapsed).min(Duration::from_secs(2)));
+                }
+            }
             match resp.status() {
                 200 | 201 => {
+                    self.resume_remove(&resume_key);
                     let v: serde_json::Value =
                         serde_json::from_str(&resp.into_string().map_err(|e| e.to_string())?)
                             .map_err(|e| format!("업로드 완료 응답 오류: {e}"))?;
@@ -895,13 +1151,7 @@ impl DriveClient {
                 }
                 308 if size > 0 => {
                     // 서버가 실제로 받은 범위(Range: bytes=0-N)를 따른다. 머리글이 없으면 아직 아무것도 받지 못한 것.
-                    let got = resp
-                        .header("Range")
-                        .and_then(|r| r.trim().strip_prefix("bytes="))
-                        .and_then(|r| r.split_once('-'))
-                        .and_then(|(_, e)| e.trim().parse::<u64>().ok())
-                        .and_then(|e| e.checked_add(1))
-                        .unwrap_or(0);
+                    let got = parse_range_next_offset(&resp);
                     if got > size {
                         return Err(format!("업로드 응답 범위 오류: {got} > {size}"));
                     }
@@ -934,6 +1184,32 @@ pub fn replicate_to_drive(
     folder: &[&str],
     cancel: &AtomicBool,
 ) -> Result<DriveReplicaReport, String> {
+    replicate_to_drive_with_limit(repo, client, folder, 0, cancel)
+}
+
+/// 대역폭 상한(`bw_limit_mbps > 0` 이면 MB/s 제한)을 적용해 구글 드라이브로 증분 복제한다.
+pub fn replicate_to_drive_with_limit(
+    repo: &Path,
+    client: &mut DriveClient,
+    folder: &[&str],
+    bw_limit_mbps: u32,
+    cancel: &AtomicBool,
+) -> Result<DriveReplicaReport, String> {
+    let prev_limit = client.bw_limit_bytes_per_sec;
+    if bw_limit_mbps > 0 {
+        client.set_bw_limit_mbps(bw_limit_mbps);
+    }
+    let res = replicate_to_drive_inner(repo, client, folder, cancel);
+    client.bw_limit_bytes_per_sec = prev_limit;
+    res
+}
+
+fn replicate_to_drive_inner(
+    repo: &Path,
+    client: &mut DriveClient,
+    folder: &[&str],
+    cancel: &AtomicBool,
+) -> Result<DriveReplicaReport, String> {
     let mut rep = DriveReplicaReport::default();
     let snaps = repo.join("snapshots");
     if !snaps.is_dir() {
@@ -947,6 +1223,7 @@ pub fn replicate_to_drive(
     manifests.sort();
     let packs = kova_engine::pack::load_index(repo);
     let mut done_packs = HashSet::new();
+    let mut cas: Option<CasStorage> = None;
     let sub = |s: &str| -> Vec<String> {
         folder
             .iter()
@@ -989,10 +1266,29 @@ pub fn replicate_to_drive(
             rep.snapshots_skipped += 1;
             continue;
         }
-        let m: SnapshotManifest = match fs::File::open(&mp)
-            .map_err(|e| e.to_string())
-            .and_then(|f| serde_json::from_reader(io::BufReader::new(f)).map_err(|e| e.to_string()))
-        {
+        let parsed: Result<SnapshotManifest, String> = (|| {
+            let raw = fs::read(&mp).map_err(|e| e.to_string())?;
+            let plain = if kova_engine::storage::is_encrypted_manifest_bytes(&raw) {
+                let sid = mp
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let store = match cas.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        let c = CasStorage::new(repo).map_err(|e| e.to_string())?;
+                        cas.insert(c)
+                    }
+                };
+                store
+                    .read_manifest_bytes(&mp, &sid)
+                    .map_err(|e| e.to_string())?
+            } else {
+                raw
+            };
+            serde_json::from_slice(&plain).map_err(|e| e.to_string())
+        })();
+        let m: SnapshotManifest = match parsed {
             Ok(m) => m,
             Err(e) => {
                 rep.snapshots_failed += 1;
@@ -1099,6 +1395,269 @@ pub fn replicate_to_drive(
     Ok(rep)
 }
 
+fn is_safe_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':', '\0'])
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DrivePullKind {
+    Crypto = 0,
+    PackData = 1,
+    PackIdx = 2,
+    Blob = 3,
+    Snapshot = 4,
+}
+
+/// 구글 드라이브 백업 폴더(`folder`, 예: `["Kova2 Backup", "p1"]`)에서
+/// `crypto.json`, `packs/*`, `blobs/<xx>/*`, `snapshots/*` 를 로컬 저장소 `dest_repo` 로 스트리밍 복원한다.
+/// 이미 같은 크기로 있는 파일은 건너뛰며, 모든 파일은 `.tmp` → `sync_all` → `rename` 으로 원자 저장한다.
+pub fn pull_from_drive(
+    client: &mut DriveClient,
+    folder: &[&str],
+    dest_repo: &Path,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(u64, u64, &str),
+) -> Result<DrivePullReport, String> {
+    let root_id = client.find_folder(folder)?.ok_or_else(|| {
+        format!(
+            "구글 드라이브에서 폴더를 찾을 수 없습니다: {}",
+            folder.join("/")
+        )
+    })?;
+
+    let top: HashMap<String, Entry> = client.list(&root_id)?.clone();
+    let mut plan: Vec<(DrivePullKind, String, String, PathBuf, u64)> = Vec::new();
+
+    if let Some(e) = top.get(kova_engine::codec::MARKER).filter(|e| !e.folder) {
+        plan.push((
+            DrivePullKind::Crypto,
+            e.id.clone(),
+            kova_engine::codec::MARKER.to_string(),
+            PathBuf::from(kova_engine::codec::MARKER),
+            e.size,
+        ));
+    }
+
+    if let Some(packs_dir) = top.get("packs").filter(|e| e.folder) {
+        let entries: HashMap<String, Entry> = client.list(&packs_dir.id)?.clone();
+        for (name, e) in entries {
+            if e.folder {
+                continue;
+            }
+            if !is_safe_name(&name) {
+                return Err(format!("안전하지 않은 Drive 파일 이름: packs/{name}"));
+            }
+            let kind = if name.ends_with(".pack") && name.len() > 5 {
+                DrivePullKind::PackData
+            } else if name.ends_with(".idx") && name.len() > 4 {
+                DrivePullKind::PackIdx
+            } else {
+                continue;
+            };
+            plan.push((
+                kind,
+                e.id,
+                format!("packs/{name}"),
+                PathBuf::from("packs").join(&name),
+                e.size,
+            ));
+        }
+    }
+
+    if let Some(blobs_dir) = top.get("blobs").filter(|e| e.folder) {
+        let prefixes: HashMap<String, Entry> = client.list(&blobs_dir.id)?.clone();
+        for (prefix, pe) in prefixes {
+            if !pe.folder {
+                continue;
+            }
+            if prefix.len() != 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("안전하지 않은 Drive 블롭 폴더: blobs/{prefix}"));
+            }
+            let files: HashMap<String, Entry> = client.list(&pe.id)?.clone();
+            for (name, fe) in files {
+                if fe.folder {
+                    continue;
+                }
+                if !is_safe_name(&name) || !name.ends_with(".blob") {
+                    continue;
+                }
+                let stem = &name[..name.len() - 5];
+                if !crate::offsite::valid_hash(stem) || !stem[..2].eq_ignore_ascii_case(&prefix) {
+                    return Err(format!(
+                        "안전하지 않은 Drive 블롭 이름: blobs/{prefix}/{name}"
+                    ));
+                }
+                plan.push((
+                    DrivePullKind::Blob,
+                    fe.id,
+                    format!("blobs/{prefix}/{name}"),
+                    PathBuf::from("blobs").join(&prefix).join(&name),
+                    fe.size,
+                ));
+            }
+        }
+    }
+
+    if let Some(snaps_dir) = top.get("snapshots").filter(|e| e.folder) {
+        let entries: HashMap<String, Entry> = client.list(&snaps_dir.id)?.clone();
+        for (name, e) in entries {
+            if e.folder {
+                continue;
+            }
+            if !is_safe_name(&name) {
+                return Err(format!("안전하지 않은 Drive 스냅샷 이름: snapshots/{name}"));
+            }
+            if !name.ends_with(".json") || name.len() <= 5 {
+                continue;
+            }
+            plan.push((
+                DrivePullKind::Snapshot,
+                e.id,
+                format!("snapshots/{name}"),
+                PathBuf::from("snapshots").join(&name),
+                e.size,
+            ));
+        }
+    }
+
+    plan.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+    let total_bytes: u64 = plan.iter().map(|(_, _, _, _, sz)| *sz).sum();
+    let mut done_bytes = 0u64;
+    let mut rep = DrivePullReport::default();
+
+    for (kind, file_id, label, rel_path, expected_size) in plan {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("취소됨".into());
+        }
+        let dest = dest_repo.join(&rel_path);
+        let ext_dest = kova_engine::longpath::to_extended(&dest);
+        if fs::metadata(&ext_dest).is_ok_and(|m| m.is_file() && m.len() == expected_size) {
+            done_bytes = done_bytes.saturating_add(expected_size);
+            progress(done_bytes, total_bytes, &label);
+            continue;
+        }
+        let n = client.download_to_file_atomic(&file_id, &dest, cancel)?;
+        rep.bytes_downloaded += n;
+        match kind {
+            DrivePullKind::Crypto => rep.crypto_downloaded = true,
+            DrivePullKind::PackData | DrivePullKind::PackIdx => rep.packs_downloaded += 1,
+            DrivePullKind::Blob => rep.blobs_downloaded += 1,
+            DrivePullKind::Snapshot => rep.snapshots_downloaded += 1,
+        }
+        done_bytes = done_bytes.saturating_add(n);
+        progress(done_bytes, total_bytes, &label);
+    }
+    Ok(rep)
+}
+
+/// 로컬 저장소에 더 이상 없는 원격 구글 드라이브 스냅샷·팩·블롭을 휴지통으로 보낸다.
+/// 로컬 스냅샷이 0개이면 실수로 클라우드 전체가 지워지지 않도록 거부한다(fail-closed).
+pub fn prune_drive_orphans(
+    client: &mut DriveClient,
+    folder: &[&str],
+    local_repo: &Path,
+    cancel: &AtomicBool,
+) -> Result<DrivePruneReport, String> {
+    let mut local_snaps = HashSet::new();
+    if let Ok(rd) = fs::read_dir(local_repo.join("snapshots")) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() && p.extension().is_some_and(|x| x == "json") {
+                local_snaps.insert(e.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+    if local_snaps.is_empty() {
+        return Err("로컬 저장소에 스냅샷이 없어 드라이브 원격 정리를 거부합니다".into());
+    }
+
+    let mut local_packs = HashSet::new();
+    for id in kova_engine::pack::pack_ids(local_repo) {
+        local_packs.insert(format!("{id}.pack"));
+        local_packs.insert(format!("{id}.idx"));
+    }
+
+    let mut local_blobs = HashSet::new();
+    if let Ok(dirs) = fs::read_dir(local_repo.join("blobs")) {
+        for d in dirs.flatten() {
+            let dp = d.path();
+            if !dp.is_dir() {
+                continue;
+            }
+            let prefix = d.file_name().to_string_lossy().to_string();
+            if let Ok(files) = fs::read_dir(&dp) {
+                for f in files.flatten() {
+                    let fp = f.path();
+                    if fp.is_file() && fp.extension().is_some_and(|x| x == "blob") {
+                        local_blobs
+                            .insert((prefix.clone(), f.file_name().to_string_lossy().to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(root_id) = client.find_folder(folder)? else {
+        return Ok(DrivePruneReport::default());
+    };
+    let top: HashMap<String, Entry> = client.list(&root_id)?.clone();
+    let mut to_trash: Vec<(u8, String, String, String, u64)> = Vec::new(); // (order, parent_id, name, file_id, size)
+
+    if let Some(snaps_dir) = top.get("snapshots").filter(|e| e.folder) {
+        let entries: HashMap<String, Entry> = client.list(&snaps_dir.id)?.clone();
+        for (name, e) in entries {
+            if !e.folder && name.ends_with(".json") && !local_snaps.contains(&name) {
+                to_trash.push((0, snaps_dir.id.clone(), name, e.id, e.size));
+            }
+        }
+    }
+    if let Some(packs_dir) = top.get("packs").filter(|e| e.folder) {
+        let entries: HashMap<String, Entry> = client.list(&packs_dir.id)?.clone();
+        for (name, e) in entries {
+            if e.folder || local_packs.contains(&name) {
+                continue;
+            }
+            if name.ends_with(".idx") {
+                to_trash.push((1, packs_dir.id.clone(), name, e.id, e.size));
+            } else if name.ends_with(".pack") {
+                to_trash.push((2, packs_dir.id.clone(), name, e.id, e.size));
+            }
+        }
+    }
+    if let Some(blobs_dir) = top.get("blobs").filter(|e| e.folder) {
+        let prefixes: HashMap<String, Entry> = client.list(&blobs_dir.id)?.clone();
+        for (prefix, pe) in prefixes {
+            if !pe.folder {
+                continue;
+            }
+            let files: HashMap<String, Entry> = client.list(&pe.id)?.clone();
+            for (name, fe) in files {
+                if !fe.folder
+                    && name.ends_with(".blob")
+                    && !local_blobs.contains(&(prefix.clone(), name.clone()))
+                {
+                    to_trash.push((3, pe.id.clone(), name, fe.id, fe.size));
+                }
+            }
+        }
+    }
+
+    to_trash.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+    let mut rep = DrivePruneReport::default();
+    for (_, parent_id, name, file_id, size) in to_trash {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("취소됨".into());
+        }
+        client.trash_id(&file_id)?;
+        if let Some(map) = client.listings.get_mut(&parent_id) {
+            map.remove(&name);
+        }
+        rep.trashed_files += 1;
+        rep.freed_bytes += size;
+    }
+    Ok(rep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,11 +1689,12 @@ mod tests {
         assert_eq!(pct_decode("%ED%95%9C"), "한");
     }
 
-    /// 모의 구글 서버: 토큰·목록·폴더 생성·이어올리기를 메모리로 흉내낸다.
+    /// 모의 구글 서버: 토큰·목록·폴더 생성·이어올리기·휴지통·403 레이트 리밋을 메모리로 흉내낸다.
     #[derive(Default)]
     struct Mock {
         // id -> (name, parent, folder, data)
         files: Vec<(String, String, bool, Vec<u8>)>,
+        trashed: HashSet<usize>,
         sessions: Vec<(Option<usize>, String, String, Vec<u8>)>, // (기존 index, name, parent, 누적)
         token_calls: usize,
         refresh_calls: usize,
@@ -1144,6 +1704,11 @@ mod tests {
         short_ack: usize,
         /// 완료 응답에 id 를 빼고 보낸다
         omit_id: bool,
+        /// 남은 횟수만큼 API 호출에 HTTP 403 userRateLimitExceeded 를 돌려준다
+        rate_limit_403: usize,
+        /// true 이면 API 호출에 재시도 불가 HTTP 403 을 돌려준다
+        forbid_403: bool,
+        api_calls: usize,
     }
 
     fn read_req(s: &mut TcpStream) -> (String, String, Vec<u8>, HashMap<String, String>) {
@@ -1233,14 +1798,32 @@ mod tests {
                     }
                 } else if path == "/revoke" {
                     respond(&mut s, "200 OK", "", "{}");
+                } else if path.starts_with("/api/") && m.rate_limit_403 > 0 {
+                    m.api_calls += 1;
+                    m.rate_limit_403 -= 1;
+                    respond(
+                        &mut s,
+                        "403 Forbidden",
+                        "",
+                        r#"{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded"}]}}"#,
+                    );
+                } else if path.starts_with("/api/") && m.forbid_403 {
+                    m.api_calls += 1;
+                    respond(
+                        &mut s,
+                        "403 Forbidden",
+                        "",
+                        r#"{"error":{"code":403,"errors":[{"reason":"insufficientPermissions"}]}}"#,
+                    );
                 } else if path == "/api/files" && method == "GET" {
+                    m.api_calls += 1;
                     let qq = q.get("q").cloned().unwrap_or_default();
                     let parent = qq.split('\'').nth(1).unwrap_or("").to_string();
                     let list: Vec<String> = m
                         .files
                         .iter()
                         .enumerate()
-                        .filter(|(_, f)| f.1 == parent)
+                        .filter(|(i, f)| f.1 == parent && !m.trashed.contains(i))
                         .map(|(i, f)| {
                             format!(
                                 r#"{{"id":"f{i}","name":{:?},"size":"{}","mimeType":"{}"}}"#,
@@ -1261,6 +1844,7 @@ mod tests {
                         &format!(r#"{{"files":[{}]}}"#, list.join(",")),
                     );
                 } else if path == "/api/files" && method == "POST" {
+                    m.api_calls += 1;
                     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     m.files.push((
                         v["name"].as_str().unwrap().into(),
@@ -1271,12 +1855,13 @@ mod tests {
                     let id = format!("f{}", m.files.len() - 1);
                     respond(&mut s, "200 OK", "", &format!(r#"{{"id":"{id}"}}"#));
                 } else if let Some(id) = path.strip_prefix("/api/files/") {
+                    m.api_calls += 1;
+                    let parsed_idx = id
+                        .strip_prefix('f')
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .filter(|&i| i < m.files.len());
                     if method == "GET" && q.get("alt").map(String::as_str) == Some("media") {
-                        if let Some(i) = id
-                            .strip_prefix('f')
-                            .and_then(|n| n.parse::<usize>().ok())
-                            .filter(|&i| i < m.files.len())
-                        {
+                        if let Some(i) = parsed_idx {
                             let data = &m.files[i].3;
                             let hdr = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1284,6 +1869,15 @@ mod tests {
                             );
                             let _ = s.write_all(hdr.as_bytes());
                             let _ = s.write_all(data);
+                        } else {
+                            respond(&mut s, "404 Not Found", "", "{}");
+                        }
+                    } else if method == "PATCH" {
+                        if let Some(i) = parsed_idx {
+                            if String::from_utf8_lossy(&body).contains("\"trashed\":true") {
+                                m.trashed.insert(i);
+                            }
+                            respond(&mut s, "200 OK", "", &format!(r#"{{"id":"f{i}"}}"#));
                         } else {
                             respond(&mut s, "404 Not Found", "", "{}");
                         }
@@ -1310,26 +1904,37 @@ mod tests {
                     );
                     respond(&mut s, "200 OK", &loc, "{}");
                 } else if let Some(n) = path.strip_prefix("/session/") {
-                    let n: usize = n.parse().unwrap();
+                    let Ok(n) = n.parse::<usize>() else {
+                        respond(&mut s, "404 Not Found", "", "{}");
+                        continue;
+                    };
+                    if n >= m.sessions.len() {
+                        respond(&mut s, "404 Not Found", "", "{}");
+                        continue;
+                    }
                     let range = headers.get("content-range").cloned().unwrap_or_default();
                     let total: usize = range
                         .rsplit('/')
                         .next()
                         .and_then(|t| t.parse().ok())
                         .unwrap_or(0);
-                    // 조각의 시작 위치에 맞춰 이어 붙인다(재전송 시 겹치는 부분 정리)
-                    let from: usize = range
-                        .strip_prefix("bytes ")
-                        .and_then(|r| r.split('-').next())
-                        .and_then(|a| a.parse().ok())
-                        .unwrap_or(0);
-                    let mut body = body;
-                    if m.short_ack > 0 && from + body.len() < total && body.len() > 1 {
-                        m.short_ack -= 1;
-                        body.truncate(body.len() / 2);
+                    // 재개 위치 조회(`Content-Range: bytes */<total>` + 빈 본문)는 기존 누적 바이트를 유지한다
+                    let is_probe = range.starts_with("bytes */") && body.is_empty() && total > 0;
+                    if !is_probe {
+                        // 조각의 시작 위치에 맞춰 이어 붙인다(재전송 시 겹치는 부분 정리)
+                        let from: usize = range
+                            .strip_prefix("bytes ")
+                            .and_then(|r| r.split('-').next())
+                            .and_then(|a| a.parse().ok())
+                            .unwrap_or(0);
+                        let mut body = body;
+                        if m.short_ack > 0 && from + body.len() < total && body.len() > 1 {
+                            m.short_ack -= 1;
+                            body.truncate(body.len() / 2);
+                        }
+                        m.sessions[n].3.truncate(from);
+                        m.sessions[n].3.extend_from_slice(&body);
                     }
-                    m.sessions[n].3.truncate(from);
-                    m.sessions[n].3.extend_from_slice(&body);
                     if m.sessions[n].3.len() >= total && m.omit_id {
                         respond(&mut s, "200 OK", "", "{}");
                     } else if m.sessions[n].3.len() >= total {
@@ -1511,6 +2116,7 @@ mod tests {
                 exclude: vec![],
                 profile_id: None,
                 scan_from: None,
+                ..Default::default()
             },
             &|_| {},
             &AtomicBool::new(false),
@@ -1568,6 +2174,7 @@ mod tests {
                 exclude: vec![],
                 profile_id: None,
                 scan_from: None,
+                ..Default::default()
             },
             &|_| {},
             &AtomicBool::new(false),
@@ -1640,6 +2247,7 @@ mod tests {
                 exclude: vec![],
                 profile_id: None,
                 scan_from: None,
+                ..Default::default()
             },
             &|_| {},
             &AtomicBool::new(false),
@@ -1943,5 +2551,209 @@ mod tests {
         st.lock().unwrap().omit_id = true;
         let e = c.upload(None, "data2.bin", "root", &local, 50).unwrap_err();
         assert!(e.contains("id"), "{e}");
+    }
+
+    #[test]
+    fn drive_pull_roundtrip_and_prune_orphans() {
+        let st = Arc::new(Mutex::new(Mock::default()));
+        let (_b, ep) = start_mock(st.clone());
+        let dir = token_dir();
+        let work = tempfile::tempdir().unwrap();
+        let src = work.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let payload = "Google Drive cloud restore payload ".repeat(60);
+        fs::write(src.join("notes.txt"), &payload).unwrap();
+        let repo = work.path().join("repo");
+        kova_engine::ops::run_backup(
+            &kova_engine::ops::BackupOptions {
+                sources: vec![src],
+                repo: repo.clone(),
+                session_id: Some("20261124_130000".into()),
+                zstd_level: 3,
+                exclude: vec![],
+                profile_id: None,
+                scan_from: None,
+                ..Default::default()
+            },
+            &|_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let no = AtomicBool::new(false);
+        let folder = ["Kova2 Backup", "prof1"];
+        let mut c = DriveClient::open(dir.path(), ep.clone(), creds()).unwrap();
+        c.retry_base = Duration::ZERO;
+        let up = replicate_to_drive_with_limit(&repo, &mut c, &folder, 50, &no).unwrap();
+        assert_eq!(up.snapshots_uploaded, 1);
+        assert!(up.blobs_uploaded >= 1);
+
+        // 1) pull_from_drive → 새 폴더로 복원 후 무결성 검증·파일 복원
+        let pulled = work.path().join("pulled_repo");
+        let mut c2 = DriveClient::open(dir.path(), ep.clone(), creds()).unwrap();
+        c2.retry_base = Duration::ZERO;
+        let progress_hits = std::sync::atomic::AtomicUsize::new(0);
+        let p1 = pull_from_drive(&mut c2, &folder, &pulled, &no, &|_, _, _| {
+            progress_hits.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        assert_eq!(p1.snapshots_downloaded, 1);
+        assert!(p1.packs_downloaded >= 2);
+        assert!(p1.bytes_downloaded > 0);
+        assert!(progress_hits.load(Ordering::Relaxed) >= 3);
+        assert!(crate::verify::verify_repo(&pulled, true).unwrap().ok());
+
+        let restored = work.path().join("restored");
+        kova_engine::ops::run_restore(
+            &kova_engine::ops::RestoreOptions {
+                repo: pulled.clone(),
+                session_id: "20261124_130000".into(),
+                target: Some(restored.clone()),
+                only: None,
+            },
+            &|_| {},
+            &no,
+        )
+        .unwrap();
+        let f = restored.join("src").join("notes.txt");
+        let text = if f.is_file() {
+            fs::read_to_string(f).unwrap()
+        } else {
+            fs::read_to_string(restored.join("notes.txt")).unwrap()
+        };
+        assert_eq!(text, payload);
+
+        // 같은 크기 파일은 두 번째 pull 에서 건너뛴다
+        let p2 = pull_from_drive(&mut c2, &folder, &pulled, &no, &|_, _, _| {}).unwrap();
+        assert_eq!(p2.snapshots_downloaded, 0);
+        assert_eq!(p2.packs_downloaded, 0);
+        assert_eq!(p2.bytes_downloaded, 0);
+
+        // 2) prune_drive_orphans: 빈 로컬 저장소는 거부
+        let empty = work.path().join("empty");
+        fs::create_dir_all(empty.join("snapshots")).unwrap();
+        assert!(prune_drive_orphans(&mut c2, &folder, &empty, &no).is_err());
+
+        // 원격에 고아 스냅샷·팩·블롭 + 보호 대상 crypto.json 심기
+        let extra = work.path().join("extra");
+        fs::create_dir_all(&extra).unwrap();
+        let mk_file = extra.join(kova_engine::codec::MARKER);
+        let orphan_snap = extra.join("old.json");
+        let orphan_pack = extra.join("porphan.pack");
+        let orphan_idx = extra.join("porphan.idx");
+        let orphan_blob_name = format!("{}.blob", "bb".repeat(32));
+        let orphan_blob = extra.join(&orphan_blob_name);
+        fs::write(&mk_file, b"{\"version\":1}").unwrap();
+        fs::write(&orphan_snap, b"{}").unwrap();
+        fs::write(&orphan_pack, b"packbytes").unwrap();
+        fs::write(&orphan_idx, b"idxbytes").unwrap();
+        fs::write(&orphan_blob, b"blobbytes").unwrap();
+
+        c2.put_file(&folder, kova_engine::codec::MARKER, &mk_file)
+            .unwrap();
+        c2.put_file(
+            &["Kova2 Backup", "prof1", "snapshots"],
+            "old.json",
+            &orphan_snap,
+        )
+        .unwrap();
+        c2.put_file(
+            &["Kova2 Backup", "prof1", "packs"],
+            "porphan.pack",
+            &orphan_pack,
+        )
+        .unwrap();
+        c2.put_file(
+            &["Kova2 Backup", "prof1", "packs"],
+            "porphan.idx",
+            &orphan_idx,
+        )
+        .unwrap();
+        c2.put_file(
+            &["Kova2 Backup", "prof1", "blobs", "bb"],
+            &orphan_blob_name,
+            &orphan_blob,
+        )
+        .unwrap();
+
+        let mut c3 = DriveClient::open(dir.path(), ep, creds()).unwrap();
+        c3.retry_base = Duration::ZERO;
+        let pruned = prune_drive_orphans(&mut c3, &folder, &repo, &no).unwrap();
+        assert_eq!(pruned.trashed_files, 4);
+        assert_eq!(pruned.freed_bytes, 2 + 9 + 8 + 9);
+
+        // crypto.json 과 살아 있는 스냅샷은 휴지통에 가지 않았어야 한다
+        let m = st.lock().unwrap();
+        let alive_names: Vec<&str> = m
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| !f.2 && !m.trashed.contains(i))
+            .map(|(_, f)| f.0.as_str())
+            .collect();
+        assert!(alive_names.contains(&kova_engine::codec::MARKER));
+        assert!(alive_names.contains(&"20261124_130000.json"));
+        assert!(!alive_names.contains(&"old.json"));
+        assert!(!alive_names.contains(&"porphan.pack"));
+        assert!(!alive_names.contains(&orphan_blob_name.as_str()));
+    }
+
+    #[test]
+    fn call_retries_403_user_rate_limit_exceeded_but_fails_on_permission_403() {
+        let st = Arc::new(Mutex::new(Mock::default()));
+        let (_b, ep) = start_mock(st.clone());
+        let dir = token_dir();
+
+        // 일시적 403 userRateLimitExceeded 2회 뒤 정상 응답 → 재시도 성공
+        st.lock().unwrap().rate_limit_403 = 2;
+        let mut c = DriveClient::open(dir.path(), ep.clone(), creds()).unwrap();
+        c.retry_base = Duration::ZERO;
+        assert!(c.list("root").is_ok());
+        assert_eq!(st.lock().unwrap().api_calls, 3);
+
+        // 권한 부족 403 은 재시도 없이 즉시 실패
+        st.lock().unwrap().api_calls = 0;
+        st.lock().unwrap().forbid_403 = true;
+        let mut c2 = DriveClient::open(dir.path(), ep, creds()).unwrap();
+        c2.retry_base = Duration::ZERO;
+        let err = c2.list("root").unwrap_err();
+        assert!(err.contains("Drive HTTP 403"), "{err}");
+        assert_eq!(st.lock().unwrap().api_calls, 1);
+    }
+
+    #[test]
+    fn resumable_upload_session_persists_and_resumes_from_server_offset() {
+        let st = Arc::new(Mutex::new(Mock::default()));
+        let (base, ep) = start_mock(st.clone());
+        let dir = token_dir();
+        let work = tempfile::tempdir().unwrap();
+        let local = work.path().join("big.bin");
+        let data: Vec<u8> = (0..64u8).collect();
+        fs::write(&local, &data).unwrap();
+
+        // 이미 앞 32바이트가 올라간 중단 세션을 서버와 gdrive_resume.json 에 미리 심는다
+        st.lock().unwrap().sessions.push((
+            None,
+            "big.bin".into(),
+            "root".into(),
+            data[..32].to_vec(),
+        ));
+        let mut cache = HashMap::new();
+        cache.insert("root/big.bin:64".to_string(), format!("{base}/session/0"));
+        save_resume_cache(dir.path(), &cache);
+
+        let mut c = DriveClient::open(dir.path(), ep, creds()).unwrap();
+        c.retry_base = Duration::ZERO;
+        c.chunk = 16;
+        let id = c.upload(None, "big.bin", "root", &local, 64).unwrap();
+        let idx: usize = id.trim_start_matches('f').parse().unwrap();
+        {
+            let m = st.lock().unwrap();
+            assert_eq!(m.files[idx].3, data);
+            // 새 세션을 열지 않고 기존 session/0 에서 이어 올렸어야 한다
+            assert_eq!(m.sessions.len(), 1);
+        }
+        // 완료 후 gdrive_resume.json 에서 항목이 정리되어야 한다
+        assert!(!dir.path().join(RESUME_FILE).exists());
     }
 }

@@ -35,9 +35,11 @@ pub fn read_idx(repo: &Path, id: &str) -> Option<Vec<(String, PackEntry)>> {
 
 /// `read_idx` 와 같되 건너뛴 잘못된 줄 수도 돌려준다(정리(GC)는 잘못된 줄이 있는 팩을 지우지 않는다).
 pub fn read_idx_checked(repo: &Path, id: &str) -> Option<(Vec<(String, PackEntry)>, usize)> {
-    let text = fs::read(idx_file(repo, id)).ok()?;
+    let text = fs::read(crate::longpath::to_extended(&idx_file(repo, id))).ok()?;
     let text = String::from_utf8_lossy(&text);
-    let pack_len = fs::metadata(pack_file(repo, id)).ok()?.len();
+    let pack_len = fs::metadata(crate::longpath::to_extended(&pack_file(repo, id)))
+        .ok()?
+        .len();
     let mut out = Vec::new();
     let mut bad = 0usize;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -66,7 +68,7 @@ pub fn read_idx_checked(repo: &Path, id: &str) -> Option<(Vec<(String, PackEntry
 
 /// 저장소의 모든 유효한 팩 id.
 pub fn pack_ids(repo: &Path) -> Vec<String> {
-    let mut ids: Vec<String> = fs::read_dir(packs_dir(repo))
+    let mut ids: Vec<String> = fs::read_dir(crate::longpath::to_extended(&packs_dir(repo)))
         .into_iter()
         .flatten()
         .flatten()
@@ -95,7 +97,7 @@ pub fn load_index(repo: &Path) -> HashMap<String, PackEntry> {
 }
 
 pub fn read_entry(repo: &Path, e: &PackEntry) -> io::Result<Vec<u8>> {
-    let mut f = File::open(pack_file(repo, &e.pack))?;
+    let mut f = File::open(crate::longpath::to_extended(&pack_file(repo, &e.pack)))?;
     f.seek(SeekFrom::Start(e.offset))?;
     let mut buf = vec![0u8; e.len as usize];
     f.read_exact(&mut buf)?;
@@ -144,10 +146,12 @@ pub fn write_pack(repo: &Path, items: &[(String, Vec<u8>)]) -> io::Result<String
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "빈 팩"));
     }
     let dir = packs_dir(repo);
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(crate::longpath::to_extended(&dir))?;
     let id = new_id();
-    let pack_tmp = dir.join(format!("{id}.pack.tmp"));
-    let idx_tmp = dir.join(format!("{id}.idx.tmp"));
+    let pack_tmp = crate::longpath::to_extended(&dir.join(format!("{id}.pack.tmp")));
+    let idx_tmp = crate::longpath::to_extended(&dir.join(format!("{id}.idx.tmp")));
+    let pack_dst = crate::longpath::to_extended(&pack_file(repo, &id));
+    let idx_dst = crate::longpath::to_extended(&idx_file(repo, &id));
     let res = (|| -> io::Result<String> {
         let mut idx = String::new();
         {
@@ -161,14 +165,14 @@ pub fn write_pack(repo: &Path, items: &[(String, Vec<u8>)]) -> io::Result<String
             f.flush()?;
             f.sync_all()?;
         }
-        fs::rename(&pack_tmp, pack_file(repo, &id))?;
+        fs::rename(&pack_tmp, &pack_dst)?;
         {
             let mut f = File::create(&idx_tmp)?;
             f.write_all(idx.as_bytes())?;
             f.flush()?;
             f.sync_all()?;
         }
-        fs::rename(&idx_tmp, idx_file(repo, &id))?;
+        fs::rename(&idx_tmp, &idx_dst)?;
         Ok(id)
     })();
     if res.is_err() {

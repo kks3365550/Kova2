@@ -68,7 +68,7 @@ fn batches_with_limit(
     limit: usize,
     mut f: impl FnMut(Vec<Chunk>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let file = File::open(path).map_err(|e| format!("read: {e}"))?;
+    let file = File::open(crate::longpath::to_extended(path)).map_err(|e| format!("read: {e}"))?;
     let file_len = file.metadata().map_err(|e| format!("read: {e}"))?.len();
     if file_len == 0 {
         return Ok(());

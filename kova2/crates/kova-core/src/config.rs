@@ -132,6 +132,18 @@ pub struct Settings {
     /// 노트북 배터리 구동 시 자동 스케줄 백업 일시정지.
     #[serde(default)]
     pub pause_on_battery: bool,
+    /// 스냅샷 매니페스트까지 AES-256-GCM 으로 암호화해 저장한다(저장소 암호화가 켜져 있을 때).
+    #[serde(default)]
+    pub encrypt_manifests: bool,
+    /// 디스크 이미지 증분 백업 사용 여부.
+    #[serde(default)]
+    pub incremental_images: bool,
+    /// 백업·복원 시 Windows NTFS ACL(SDDL)을 보존한다.
+    #[serde(default)]
+    pub preserve_acl: bool,
+    /// 다중 PC 플릿 하트비트 전송 엔드포인트 URL (비어 있으면 비활성).
+    #[serde(default)]
+    pub fleet_endpoint: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -527,10 +539,26 @@ mod tests {
     fn defaults_and_settings_roundtrip() {
         let d = tempfile::tempdir().unwrap();
         let st = ConfigStore::new(d.path());
-        let s = st.settings();
+        let mut s = st.settings();
         assert_eq!(s.server_port, 8765);
+        assert!(!s.encrypt_manifests);
+        assert!(!s.incremental_images);
+        assert!(!s.preserve_acl);
+        assert!(s.fleet_endpoint.is_empty());
         st.save_settings(&s).unwrap();
         assert_eq!(st.settings(), s);
+
+        s.encrypt_manifests = true;
+        s.incremental_images = true;
+        s.preserve_acl = true;
+        s.fleet_endpoint = "https://fleet.example.com/heartbeat".into();
+        st.save_settings(&s).unwrap();
+        let loaded = st.settings();
+        assert_eq!(loaded, s);
+        assert!(loaded.encrypt_manifests);
+        assert!(loaded.incremental_images);
+        assert!(loaded.preserve_acl);
+        assert_eq!(loaded.fleet_endpoint, "https://fleet.example.com/heartbeat");
     }
 
     #[test]

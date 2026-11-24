@@ -1,0 +1,146 @@
+name: kova2-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: kova2
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kova2/target
+          key: kova2-release-${{ hashFiles('kova2/Cargo.lock') }}
+
+      - name: Resolve Release Tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $tag = if ($env:EVENT_NAME -eq "workflow_dispatch") { $env:INPUT_TAG } else { $env:REF_NAME }
+          $tag = $tag.Trim()
+          if ($tag -notmatch '^[A-Za-z0-9._-]+$') {
+            throw "Invalid release tag: '$tag'"
+          }
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Release tag: $tag"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: PowerShell Syntax Check
+        run: |
+          $scripts = @(
+            "installer/make_pe.ps1",
+            "installer/make_update.ps1",
+            "installer/make_checksums.ps1"
+          )
+          foreach ($rel in $scripts) {
+            if (-not (Test-Path $rel)) { throw "Missing script: $rel" }
+            $full = (Resolve-Path $rel).Path
+            $text = [IO.File]::ReadAllText($full, [Text.UTF8Encoding]::new($false))
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseInput($text, $full, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              foreach ($e in $errors) {
+                Write-Error ("{0}:{1}: {2}" -f $rel, $e.Extent.StartLineNumber, $e.Message)
+              }
+              throw "PowerShell syntax check failed for $rel"
+            }
+            Write-Host "OK: $rel"
+          }
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build Release Binaries
+        run: cargo build --release -p kova-app -p kova-service -p kova-pe --locked
+
+      - name: Stage Release Archive
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:RELEASE_TAG
+          $dist = Join-Path (Get-Location) "dist"
+          if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
+          New-Item -ItemType Directory -Force $dist | Out-Null
+
+          $stage = Join-Path $dist ("stage_" + $tag)
+          New-Item -ItemType Directory -Force $stage | Out-Null
+
+          foreach ($bin in @("kova-app.exe", "kova-service.exe", "kova-pe.exe")) {
+            $src = Join-Path "target/release" $bin
+            if (-not (Test-Path $src)) { throw "Missing build output: $src" }
+            Copy-Item $src $stage
+          }
+          $makePe = "installer/make_pe.ps1"
+          if (-not (Test-Path $makePe)) { throw "Missing script: $makePe" }
+          Copy-Item $makePe $stage
+
+          $zip = Join-Path $dist ("release_" + $tag + ".zip")
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
+          Remove-Item -Recurse -Force $stage
+          Write-Host "Staged archive: $zip"
+
+      - name: Sign Release Archive (Optional)
+        env:
+          KOVA2_RELEASE_PRIV_PEM: ${{ secrets.KOVA2_RELEASE_PRIV_PEM }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:KOVA2_RELEASE_PRIV_PEM)) {
+            Write-Host "KOVA2_RELEASE_PRIV_PEM secret not configured; skipping .sig/.sig2 signing."
+            exit 0
+          }
+          $tag = $env:RELEASE_TAG
+          $zip = Join-Path (Get-Location) ("dist/release_" + $tag + ".zip")
+          $keyPath = Join-Path $env:RUNNER_TEMP "kova2_release_priv.pem"
+          try {
+            [IO.File]::WriteAllText($keyPath, $env:KOVA2_RELEASE_PRIV_PEM, [Text.UTF8Encoding]::new($false))
+            cargo run --release --locked -q -p kova-core --example sign_release -- sign $zip $keyPath $tag
+            if ($LASTEXITCODE -ne 0) { throw "Release signing failed with exit code $LASTEXITCODE" }
+            if (-not (Test-Path ($zip + ".sig")) -or -not (Test-Path ($zip + ".sig2"))) {
+              throw "Expected .sig and .sig2 signature files were not generated"
+            }
+            Write-Host "Generated signatures: $zip.sig, $zip.sig2"
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $keyPath
+          }
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          $dist = Join-Path (Get-Location) "dist"
+          $out = Join-Path $dist "SHA256SUMS.txt"
+          & pwsh -NoProfile -ExecutionPolicy Bypass -File "installer/make_checksums.ps1" -DistDir $dist -Out $out
+          if ($LASTEXITCODE -ne 0) { throw "make_checksums.ps1 failed" }
+          Get-Content $out
+
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kova2-release-${{ env.RELEASE_TAG }}
+          path: kova2/dist/
+          if-no-files-found: error

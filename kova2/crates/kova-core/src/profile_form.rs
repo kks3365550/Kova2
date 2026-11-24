@@ -2,16 +2,37 @@
 use crate::config::Profile;
 use std::path::Path;
 
+fn unwrap_long_prefix(p: &str) -> Option<String> {
+    if p.starts_with("\\\\.\\") {
+        return None;
+    }
+    if let Some(rest) = p.strip_prefix("\\\\?\\") {
+        let rb = rest.as_bytes();
+        if rb.len() >= 3 && rb[0].is_ascii_alphabetic() && rb[1] == b':' && rb[2] == b'\\' {
+            return Some(rest.to_string());
+        }
+        if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("UNC\\") {
+            return Some(format!("\\\\{}", &rest[4..]));
+        }
+        return None;
+    }
+    Some(p.to_string())
+}
+
 fn abs_ok(p: &str) -> bool {
-    let b = p.as_bytes();
-    !p.starts_with("\\\\.\\")
-        && !p.starts_with("\\\\?\\")
-        && ((b.len() >= 3 && b[1] == b':' && b[2] == b'\\') || p.starts_with("\\\\"))
+    let Some(clean) = unwrap_long_prefix(p) else {
+        return false;
+    };
+    let b = clean.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
+        || clean.starts_with("\\\\")
 }
 
 fn norm(p: &str) -> String {
+    let cleaned = p.trim().trim_matches('"').trim().replace('/', "\\");
+    let stripped = unwrap_long_prefix(&cleaned).unwrap_or(cleaned);
     // `..`·`.` 를 풀어야 `D:\a\..\b` 같은 경로가 겹침 검사를 빠져나가지 않는다
-    crate::restore_target::lexical_normalize(&p.trim().trim_matches('"').trim().replace('/', "\\"))
+    crate::restore_target::lexical_normalize(&stripped)
         .trim_end_matches('\\')
         .to_lowercase()
 }
@@ -52,7 +73,7 @@ pub fn build(
         if !abs_ok(s) {
             return Err(format!("백업 대상은 전체 경로여야 합니다: {s}"));
         }
-        if !Path::new(s).exists() {
+        if !kova_engine::longpath::to_extended(Path::new(s)).exists() {
             return Err(format!("백업 대상이 없습니다: {s}"));
         }
     }
@@ -67,7 +88,7 @@ pub fn build(
     if rp.parent().is_none() || rp.file_name().is_none() {
         return Err("드라이브 루트는 저장 폴더로 쓸 수 없습니다 — 폴더를 지정하세요".into());
     }
-    if rp.is_file() {
+    if kova_engine::longpath::to_extended(rp).is_file() {
         return Err("저장 폴더 자리에 같은 이름의 파일이 있습니다".into());
     }
     let rn = norm(&repo);
@@ -116,8 +137,49 @@ pub fn apply_keep(mut p: Profile, weekly: &str, monthly: &str) -> Result<Profile
     Ok(p)
 }
 
-/// 자동 백업 켜기·끄기, 스케줄(N시간마다 / 매일 시:분), 제외 패턴을 프로파일에 반영한다.
-/// `daily` 가 참이면 `value` 는 "시:분", 아니면 시간 간격(0보다 크고 8760 이하).
+fn parse_hhmm(value: &str) -> Option<(u32, u32)> {
+    value
+        .split_once(':')
+        .and_then(|(h, m)| Some((h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?)))
+        .filter(|(h, m)| *h < 24 && *m < 60)
+}
+
+fn parse_weekday_tokens(days_part: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for raw in days_part.split(',') {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            return None;
+        }
+        let upper = tok.to_ascii_uppercase();
+        let valid = matches!(
+            upper.as_str(),
+            "MON"
+                | "TUE"
+                | "WED"
+                | "THU"
+                | "FRI"
+                | "SAT"
+                | "SUN"
+                | "월"
+                | "화"
+                | "수"
+                | "목"
+                | "금"
+                | "토"
+                | "일"
+        );
+        if !valid {
+            return None;
+        }
+        out.push(upper);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// 자동 백업 켜기·끄기, 스케줄(N시간마다 / 매일 시:분 / 매주 요일@시:분 / 매월 일@시:분), 제외 패턴을 프로파일에 반영한다.
+/// - `value` 에 `@` 가 있으면 `schedule.rs` 와 같은 형식으로 매주(`MON,WED@03:00`, `월,수@03:00`) 또는 매월(`15@02:30`)을 인식한다.
+/// - 그렇지 않고 `daily` 가 참이면 "시:분", 거짓이면 시간 간격(0보다 크고 8760 이하).
 pub fn apply_schedule(
     mut p: Profile,
     auto: bool,
@@ -126,12 +188,28 @@ pub fn apply_schedule(
     exclude: &str,
 ) -> Result<Profile, String> {
     let value = value.trim();
-    if daily {
-        let (h, m) = value
-            .split_once(':')
-            .and_then(|(h, m)| Some((h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?)))
-            .filter(|(h, m)| *h < 24 && *m < 60)
-            .ok_or("매일 실행 시각은 시:분 형식이어야 합니다 (예: 02:30)")?;
+    if let Some((left, time_part)) = value.split_once('@') {
+        let left = left.trim();
+        let (h, m) =
+            parse_hhmm(time_part).ok_or("실행 시각은 시:분 형식이어야 합니다 (예: 03:00)")?;
+        if let Ok(day) = left.parse::<u32>() {
+            if !(1..=28).contains(&day) {
+                return Err("매월 실행일은 1~28 사이의 숫자여야 합니다 (예: 15@02:30)".into());
+            }
+            p.schedule_type = "monthly".into();
+            p.schedule_value = format!("{day}@{h:02}:{m:02}");
+        } else if let Some(days) = parse_weekday_tokens(left) {
+            p.schedule_type = "weekly".into();
+            p.schedule_value = format!("{}@{h:02}:{m:02}", days.join(","));
+        } else {
+            return Err(
+                "매주/매월 스케줄 형식이 올바르지 않습니다 (예: MON,WED@03:00 또는 15@02:30)"
+                    .into(),
+            );
+        }
+    } else if daily {
+        let (h, m) =
+            parse_hhmm(value).ok_or("매일 실행 시각은 시:분 형식이어야 합니다 (예: 02:30)")?;
         p.schedule_type = "daily".into();
         p.schedule_value = format!("{h:02}:{m:02}");
     } else {
@@ -289,5 +367,46 @@ mod tests {
         m.schedule_type = "monthly".into();
         m.schedule_value = "15@02:30".into();
         assert_eq!(schedule_text(&m), "매월 15일 02:30");
+    }
+
+    #[test]
+    fn apply_schedule_supports_weekly_and_monthly_and_rejects_invalid() {
+        let p = Profile::new("p", "P");
+        let w = apply_schedule(p.clone(), true, true, "mon,wed@3:5", "*.log").unwrap();
+        assert_eq!(w.schedule_type, "weekly");
+        assert_eq!(w.schedule_value, "MON,WED@03:05");
+        assert_eq!(schedule_text(&w), "매주 MON,WED 03:05");
+        assert_eq!(w.exclude_patterns, vec!["*.log"]);
+
+        let w_kr = apply_schedule(p.clone(), true, false, "월,금@04:30", "").unwrap();
+        assert_eq!(w_kr.schedule_type, "weekly");
+        assert_eq!(w_kr.schedule_value, "월,금@04:30");
+
+        let m = apply_schedule(p.clone(), true, true, "15@2:30", "").unwrap();
+        assert_eq!(m.schedule_type, "monthly");
+        assert_eq!(m.schedule_value, "15@02:30");
+        assert_eq!(schedule_text(&m), "매월 15일 02:30");
+
+        for bad in [
+            "0@02:30",
+            "29@02:30",
+            "FOO@02:30",
+            "MON@25:00",
+            "@02:30",
+            "MON,@03:00",
+        ] {
+            assert!(
+                apply_schedule(p.clone(), true, true, bad, "").is_err(),
+                "{bad}"
+            );
+        }
+
+        // 긴 경로(260자 초과)는 허용하되 `\\.\` 장치 경로는 여전히 거부한다
+        let long_path = format!("C:\\{}\\{}", "a".repeat(150), "b".repeat(150));
+        assert!(long_path.len() > 260);
+        assert!(abs_ok(&long_path));
+        assert!(abs_ok(&format!("\\\\?\\{long_path}")));
+        assert!(!abs_ok(r"\\.\PhysicalDrive0"));
+        assert!(!abs_ok(r"\\?\Volume{1234}\foo"));
     }
 }

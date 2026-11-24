@@ -2898,7 +2898,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kova-app"
-version = "3.17.7"
+version = "3.18.0"
 dependencies = [
  "kova-core",
  "kova-engine",
@@ -2924,12 +2924,14 @@ dependencies = [
  "kova-engine",
  "rayon",
  "rusqlite",
+ "rustls",
  "scrypt",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "ureq",
+ "webpki-roots 0.26.11",
  "zip",
  "zstd",
 ]
@@ -2995,6 +2997,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows-service",
+ "winresource",
 ]
 
 [[package]]

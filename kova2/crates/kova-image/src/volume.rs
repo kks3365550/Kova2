@@ -182,7 +182,7 @@ pub fn write_image<R: Read + Seek, W: Write + Seek + Send>(
 }
 
 #[cfg(windows)]
-pub use win::capture_volume;
+pub use win::{capture_volume, capture_volume_incremental};
 
 #[cfg(windows)]
 mod win {
@@ -310,6 +310,71 @@ mod win {
         }
     }
 
+    fn validate_fixed_drive(drive: &str) -> Result<String, QblkError> {
+        let drive = norm_drive(drive)?;
+        extern "system" {
+            fn GetDriveTypeW(root: *const u16) -> u32;
+        }
+        let w: Vec<u16> = format!("{drive}\\").encode_utf16().chain(Some(0)).collect();
+        if unsafe { GetDriveTypeW(w.as_ptr()) } != 3 {
+            return Err(io_err("내장(고정) 드라이브만 이미지로 만들 수 있습니다"));
+        }
+        Ok(drive)
+    }
+
+    struct VolumeSnapshot {
+        dev: std::fs::File,
+        serial: u64,
+        total: u64,
+        cs: u32,
+        bitmap: Vec<u8>,
+    }
+
+    fn open_snapshot(shadow: &Shadow) -> Result<VolumeSnapshot, QblkError> {
+        // 섀도 장치는 읽기 전용으로만 연다(쓰기 권한 요청 없음).
+        let dev = OpenOptions::new()
+            .read(true)
+            .share_mode(7)
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+            .open(&shadow.device)?;
+        let mut vd = [0u8; 128];
+        ioctl(&dev, FSCTL_GET_NTFS_VOLUME_DATA, &[], &mut vd).map_err(|e| {
+            io_err(format!(
+                "NTFS 볼륨 정보 조회 실패(NTFS 가 아닐 수 있음): {e}"
+            ))
+        })?;
+        let serial = u64::from_le_bytes(vd[0..8].try_into().unwrap());
+        let total = u64::from_le_bytes(vd[16..24].try_into().unwrap());
+        let cs = u32::from_le_bytes(vd[44..48].try_into().unwrap());
+        if cs == 0 || !cs.is_power_of_two() || total == 0 {
+            return Err(io_err("볼륨 클러스터 정보가 이상함"));
+        }
+        // 비트맵: StartingLcn(8)+BitmapSize(8)+bits. 한 번에 받고, 모자라면(ERROR_MORE_DATA) 오류로 중단한다.
+        let bytes = (total as usize).div_ceil(8);
+        let mut out = vec![0u8; 16 + bytes + 64];
+        let ret = ioctl(&dev, FSCTL_GET_VOLUME_BITMAP, &0u64.to_le_bytes(), &mut out)
+            .map_err(|e| io_err(format!("볼륨 비트맵 조회 실패: {e}")))?;
+        if (ret as usize) < 16 + bytes {
+            return Err(io_err("볼륨 비트맵 응답이 예상보다 짧음"));
+        }
+        let start = u64::from_le_bytes(out[0..8].try_into().unwrap());
+        if start != 0 {
+            return Err(io_err("비트맵 시작 위치가 0이 아님"));
+        }
+        let bm_clusters = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        if bm_clusters < total {
+            return Err(io_err("볼륨 비트맵 클러스터 수가 볼륨 크기보다 작음"));
+        }
+        let bitmap = out[16..16 + bytes].to_vec();
+        Ok(VolumeSnapshot {
+            dev,
+            serial,
+            total,
+            cs,
+            bitmap,
+        })
+    }
+
     /// `drive`(예: "C:")의 섀도 복사본을 읽어 `out_path` 에 .qblk 를 만든다. 관리자 권한 필요.
     pub fn capture_volume(
         drive: &str,
@@ -318,55 +383,12 @@ mod win {
         cancel: &AtomicBool,
         progress: &dyn Fn(&Stats),
     ) -> Result<(Header, Stats), QblkError> {
-        let drive = norm_drive(drive)?;
-        {
-            extern "system" {
-                fn GetDriveTypeW(root: *const u16) -> u32;
-            }
-            let w: Vec<u16> = format!("{drive}\\").encode_utf16().chain(Some(0)).collect();
-            if unsafe { GetDriveTypeW(w.as_ptr()) } != 3 {
-                return Err(io_err("내장(고정) 드라이브만 이미지로 만들 수 있습니다"));
-            }
-        }
+        let drive = validate_fixed_drive(drive)?;
         check_output(Path::new(&format!("{drive}\\")), out_path)?;
         let shadow = Shadow::create(&drive)?;
         let mut created = false;
         let res = (|| -> Result<(Header, Stats), QblkError> {
-            // 섀도 장치는 읽기 전용으로만 연다(쓰기 권한 요청 없음).
-            let mut dev = OpenOptions::new()
-                .read(true)
-                .share_mode(7)
-                .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
-                .open(&shadow.device)?;
-            let mut vd = [0u8; 128];
-            ioctl(&dev, FSCTL_GET_NTFS_VOLUME_DATA, &[], &mut vd).map_err(|e| {
-                io_err(format!(
-                    "NTFS 볼륨 정보 조회 실패(NTFS 가 아닐 수 있음): {e}"
-                ))
-            })?;
-            let serial = u64::from_le_bytes(vd[0..8].try_into().unwrap());
-            let total = u64::from_le_bytes(vd[16..24].try_into().unwrap());
-            let cs = u32::from_le_bytes(vd[44..48].try_into().unwrap());
-            if cs == 0 || !cs.is_power_of_two() || total == 0 {
-                return Err(io_err("볼륨 클러스터 정보가 이상함"));
-            }
-            // 비트맵: StartingLcn(8)+BitmapSize(8)+bits. 한 번에 받고, 모자라면(ERROR_MORE_DATA) 오류로 중단한다.
-            let bytes = (total as usize).div_ceil(8);
-            let mut out = vec![0u8; 16 + bytes + 64];
-            let ret = ioctl(&dev, FSCTL_GET_VOLUME_BITMAP, &0u64.to_le_bytes(), &mut out)
-                .map_err(|e| io_err(format!("볼륨 비트맵 조회 실패: {e}")))?;
-            if (ret as usize) < 16 + bytes {
-                return Err(io_err("볼륨 비트맵 응답이 예상보다 짧음"));
-            }
-            let start = u64::from_le_bytes(out[0..8].try_into().unwrap());
-            if start != 0 {
-                return Err(io_err("비트맵 시작 위치가 0이 아님"));
-            }
-            let bm_clusters = u64::from_le_bytes(out[8..16].try_into().unwrap());
-            if bm_clusters < total {
-                return Err(io_err("볼륨 비트맵 클러스터 수가 볼륨 크기보다 작음"));
-            }
-            let bitmap = out[16..16 + bytes].to_vec();
+            let mut snap = open_snapshot(&shadow)?;
             let file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -374,17 +396,17 @@ mod win {
             created = true;
             let mut header = Header {
                 version: crate::qblk::VERSION,
-                cluster_size: cs,
-                total_clusters: total,
+                cluster_size: snap.cs,
+                total_clusters: snap.total,
                 used_clusters: 0,
-                vsn: format!("{serial:016X}"),
+                vsn: format!("{:016X}", snap.serial),
                 source_label: drive.clone(),
             };
             let (st, f) = write_image(
-                &mut dev,
+                &mut snap.dev,
                 file,
                 &mut header,
-                &bitmap,
+                &snap.bitmap,
                 level,
                 cancel,
                 progress,
@@ -395,6 +417,106 @@ mod win {
         drop(shadow); // 섀도 복사본 삭제
         if res.is_err() && created {
             let _ = std::fs::remove_file(out_path);
+        }
+        res
+    }
+
+    /// `drive`(예: "C:")의 섀도 복사본을 읽어 풀 또는 증분 `.qblk`를 만들고 `.qmap.json`(및 증분 시 `.qchain.json`)을 저장한다.
+    pub fn capture_volume_incremental(
+        drive: &str,
+        out_path: &Path,
+        base_image: Option<&Path>,
+        level: i32,
+        cancel: &AtomicBool,
+        progress: &dyn Fn(&Stats),
+    ) -> Result<(Header, Stats, crate::incremental::IncrementalStats), QblkError> {
+        let drive = validate_fixed_drive(drive)?;
+        check_output(Path::new(&format!("{drive}\\")), out_path)?;
+        let shadow = Shadow::create(&drive)?;
+        let mut created = false;
+        let res =
+            (|| -> Result<(Header, Stats, crate::incremental::IncrementalStats), QblkError> {
+                let mut snap = open_snapshot(&shadow)?;
+                let (base_map, parent_name) = match base_image {
+                    Some(bp) => {
+                        let norm_dir = |p: &Path| {
+                            let parent = p
+                                .parent()
+                                .filter(|d| !d.as_os_str().is_empty())
+                                .unwrap_or_else(|| Path::new("."));
+                            std::fs::canonicalize(parent).ok()
+                        };
+                        let same_dir = match (norm_dir(bp), norm_dir(out_path)) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => bp.parent() == out_path.parent(),
+                        };
+                        let depth_ok = crate::incremental::resolve_chain(bp)
+                            .is_ok_and(|chain| chain.len() < 14);
+                        let fname = bp
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        if same_dir && depth_ok {
+                            match (crate::incremental::load_block_map(bp), fname) {
+                                (Ok(m), Some(name))
+                                    if m.version == 2
+                                        && m.cluster_size == snap.cs
+                                        && m.total_clusters == snap.total =>
+                                {
+                                    (Some(m), Some(name))
+                                }
+                                _ => (None, None),
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    }
+                    None => (None, None),
+                };
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(out_path)?;
+                created = true;
+                let mut header = Header {
+                    version: crate::qblk::VERSION,
+                    cluster_size: snap.cs,
+                    total_clusters: snap.total,
+                    used_clusters: 0,
+                    vsn: format!("{:016X}", snap.serial),
+                    source_label: drive.clone(),
+                };
+                let (st, inc_stats, new_map, f) = crate::incremental::write_incremental_image(
+                    &mut snap.dev,
+                    file,
+                    &mut header,
+                    &snap.bitmap,
+                    base_map.as_ref(),
+                    level,
+                    cancel,
+                    progress,
+                )?;
+                f.sync_all()?;
+                crate::incremental::save_block_map(out_path, &new_map)?;
+                if let Some(parent) = parent_name {
+                    crate::incremental::save_chain_meta(
+                        out_path,
+                        &crate::incremental::ChainMeta {
+                            version: 1,
+                            parent,
+                            changed_clusters: inc_stats.changed_clusters,
+                            skipped_clusters: inc_stats.skipped_clusters,
+                        },
+                    )?;
+                }
+                Ok((header, st, inc_stats))
+            })();
+        drop(shadow); // 섀도 복사본 삭제
+        if res.is_err() && created {
+            let _ = std::fs::remove_file(out_path);
+            let _ = std::fs::remove_file(crate::incremental::map_path_for(out_path));
+            let _ = std::fs::remove_file(crate::incremental::chain_path_for(out_path));
         }
         res
     }

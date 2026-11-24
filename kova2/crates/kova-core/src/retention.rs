@@ -189,8 +189,12 @@ pub fn list_snapshots(repo: &Path) -> std::io::Result<Vec<SnapshotMeta>> {
         if p.extension().is_none_or(|x| x != "json") {
             continue;
         }
-        let f = fs::File::open(&p)?;
-        let m: MetaOnly = serde_json::from_reader(std::io::BufReader::new(f)).map_err(|e| {
+        let sid_stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let plain = crate::repocrypto::read_manifest_plain(repo, &p, &sid_stem)?;
+        let m: MetaOnly = serde_json::from_slice(&plain).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("{}: {}", p.display(), e),
