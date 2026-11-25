@@ -558,8 +558,24 @@ pub fn enable_all(store: &crate::config::ConfigStore) -> Result<Vec<String>, Str
 
 /// 복구 코드로 이 PC의 키 파일을 다시 만든다. 암호화된 프로파일 저장소 중 코드가 맞는 곳마다 복원한다(서비스가 실행).
 pub fn restore_keys(store: &crate::config::ConfigStore, code: &str) -> Result<String, String> {
+    restore_keys_at(store, code, None)
+}
+
+/// `restore_keys` 에 저장소 경로 힌트(키 파일에 적힌 경로)를 더한 것. 새 PC처럼 프로파일이 아직 없어도
+/// 힌트 경로가 암호화 저장소이고 코드가 맞으면 그 키를 복원한다.
+pub fn restore_keys_at(
+    store: &crate::config::ConfigStore,
+    code: &str,
+    repo_hint: Option<&str>,
+) -> Result<String, String> {
     let mut ok = 0;
     let mut seen = std::collections::HashSet::new();
+    if let Some(h) = repo_hint.map(str::trim).filter(|h| !h.is_empty()) {
+        let repo = Path::new(h);
+        if seen.insert(h.to_string()) && is_enabled(repo) && restore_key(repo, code).is_ok() {
+            ok += 1;
+        }
+    }
     for p in store.profiles() {
         let repo = Path::new(&p.repo_dir);
         if p.repo_dir.is_empty() || !seen.insert(p.repo_dir.clone()) || !is_enabled(repo) {
@@ -768,6 +784,17 @@ mod tests {
         }
         assert!(restore_keys(&store, "00000000").is_err());
         assert!(restore_keys(&store, &code).is_ok());
+        assert_eq!(fs::read_dir(&keys).unwrap().count(), 1);
+        // 새 PC: 프로파일이 없어도 키 파일의 저장소 경로 힌트로 복원된다(틀린 코드·엉뚱한 경로는 실패)
+        for f in fs::read_dir(&keys).unwrap() {
+            fs::remove_file(f.unwrap().path()).unwrap();
+        }
+        let empty = crate::config::ConfigStore::new(base.path().join("cfg_new_pc"));
+        let hint = repo.to_string_lossy().to_string();
+        assert!(restore_keys(&empty, &code).is_err());
+        assert!(restore_keys_at(&empty, "00000000", Some(&hint)).is_err());
+        assert!(restore_keys_at(&empty, &code, Some("/no/such/repo")).is_err());
+        assert!(restore_keys_at(&empty, &code, Some(&hint)).is_ok());
         assert_eq!(fs::read_dir(&keys).unwrap().count(), 1);
         let entries = recovery_entries(&store).unwrap();
         let kit = base.path().join("kit.txt");

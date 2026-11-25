@@ -62,8 +62,11 @@ pub enum Request {
     /// 프로파일 저장소마다 암호화를 켠다(키는 서비스가 만들고 보관). 답: `Encrypted`(새로 켠 곳의 복구 코드, 이때 한 번만).
     EnableEncryption,
     /// 복구 코드로 이 PC의 저장소 키를 다시 만든다. 답: `Done` / `Error`.
+    /// `repo` 는 키 파일(.kovakey)이 알려 준 저장소 경로로, 이 PC에 프로파일이 없어도 그 저장소 키를 복원하게 한다.
     RestoreKey {
         code: Secret,
+        #[serde(default)]
+        repo: Option<String>,
     },
     /// 복구 코드 내보내기(관리자/SYSTEM 호출자만). 답: `RecoveryCodes`.
     ExportRecoveryCodes,
