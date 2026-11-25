@@ -362,7 +362,10 @@ mod tests {
     fn acl_protect_and_remove_image_with_sidecars() {
         let d = tempfile::tempdir().unwrap();
         let img = d.path().join("disk.qblk");
-        let sides = [d.path().join("disk.qblk.verified"), d.path().join("disk.qblk.map")];
+        let sides = [
+            d.path().join("disk.qblk.verified"),
+            d.path().join("disk.qblk.map"),
+        ];
         fs::write(&img, b"img").unwrap();
         for s in &sides {
             fs::write(s, b"s").unwrap();
@@ -371,7 +374,10 @@ mod tests {
         for s in &sides {
             assert!(protect_file(s, true));
         }
-        assert!(fs::write(&img, b"x").is_err(), "보호 중인 이미지는 덮어쓸 수 없어야 함");
+        assert!(
+            fs::write(&img, b"x").is_err(),
+            "보호 중인 이미지는 덮어쓸 수 없어야 함"
+        );
         assert!(remove_protected(&img).is_ok() && !img.exists());
         for s in &sides {
             assert!(remove_protected(s).is_ok() && !s.exists());
