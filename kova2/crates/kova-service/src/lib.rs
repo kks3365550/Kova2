@@ -620,6 +620,11 @@ impl Supervisor {
             && (!outcome.ok
                 || outcome.message.contains("복제 실패")
                 || outcome.message.contains("이상 징후"));
+        // 백업이 성공하면 같은 프로파일의 낡은 "N일째 성공 기록 없음" 경고는 자동으로 확인 처리한다.
+        if outcome.ok && matches!(job.kind, Kind::Backup) {
+            let _ =
+                kova_core::alerts::AlertLog::new(&self.0.config_dir).resolve_stale(&job.profile_id);
+        }
         if is_alert {
             let _ = kova_core::alerts::AlertLog::new(&self.0.config_dir).push(
                 kova_core::alerts::Alert {
