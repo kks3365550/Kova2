@@ -195,7 +195,7 @@ fn import_key_bundle_from(path: &Path, pass: &str) -> Result<String, String> {
     let entries = kova_core::keybundle::open(&text, pass)?;
     let (mut ok, mut last_err) = (0usize, String::new());
     for e in &entries {
-        match restore_keys(&e.code) {
+        match restore_keys(&e.code, Some(&e.repo)) {
             Ok(_) => ok += 1,
             Err(err) => last_err = err,
         }
@@ -302,9 +302,10 @@ pub(crate) fn apply_watch_settings(
 }
 
 /// 복구 코드로 이 PC의 키 파일을 다시 만든다.
-fn restore_keys(code: &str) -> Result<String, String> {
+fn restore_keys(code: &str, repo: Option<&str>) -> Result<String, String> {
     ipc_done(&kova_ipc::Request::RestoreKey {
         code: kova_ipc::Secret(code.to_string()),
+        repo: repo.map(str::to_string),
     })
 }
 
@@ -1161,7 +1162,7 @@ pub(crate) fn wire(w: &MainWindow) {
             }
             let (code, weak) = (code.to_string(), weak.clone());
             std::thread::spawn(move || {
-                let res = restore_keys(&code);
+                let res = restore_keys(&code, None);
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak.upgrade() {
                         set_settings_msg(&w, res);

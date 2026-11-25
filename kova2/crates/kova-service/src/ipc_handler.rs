@@ -365,13 +365,14 @@ impl Handler for IpcHandler {
                     },
                 ])
             }
-            Request::RestoreKey { code } => {
+            Request::RestoreKey { code, repo } => {
                 if !caller.privileged {
                     return self.refuse("RestoreKey");
                 }
-                Reply::Once(vec![match kova_core::repocrypto::restore_keys(
+                Reply::Once(vec![match kova_core::repocrypto::restore_keys_at(
                     &self.0 .0.store,
                     &code.0,
+                    repo.as_deref(),
                 ) {
                     Ok(m) => {
                         kova_core::applog::write(&self.0 .0.config_dir, "INFO", &m);

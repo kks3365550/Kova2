@@ -891,6 +891,7 @@ fn encryption_keys_are_managed_by_service_and_export_needs_admin() {
     assert!(first_error(h.handle(
         Request::RestoreKey {
             code: Secret("00000000".into()),
+            repo: None,
         },
         user
     ))
@@ -919,6 +920,7 @@ fn encryption_keys_are_managed_by_service_and_export_needs_admin() {
         once_events(h.handle(
             Request::RestoreKey {
                 code: Secret(c.into()),
+                repo: None,
             },
             admin,
         ))
@@ -1287,6 +1289,7 @@ fn unprivileged_caller_is_refused_for_all_admin_ipc_requests() {
         Request::EnableEncryption,
         Request::RestoreKey {
             code: Secret("00000000".into()),
+            repo: None,
         },
         Request::GdriveStoreToken {
             token: Secret(r#"{"refresh":"r","access":"a","expires_at":0}"#.into()),

@@ -102,7 +102,7 @@ pub fn import(
     let entries = open(text, pass)?;
     let (mut ok, mut missing) = (0usize, 0usize);
     for e in &entries {
-        if crate::repocrypto::restore_keys(store, &e.code).is_ok() {
+        if crate::repocrypto::restore_keys_at(store, &e.code, Some(&e.repo)).is_ok() {
             ok += 1;
         } else {
             missing += 1;
