@@ -254,7 +254,7 @@ export component MainWindow inherits Window {
     in property <string> diag-text;
 
     // Profile editor
-    callback save-profile(string, string, string, string, string, string, bool, int, string, string, string, string);
+    callback save-profile(string, string, string, string, string, string, bool, int, string, string, string, string, string, string);
     callback edit-profile(string);
     callback estimate-size(string);
     callback delete-profile(string);
@@ -286,6 +286,8 @@ export component MainWindow inherits Window {
     in-out property <string> form-exclude: "";
     in-out property <string> form-weekly: "0";
     in-out property <string> form-monthly: "0";
+    in-out property <string> form-daily: "0";
+    in-out property <string> form-yearly: "0";
     in-out property <string> delete-pending;
     in property <string> form-text;
     in property <string> image-text;
@@ -1110,10 +1112,14 @@ export component MainWindow inherits Window {
                                             Field { text <=> root.form-count; width: 70px; }
                                             Text { text: "보관 일수"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
                                             Field { text <=> root.form-days; width: 70px; }
+                                            Text { text: "일 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+                                            Field { text <=> root.form-daily; width: 60px; }
                                             Text { text: "주 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
                                             Field { text <=> root.form-weekly; width: 60px; }
                                             Text { text: "월 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
                                             Field { text <=> root.form-monthly; width: 60px; }
+                                            Text { text: "연 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+                                            Field { text <=> root.form-yearly; width: 60px; }
                                             Rectangle { horizontal-stretch: 1; }
                                         }
                                     }
@@ -1138,6 +1144,8 @@ export component MainWindow inherits Window {
                                             root.form-exclude = "";
                                             root.form-weekly = "0";
                                             root.form-monthly = "0";
+                                            root.form-daily = "0";
+                                            root.form-yearly = "0";
                                             root.delete-pending = "";
                                         }
                                     }
@@ -1145,7 +1153,7 @@ export component MainWindow inherits Window {
                                         text: root.form-id == "" ? "프로파일 저장" : "변경사항 적용";
                                         kind: 1;
                                         clicked => {
-                                            root.save-profile(root.form-id, root.form-name, root.form-sources, root.form-repo, root.form-count, root.form-days, root.form-auto, root.form-sched-mode, root.form-sched, root.form-exclude, root.form-weekly, root.form-monthly);
+                                            root.save-profile(root.form-id, root.form-name, root.form-sources, root.form-repo, root.form-count, root.form-days, root.form-auto, root.form-sched-mode, root.form-sched, root.form-exclude, root.form-weekly, root.form-monthly, root.form-daily, root.form-yearly);
                                         }
                                     }
                                 }

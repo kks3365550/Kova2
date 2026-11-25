@@ -137,6 +137,24 @@ pub fn apply_keep(mut p: Profile, weekly: &str, monthly: &str) -> Result<Profile
     Ok(p)
 }
 
+/// 일간·연간 보관 개수(0=끔)를 프로파일에 저장한다. 주간·월간은 `apply_keep`.
+pub fn apply_keep_extra(mut p: Profile, daily: &str, yearly: &str) -> Result<Profile, String> {
+    let parse = |s: &str, what: &str, max: u32| -> Result<u32, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(0);
+        }
+        s.parse::<u32>()
+            .ok()
+            .filter(|n| *n <= max)
+            .ok_or(format!("{what} 보관은 0~{max} 사이의 숫자여야 합니다"))
+    };
+    let (d, y) = (parse(daily, "일간", 3650)?, parse(yearly, "연간", 100)?);
+    p.extra.insert("keep_daily".into(), d.into());
+    p.extra.insert("keep_yearly".into(), y.into());
+    Ok(p)
+}
+
 fn parse_hhmm(value: &str) -> Option<(u32, u32)> {
     value
         .split_once(':')

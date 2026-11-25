@@ -705,6 +705,8 @@ pub(crate) fn wire(w: &MainWindow, banner_gen: &Arc<AtomicU64>) {
                 let keep = |k: &str| p.extra.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                 w.set_form_weekly(keep("keep_weekly").to_string().into());
                 w.set_form_monthly(keep("keep_monthly").to_string().into());
+                w.set_form_daily(keep("keep_daily").to_string().into());
+                w.set_form_yearly(keep("keep_yearly").to_string().into());
                 w.set_form_text("".into());
             }
         });
@@ -745,7 +747,9 @@ pub(crate) fn wire(w: &MainWindow, banner_gen: &Arc<AtomicU64>) {
                   sched,
                   exclude,
                   weekly,
-                  monthly| {
+                  monthly,
+                  daily,
+                  yearly| {
                 if app_locked() {
                     if let Some(w) = weak.upgrade() {
                         w.set_form_text(LOCKED_MSG.into());
@@ -766,7 +770,8 @@ pub(crate) fn wire(w: &MainWindow, banner_gen: &Arc<AtomicU64>) {
                     base, &new_id, &name, &srcs, &repo, &count, &days, &all,
                 )
                 .and_then(|p| apply_schedule_mode(p, auto, sched_mode, &sched, &exclude))
-                .and_then(|p| kova_core::profile_form::apply_keep(p, &weekly, &monthly));
+                .and_then(|p| kova_core::profile_form::apply_keep(p, &weekly, &monthly))
+                .and_then(|p| kova_core::profile_form::apply_keep_extra(p, &daily, &yearly));
                 let msg = match built {
                     Ok(p) => match store.upsert(p.clone()) {
                         Ok(()) => {
@@ -813,6 +818,8 @@ pub(crate) fn wire(w: &MainWindow, banner_gen: &Arc<AtomicU64>) {
                     w.set_form_exclude("".into());
                     w.set_form_weekly("0".into());
                     w.set_form_monthly("0".into());
+                    w.set_form_daily("0".into());
+                    w.set_form_yearly("0".into());
                 }
                 w.set_form_text(msg.into());
             }

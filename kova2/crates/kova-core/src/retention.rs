@@ -20,10 +20,14 @@ pub struct SnapshotMeta {
 pub struct Policy {
     pub retention_count: Option<usize>,
     pub retention_days: Option<u32>,
+    /// 최근 N일 각각의 가장 최신 스냅샷을 추가로 남긴다(0=끔)
+    pub keep_daily: u32,
     /// 최근 N주 각각의 가장 최신 스냅샷을 추가로 남긴다(0=끔)
     pub keep_weekly: u32,
     /// 최근 N개월 각각의 가장 최신 스냅샷을 추가로 남긴다(0=끔)
     pub keep_monthly: u32,
+    /// 최근 N년 각각의 가장 최신 스냅샷을 추가로 남긴다(0=끔)
+    pub keep_yearly: u32,
 }
 
 impl Default for Policy {
@@ -31,8 +35,10 @@ impl Default for Policy {
         Policy {
             retention_count: Some(30),
             retention_days: Some(60),
+            keep_daily: 0,
             keep_weekly: 0,
             keep_monthly: 0,
+            keep_yearly: 0,
         }
     }
 }
@@ -86,16 +92,28 @@ fn normalize(f: f64) -> f64 {
     }
 }
 
-fn period_key(ts: f64, monthly: bool) -> (i32, u32) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Period {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+fn period_key(ts: f64, period: Period) -> (i32, u32) {
     match Local.timestamp_opt(ts as i64, 0).single() {
-        Some(dt) if monthly => (dt.year(), dt.month()),
-        Some(dt) => (dt.iso_week().year(), dt.iso_week().week()),
+        Some(dt) => match period {
+            Period::Day => (dt.year(), dt.ordinal()),
+            Period::Week => (dt.iso_week().year(), dt.iso_week().week()),
+            Period::Month => (dt.year(), dt.month()),
+            Period::Year => (dt.year(), 0),
+        },
         None => (0, 0),
     }
 }
 
-/// 최신순으로 정렬된 그룹에서, 최근 `n`개 구간(주 또는 월) 각각의 가장 최신 스냅샷 id.
-fn keepers(group: &[&SnapshotMeta], n: u32, monthly: bool) -> Vec<String> {
+/// 최신순으로 정렬된 그룹에서, 최근 `n`개 구간(일·주·월·년) 각각의 가장 최신 스냅샷 id.
+fn keepers(group: &[&SnapshotMeta], n: u32, period: Period) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut keep = Vec::new();
     if n == 0 {
@@ -105,7 +123,7 @@ fn keepers(group: &[&SnapshotMeta], n: u32, monthly: bool) -> Vec<String> {
         if s.created_at <= 0.0 {
             continue;
         }
-        if seen.insert(period_key(s.created_at, monthly)) {
+        if seen.insert(period_key(s.created_at, period)) {
             if seen.len() as u32 > n {
                 break;
             }
@@ -150,10 +168,12 @@ pub fn select_expired(snapshots: &[SnapshotMeta], policy: Policy, now: f64) -> V
                 }
             }
         }
-        // 주간·월간 보관분은 세대 수·기간을 넘어도 남긴다
-        for id in keepers(group, policy.keep_weekly, false)
+        // 일·주·월·년 보관분은 세대 수·기간을 넘어도 남긴다
+        for id in keepers(group, policy.keep_daily, Period::Day)
             .into_iter()
-            .chain(keepers(group, policy.keep_monthly, true))
+            .chain(keepers(group, policy.keep_weekly, Period::Week))
+            .chain(keepers(group, policy.keep_monthly, Period::Month))
+            .chain(keepers(group, policy.keep_yearly, Period::Year))
         {
             out.remove(&id);
         }
@@ -362,6 +382,8 @@ mod tests {
                 retention_days: Some(1),
                 keep_weekly: 0,
                 keep_monthly: 0,
+                keep_daily: 0,
+                keep_yearly: 0,
             },
             1e9
         )
@@ -380,6 +402,8 @@ mod tests {
                 retention_days: None,
                 keep_weekly: 0,
                 keep_monthly: 0,
+                keep_daily: 0,
+                keep_yearly: 0,
             },
             2000.0,
         );
@@ -400,6 +424,8 @@ mod tests {
                 retention_days: Some(60),
                 keep_weekly: 0,
                 keep_monthly: 0,
+                keep_daily: 0,
+                keep_yearly: 0,
             },
             now,
         );
@@ -421,6 +447,8 @@ mod tests {
                 retention_days: None,
                 keep_weekly: 0,
                 keep_monthly: 0,
+                keep_daily: 0,
+                keep_yearly: 0,
             },
             now,
         );
@@ -459,6 +487,8 @@ mod tests {
                 retention_days: None,
                 keep_weekly: 0,
                 keep_monthly: 0,
+                keep_daily: 0,
+                keep_yearly: 0,
             },
         );
         assert!(r.status.starts_with("list_failed"));
@@ -498,6 +528,8 @@ mod tests {
                 retention_days: None,
                 keep_weekly: 0,
                 keep_monthly: 0,
+                keep_daily: 0,
+                keep_yearly: 0,
             },
         );
         let mut del = r.deleted_snapshots.clone();
@@ -537,6 +569,42 @@ mod tests {
     }
 
     #[test]
+    fn daily_and_yearly_keepers_extend_retention() {
+        let day = 86400.0;
+        let base = 1_700_000_000.0; // 2023-11
+        let mut v = Vec::new();
+        // 최근 5일, 하루 2개씩
+        for d in 0..5 {
+            v.push(s(&format!("d{d}b"), base + d as f64 * day + 3600.0, ""));
+            v.push(s(&format!("d{d}a"), base + d as f64 * day, ""));
+        }
+        // 2년 전 스냅샷
+        v.push(s("y2021", base - 2.0 * 365.0 * day, ""));
+        let pol = Policy {
+            retention_count: Some(2),
+            retention_days: None,
+            keep_daily: 3,
+            keep_weekly: 0,
+            keep_monthly: 0,
+            keep_yearly: 0,
+        };
+        let del = select_expired(&v, pol, base + 10.0 * day);
+        // 최신 2개 + 일 단위 3일(d4,d3,d2 각 최신) 보존 → d4b,d4a,d3b,d2b 유지
+        for keep in ["d4b", "d4a", "d3b", "d2b"] {
+            assert!(!del.contains(&keep.to_string()), "{keep} {del:?}");
+        }
+        assert!(del.contains(&"d1b".to_string()) && del.contains(&"y2021".to_string()));
+        // 연 단위 보존 시 오래된 해의 최신본이 남는다
+        let pol2 = Policy {
+            keep_daily: 0,
+            keep_yearly: 3,
+            ..pol
+        };
+        let del2 = select_expired(&v, pol2, base + 10.0 * day);
+        assert!(!del2.contains(&"y2021".to_string()), "{del2:?}");
+    }
+
+    #[test]
     fn unknown_created_at_is_never_deleted_and_falls_back_to_file_time() {
         // 순수 선택: 시각 0 은 세대 수 초과여도 지우지 않는다
         let v = vec![s("new", 300.0, ""), s("mid", 200.0, ""), s("zero", 0.0, "")];
@@ -545,6 +613,8 @@ mod tests {
             retention_days: None,
             keep_weekly: 0,
             keep_monthly: 0,
+            keep_daily: 0,
+            keep_yearly: 0,
         };
         assert_eq!(select_expired(&v, pol, 400.0), vec!["mid"]);
         // 목록: created_at 이 없거나 깨지면 파일 수정 시각을 쓴다
@@ -592,6 +662,8 @@ mod tests {
                 retention_days: None,
                 keep_weekly: 0,
                 keep_monthly: 0,
+                keep_daily: 0,
+                keep_yearly: 0,
             },
         );
         assert_eq!(r.deleted_snapshots, vec!["a"]);
@@ -609,8 +681,10 @@ mod tests {
         let pol = |w, m| Policy {
             retention_count: Some(7),
             retention_days: None,
+            keep_daily: 0,
             keep_weekly: w,
             keep_monthly: m,
+            keep_yearly: 0,
         };
         let plain = select_expired(&snaps, pol(0, 0), now);
         assert_eq!(plain.len(), 83);

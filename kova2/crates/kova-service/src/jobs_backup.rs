@@ -162,6 +162,11 @@ impl Supervisor {
                     let policy = kova_core::retention::Policy {
                         retention_count: Some(prof.retention_count as usize),
                         retention_days: Some(prof.retention_days),
+                        keep_daily: prof
+                            .extra
+                            .get("keep_daily")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32,
                         keep_weekly: prof
                             .extra
                             .get("keep_weekly")
@@ -170,6 +175,11 @@ impl Supervisor {
                         keep_monthly: prof
                             .extra
                             .get("keep_monthly")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32,
+                        keep_yearly: prof
+                            .extra
+                            .get("keep_yearly")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as u32,
                     };
