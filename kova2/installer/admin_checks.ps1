@@ -7,7 +7,8 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) { Write-Host 'FAIL: run as administrator'; exit 2 }
 $tests = @(
     @('-p', 'kova-core', 'vss::tests::real_shadow'),
-    @('-p', 'kova-core', 'worm::tests::acl_protect'),
+    @('-p', 'kova-core', 'worm::tests::acl_protect_and_authorized_remove_on_temp_file'),
+    @('-p', 'kova-core', 'worm::tests::acl_protect_and_remove_image_with_sidecars'),
     @('-p', 'kova-service', 'vss_backup_reads')
 )
 $fail = 0

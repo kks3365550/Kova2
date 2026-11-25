@@ -354,6 +354,36 @@ mod tests {
         assert!(remove_protected(&f).is_ok() && !f.exists());
     }
 
+    /// 이미지 삭제 경로(disk_image::delete_image_file)와 같은 순서: 보호된 이미지 본체를 지우고 곁 파일도 지운다.
+    /// 읽기 전용 + ACL 이 걸린 이미지·곁 파일이 승인 경로로 모두 지워지는지 실제 icacls 로 시험한다.
+    #[test]
+    #[ignore]
+    #[cfg(windows)]
+    fn acl_protect_and_remove_image_with_sidecars() {
+        let d = tempfile::tempdir().unwrap();
+        let img = d.path().join("disk.qblk");
+        let sides = [
+            d.path().join("disk.qblk.verified"),
+            d.path().join("disk.qblk.map"),
+        ];
+        fs::write(&img, b"img").unwrap();
+        for s in &sides {
+            fs::write(s, b"s").unwrap();
+        }
+        assert!(protect_file(&img, true));
+        for s in &sides {
+            assert!(protect_file(s, true));
+        }
+        assert!(
+            fs::write(&img, b"x").is_err(),
+            "보호 중인 이미지는 덮어쓸 수 없어야 함"
+        );
+        assert!(remove_protected(&img).is_ok() && !img.exists());
+        for s in &sides {
+            assert!(remove_protected(s).is_ok() && !s.exists());
+        }
+    }
+
     #[test]
     #[cfg(windows)]
     fn failed_removal_reapplies_protection() {
