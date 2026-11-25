@@ -148,6 +148,14 @@ pub fn strip_extended(path: &Path) -> PathBuf {
                 unc.extend_from_slice(&rest[4..]);
                 return PathBuf::from(OsString::from_wide(&unc));
             }
+            // `\\?\GLOBALROOT\Device\...`(VSS 섀도 장치 경로) 같은 비-드라이브 경로는 접두사가 있어야 열린다
+            let is_drive = rest.len() >= 2
+                && rest[0] < 128
+                && (rest[0] as u8).is_ascii_alphabetic()
+                && rest[1] == b':' as u16;
+            if !is_drive {
+                return path.to_path_buf();
+            }
             return PathBuf::from(OsString::from_wide(rest));
         }
         path.to_path_buf()
@@ -162,7 +170,11 @@ pub fn strip_extended(path: &Path) -> PathBuf {
                 {
                     return PathBuf::from(format!(r"\\{}", &rest[4..]));
                 }
-                return PathBuf::from(rest);
+                let b = rest.as_bytes();
+                if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                    return PathBuf::from(rest);
+                }
+                return path.to_path_buf();
             }
         }
         path.to_path_buf()
@@ -182,6 +194,13 @@ mod tests {
         assert_eq!(
             strip_extended(Path::new(r"\\?\UNC\server\share\dir\file.txt")),
             PathBuf::from(r"\\server\share\dir\file.txt")
+        );
+        // VSS 섀도 장치 경로는 접두사를 벗기면 열 수 없으므로 그대로 둔다
+        assert_eq!(
+            strip_extended(Path::new(
+                r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\a.txt"
+            )),
+            PathBuf::from(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\a.txt")
         );
         assert_eq!(
             strip_extended(Path::new(r"\\.\PhysicalDrive0")),
