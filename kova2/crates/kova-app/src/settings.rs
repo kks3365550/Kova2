@@ -141,7 +141,7 @@ pub(crate) fn apply_settings(
 }
 
 /// 이 PC에 키가 있는 암호화 저장소들의 복구 코드를 서비스에서 받아(관리자 권한 앱만) 복구 키트 파일로 저장한다.
-fn export_recovery_kit_to(out_path: &Path) -> Result<String, String> {
+fn fetch_recovery_entries() -> Result<Vec<(String, String, String)>, String> {
     let res = ipc_once(&kova_ipc::Request::ExportRecoveryCodes);
     if let Some(why) = send_failure(&res) {
         return Err(why);
@@ -160,12 +160,50 @@ fn export_recovery_kit_to(out_path: &Path) -> Result<String, String> {
             _ => None,
         })
         .ok_or("서비스가 응답하지 않았습니다(서비스를 최신 버전으로 업데이트하세요)")?;
+    Ok(entries)
+}
+
+fn export_recovery_kit_to(out_path: &Path) -> Result<String, String> {
+    let entries = fetch_recovery_entries()?;
     kova_core::repocrypto::write_recovery_kit(out_path, &entries)?;
     Ok(format!(
         "복구 키트 저장 완료 (암호화 저장소 {}곳): {}",
         entries.len(),
         out_path.display()
     ))
+}
+
+/// 복구 코드들을 암호로 감싼 키 파일(.kovakey)로 저장한다.
+fn export_key_bundle_to(out_path: &Path, pass: &str) -> Result<String, String> {
+    let entries: Vec<kova_core::keybundle::KeyEntry> = fetch_recovery_entries()?
+        .into_iter()
+        .map(|(name, repo, code)| kova_core::keybundle::KeyEntry { name, repo, code })
+        .collect();
+    let text = kova_core::keybundle::seal(&entries, pass)?;
+    std::fs::write(out_path, text).map_err(|e| format!("키 파일 저장 실패: {e}"))?;
+    Ok(format!(
+        "암호 키 파일 저장 완료 (키 {}개): {}",
+        entries.len(),
+        out_path.display()
+    ))
+}
+
+/// 암호 키 파일을 열어 이 PC의 저장소 키를 서비스로 복원한다.
+fn import_key_bundle_from(path: &Path, pass: &str) -> Result<String, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("키 파일을 읽지 못했습니다: {e}"))?;
+    let entries = kova_core::keybundle::open(&text, pass)?;
+    let (mut ok, mut last_err) = (0usize, String::new());
+    for e in &entries {
+        match restore_keys(&e.code) {
+            Ok(_) => ok += 1,
+            Err(err) => last_err = err,
+        }
+    }
+    if ok == 0 {
+        return Err(last_err);
+    }
+    Ok(format!("키를 복원했습니다 (키 {ok}/{}개)", entries.len()))
 }
 
 /// 운영 자동화 설정(웹훅·CPU 스레드·오프사이트 대역폭·배터리 일시정지·Fleet 주소)을 검증하고 저장한다.
@@ -1158,6 +1196,63 @@ pub(crate) fn wire(w: &MainWindow) {
                 let res = export_recovery_kit_to(&out);
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak.upgrade() {
+                        set_settings_msg(&w, res);
+                    }
+                });
+            });
+        });
+
+        let weak = w.as_weak();
+        w.on_export_key_bundle(move |pass| {
+            if app_locked() {
+                if let Some(w) = weak.upgrade() {
+                    set_settings_msg(&w, Err(LOCKED_MSG.to_string()));
+                }
+                return;
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_settings_err(false);
+                w.set_settings_text("암호 키 파일 생성 중…".into());
+            }
+            let (pass, weak) = (pass.to_string(), weak.clone());
+            std::thread::spawn(move || {
+                let base = std::env::var_os("USERPROFILE")
+                    .map(|u| std::path::PathBuf::from(u).join("Desktop"))
+                    .filter(|d| d.is_dir())
+                    .unwrap_or_else(std::env::temp_dir);
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let res =
+                    export_key_bundle_to(&base.join(format!("Kova2_Keys_{secs}.kovakey")), &pass);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        set_settings_msg(&w, res);
+                    }
+                });
+            });
+        });
+
+        let weak = w.as_weak();
+        w.on_import_key_bundle(move |path, pass| {
+            if app_locked() {
+                if let Some(w) = weak.upgrade() {
+                    set_settings_msg(&w, Err(LOCKED_MSG.to_string()));
+                }
+                return;
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_settings_err(false);
+                w.set_settings_text("암호 키 파일 복원 중…".into());
+            }
+            let (path, pass, weak) = (path.to_string(), pass.to_string(), weak.clone());
+            std::thread::spawn(move || {
+                let p = std::path::PathBuf::from(path.trim().trim_matches('"'));
+                let res = import_key_bundle_from(&p, &pass);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_form_key_pass("".into());
                         set_settings_msg(&w, res);
                     }
                 });

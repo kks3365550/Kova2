@@ -111,6 +111,10 @@ export component MainWindow inherits Window {
     in-out property <string> form-recovery: "";
     callback restore-key(string);
     callback export-recovery-kit();
+    in-out property <string> form-key-pass: "";
+    in-out property <string> form-key-file: "";
+    callback export-key-bundle(string);
+    callback import-key-bundle(string, string);
 
     // Ops & Fleet settings
     in-out property <string> form-webhook: "";
@@ -2604,6 +2608,20 @@ export component MainWindow inherits Window {
                                     Btn { text: "키 복원"; clicked => { root.restore-key(root.form-recovery); } }
                                 }
                                 Hint { text: "암호화 키 분실 시 내보내 둔 복구 코드를 입력하여 복구 마스터 키를 복원합니다."; }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "암호 키 파일 암호"; color: Theme.text; font-size: 13px; width: 190px; vertical-alignment: center; }
+                                    Field { text <=> root.form-key-pass; horizontal-stretch: 1; placeholder: "8자 이상 (분실 시 복구 불가)"; }
+                                    Btn { text: "암호 키 파일 저장"; clicked => { root.export-key-bundle(root.form-key-pass); root.form-key-pass = ""; } }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "키 파일 경로(.kovakey)"; color: Theme.text; font-size: 13px; width: 190px; vertical-alignment: center; }
+                                    Field { text <=> root.form-key-file; horizontal-stretch: 1; }
+                                    Btn { text: "키 파일로 복원"; clicked => { root.import-key-bundle(root.form-key-file, root.form-key-pass); } }
+                                }
+                                Hint { text: "복구 코드 대신 암호로 보호한 파일 하나로 다른 PC에 키를 옮기거나 보관합니다. 저장 시 바탕화면에 만들어지며, 복원하려면 위 암호와 파일 경로를 입력하세요."; }
                                 if root.settings-text != "": Text { text: root.settings-text; color: root.settings-err ? Theme.danger : Theme.ok; font-size: 13px; wrap: word-wrap; }
 
                                 HorizontalLayout {

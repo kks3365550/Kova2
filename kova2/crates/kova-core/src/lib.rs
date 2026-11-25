@@ -19,6 +19,7 @@ pub mod health;
 pub mod history;
 pub mod install;
 pub mod jobs;
+pub mod keybundle;
 pub mod lock;
 pub mod notify;
 pub mod offsite;
