@@ -2612,7 +2612,7 @@ export component MainWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 8px;
                                     Text { text: "암호 키 파일 암호"; color: Theme.text; font-size: 13px; width: 190px; vertical-alignment: center; }
-                                    Field { text <=> root.form-key-pass; horizontal-stretch: 1; placeholder: "8자 이상 (분실 시 복구 불가)"; }
+                                    Field { text <=> root.form-key-pass; horizontal-stretch: 1; placeholder: "8자 이상 (분실 시 복구 불가)"; secret: true; }
                                     Btn { text: "암호 키 파일 저장"; clicked => { root.export-key-bundle(root.form-key-pass); root.form-key-pass = ""; } }
                                 }
                                 HorizontalLayout {
