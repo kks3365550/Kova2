@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const MAX_ALERTS: usize = 100;
+/// 미성공 경고 메시지에 들어가는 표식(서비스가 만들고 성공 시 자동 해제에 쓴다).
+pub const STALE_MARK: &str = "일째 백업 성공 기록이 없습니다";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Alert {
@@ -67,6 +69,24 @@ impl AlertLog {
         self.list().iter().filter(|a| !a.acknowledged).count()
     }
 
+    /// 백업이 다시 성공하면 그 프로파일의 "N일째 백업 성공 기록이 없습니다" 경고를 자동으로 확인 처리한다.
+    /// 성공했는데도 배너에 낡은 경고가 남는 문제를 막는다. 해제한 건수를 돌려준다.
+    pub fn resolve_stale(&self, profile_id: &str) -> io::Result<usize> {
+        let _g = self.lock();
+        let mut v = self.load_for_update()?;
+        let mut n = 0;
+        for a in v.iter_mut().filter(|a| {
+            !a.acknowledged && a.profile_id == profile_id && a.message.contains(STALE_MARK)
+        }) {
+            a.acknowledged = true;
+            n += 1;
+        }
+        if n > 0 {
+            self.save(&v)?;
+        }
+        Ok(n)
+    }
+
     pub fn acknowledge_all(&self) -> io::Result<()> {
         let _g = self.lock();
         let mut v = self.load_for_update()?;
@@ -103,6 +123,25 @@ mod tests {
         assert_eq!(l.unacknowledged(), 100);
         l.acknowledge_all().unwrap();
         assert_eq!(l.unacknowledged(), 0);
+    }
+
+    #[test]
+    fn resolve_stale_only_clears_that_profiles_stale_warnings() {
+        let d = tempfile::tempdir().unwrap();
+        let l = AlertLog::new(d.path());
+        let mk = |pid: &str, msg: &str| Alert {
+            at: 1.0,
+            profile_id: pid.into(),
+            level: "warning".into(),
+            message: msg.into(),
+            acknowledged: false,
+        };
+        l.push(mk("p", &format!("P: 4{STALE_MARK}"))).unwrap();
+        l.push(mk("q", &format!("Q: 4{STALE_MARK}"))).unwrap();
+        l.push(mk("p", "복제 실패")).unwrap();
+        assert_eq!(l.resolve_stale("p").unwrap(), 1);
+        assert_eq!(l.unacknowledged(), 2);
+        assert_eq!(l.resolve_stale("p").unwrap(), 0);
     }
 
     #[test]
