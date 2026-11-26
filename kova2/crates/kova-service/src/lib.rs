@@ -482,7 +482,14 @@ impl Supervisor {
                 // 주기 복구 훈련: 최근 스냅샷을 임시 폴더에 실제로 복원해 보고 결과를 남긴다(실패하면 알림)
                 let last_drill = p.extra.get("last_drill_at").and_then(|v| v.as_f64());
                 let idle = !self.0.queue.lock().unwrap().is_profile_busy(&p.id);
-                if idle
+                // 훈련 기록이 없는 프로파일(이전 버전에서 업데이트한 경우)은 바로 돌리지 않고, 지금을 기준으로
+                // 주기를 시작한다. 업데이트·서비스 재시작 직후에 디스크를 몰아 쓰지 않게 하려는 유예다.
+                if last_drill.is_none() && settings.auto_drill_days > 0 {
+                    if let Some(mut fresh) = self.0.store.get(&p.id) {
+                        fresh.extra.insert("last_drill_at".into(), now_ts.into());
+                        let _ = self.0.store.upsert(fresh);
+                    }
+                } else if idle
                     && should_run_maintenance(last_drill, p.last_run, settings.auto_drill_days, now)
                 {
                     if let Ok(guard) = self.try_begin_drill(&p.id) {

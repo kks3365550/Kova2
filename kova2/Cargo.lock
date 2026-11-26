@@ -2932,6 +2932,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "webpki-roots 0.26.11",
+ "windows 0.58.0",
  "zip",
  "zstd",
 ]
