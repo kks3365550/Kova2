@@ -257,10 +257,10 @@ mod tests {
             ..Default::default()
         };
         run_backup(&opts, &|_| {}, &AtomicBool::new(false)).unwrap();
-        let a = kova_engine::ops::sample_snapshot_paths(&repo, "20261101_000000", 3, 1 << 20)
-            .unwrap();
-        let b = kova_engine::ops::sample_snapshot_paths(&repo, "20261101_000000", 3, 1 << 20)
-            .unwrap();
+        let a =
+            kova_engine::ops::sample_snapshot_paths(&repo, "20261101_000000", 3, 1 << 20).unwrap();
+        let b =
+            kova_engine::ops::sample_snapshot_paths(&repo, "20261101_000000", 3, 1 << 20).unwrap();
         assert_eq!(a.len(), 3);
         assert_eq!(a, b, "표본은 결정적이어야 함");
         let all = kova_engine::ops::sample_snapshot_paths(&repo, "20261101_000000", 100, 1 << 20)
