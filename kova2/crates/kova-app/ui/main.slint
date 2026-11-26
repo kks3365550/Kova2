@@ -2091,6 +2091,7 @@ export component MainWindow inherits Window {
                                     spacing: 8px;
                                     Field { text <=> root.vol-letter; placeholder: "대상 드라이브 문자 (예: E)"; width: 220px; }
                                     Btn { text: "드라이브 상태 확인"; clicked => { root.volume-check(root.vol-letter); } }
+                                    Rectangle { horizontal-stretch: 1; }
                                 }
                                 Hint { text: "③ 안전 확인: 드라이브를 고르면 아래에 입력할 확인 문구가 나타납니다. 그 문구를 그대로 입력해야 실행됩니다."; }
                                 if root.volume-phrase == "": Text { text: "아직 문구가 없습니다. 위 ②에서 드라이브를 먼저 고르세요."; color: Theme.muted; font-size: 12px; }
@@ -2408,6 +2409,8 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                     if root.settings-text != "": Text { text: root.settings-text; color: root.settings-err ? Theme.danger : Theme.ok; font-size: 13px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+                                    // 안내 글이 없을 때 저장 버튼이 카드 폭 전체로 늘어나지 않게 한다
+                                    if root.settings-text == "": Rectangle { horizontal-stretch: 1; }
                                 }
                             }
                         }
