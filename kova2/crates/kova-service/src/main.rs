@@ -36,6 +36,15 @@ fn start_core(rt: &tokio::runtime::Runtime) -> (Supervisor, Arc<AtomicBool>) {
         };
         kova_core::applog::write(&default_config_dir(), level, &text);
     }
+    // 이전 실행이 도중에 끊겨 남긴 복구 훈련 임시 폴더를 치운다(시작 직후라 훈련은 돌고 있지 않다)
+    let cleaned = kova_core::drill::cleanup_stale(&std::env::temp_dir());
+    if cleaned > 0 {
+        kova_core::applog::write(
+            &default_config_dir(),
+            "INFO",
+            &format!("남은 복구 훈련 임시 폴더 {cleaned}개를 지웠습니다"),
+        );
+    }
     let stop = Arc::new(AtomicBool::new(false));
     spawn_scheduler(sup.clone(), stop.clone());
     let handler: Arc<dyn kova_ipc::Handler> = Arc::new(IpcHandler(sup.clone()));

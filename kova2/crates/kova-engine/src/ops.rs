@@ -700,6 +700,50 @@ fn is_under(path: &str, prefix: &str) -> bool {
     prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// 복구 훈련용 표본: 스냅샷의 파일 중 최대 `max_files` 개 · 합계 약 `max_bytes` 바이트까지를
+/// 이름 해시로 고르게 뽑아 `RestoreOptions::only` 에 넣을 가상 경로로 돌려준다.
+/// 같은 스냅샷이면 늘 같은 표본이 나온다(결정적). 파일이 이보다 적으면 전부 돌려준다.
+pub fn sample_snapshot_paths(
+    repo: &Path,
+    session_id: &str,
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<Vec<String>, EngineError> {
+    if !valid_session_id(session_id) {
+        return Err(msg(format!("invalid session id: {session_id}")));
+    }
+    let cas = CasStorage::new(repo)?;
+    let manifest = cas.load_manifest(session_id)?;
+    let base = browse_base(&manifest);
+    let mut items: Vec<(u64, u64, String)> = Vec::new();
+    for e in manifest.files().iter().filter(|e| !e.is_dir) {
+        if let Some(vp) = virtual_path(&base, e) {
+            // FNV-1a 로 경로를 섞어 고르게 뽑는다
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in vp.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            items.push((h, e.size, vp));
+        }
+    }
+    items.sort();
+    let mut out = Vec::new();
+    let mut bytes = 0u64;
+    for (_, size, vp) in items {
+        if out.len() >= max_files {
+            break;
+        }
+        // 첫 파일은 크기와 관계없이 넣고, 이후는 한도를 넘으면 건너뛴다
+        if !out.is_empty() && bytes.saturating_add(size) > max_bytes {
+            continue;
+        }
+        bytes = bytes.saturating_add(size);
+        out.push(vp);
+    }
+    Ok(out)
+}
+
 /// 스냅샷 안을 한 폴더씩 보여준다. `query` 가 있으면 폴더 구분 없이 파일 이름으로 찾고 `limit` 건까지만 돌려준다.
 /// 폴더가 먼저, 이름순.
 pub fn browse_snapshot(
