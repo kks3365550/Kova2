@@ -2,13 +2,13 @@
 //! 필요하면 압축을 풀어 BLAKE3 해시와 길이가 일치하는지(전체 검사) 확인한다.
 use kova_engine::{
     hasher,
-    storage::{CasStorage, SnapshotManifest},
+    storage::{valid_session_id, CasStorage, SnapshotManifest},
 };
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Problem {
@@ -43,16 +43,40 @@ impl VerifyReport {
 
 /// deep=false: 청크 파일 존재만 확인. deep=true: 전부 읽어 압축 해제 + 해시 + 길이 확인.
 pub fn verify_repo(repo: &Path, deep: bool) -> io::Result<VerifyReport> {
+    let mut paths = Vec::new();
+    for e in fs::read_dir(repo.join("snapshots"))? {
+        let p = e?.path();
+        if p.extension().is_some_and(|x| x == "json") {
+            paths.push(p);
+        }
+    }
+    verify_manifests(repo, paths, deep)
+}
+
+/// 스냅샷 하나만 검증한다. 보고되는 문제는 모두 그 스냅샷의 것이다(손상 청크 포함).
+pub fn verify_snapshot(repo: &Path, session_id: &str, deep: bool) -> io::Result<VerifyReport> {
+    if !valid_session_id(session_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "스냅샷 번호가 올바르지 않습니다",
+        ));
+    }
+    let path = repo.join("snapshots").join(format!("{session_id}.json"));
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("스냅샷을 찾을 수 없습니다: {session_id}"),
+        ));
+    }
+    verify_manifests(repo, vec![path], deep)
+}
+
+fn verify_manifests(repo: &Path, paths: Vec<PathBuf>, deep: bool) -> io::Result<VerifyReport> {
     let cas = CasStorage::new(repo)?;
     let mut rep = VerifyReport::default();
     // 해시 -> (기대 길이(0 이면 미상), 구형 blob_id/sha256 여부). 같은 청크는 한 번만 검사한다.
     let mut unique: BTreeMap<String, (usize, bool)> = BTreeMap::new();
-    let dir = repo.join("snapshots");
-    for e in fs::read_dir(&dir)? {
-        let p = e?.path();
-        if p.extension().is_none_or(|x| x != "json") {
-            continue;
-        }
+    for p in paths {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let sid_stem = p
             .file_stem()
@@ -191,6 +215,29 @@ mod tests {
         let r = verify_repo(d.path(), true).unwrap();
         assert!(r.ok(), "{:?}", r.problems);
         assert_eq!((r.snapshots, r.files, r.unique_chunks), (1, 1, 1));
+    }
+
+    #[test]
+    fn single_snapshot_verify_checks_only_that_snapshot() {
+        let (d, _) = make_repo(b"good data");
+        // s2 는 없는 청크를 가리킨다
+        fs::write(
+            d.path().join("snapshots").join("s2.json"),
+            r#"{"id":"s2","files":[{"path":"b.txt","size":1,"chunks":[{"hash":"00ff","length":1}]}]}"#,
+        )
+        .unwrap();
+        let good = verify_snapshot(d.path(), "s1", true).unwrap();
+        assert!(good.ok(), "{:?}", good.problems);
+        assert_eq!(good.snapshots, 1);
+        assert!(!verify_snapshot(d.path(), "s2", true).unwrap().ok());
+        assert_eq!(
+            verify_snapshot(d.path(), "../s1", true).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            verify_snapshot(d.path(), "none", true).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]

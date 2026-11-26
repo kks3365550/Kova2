@@ -83,7 +83,7 @@ export component MainWindow inherits Window {
     callback load-job-history();
     in property <string> log-text;
     callback run-backup(string);
-    callback run-verify(string);
+    callback run-verify(string, string);  // 프로파일, 스냅샷 번호 (그 스냅샷만 정밀 검사)
     callback run-gc(string);
     callback open-repo-dir(string);
     callback export-drivers();
@@ -1512,7 +1512,7 @@ export component MainWindow inherits Window {
                                         Btn {
                                             text: s.verified == "오류 있음" ? "🔍 다시 검사" : "🔍 검사";
                                             height: 32px;
-                                            clicked => { root.run-verify(s.profile-id != "" ? s.profile-id : s.id); }
+                                            clicked => { root.run-verify(s.profile-id != "" ? s.profile-id : s.id, s.id); }
                                         }
                                     }
 

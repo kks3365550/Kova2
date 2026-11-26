@@ -40,7 +40,7 @@ impl std::fmt::Debug for Secret {
 pub enum Request {
     Ping,
     Status,
-    /// kind: "backup" | "verify"
+    /// kind: "backup" | "verify" | "verify:<스냅샷 번호>"(그 스냅샷만 정밀 검증) | "gc"
     RunNow {
         profile_id: String,
         kind: String,

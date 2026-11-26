@@ -161,7 +161,7 @@ pub(crate) fn chrono_fmt(ts: f64) -> String {
 /// 작업 종류(서비스 kind 문자열)를 화면에 보일 이름으로 바꾼다. "image:C" 같은 내부 표기를 그대로 보이지 않는다.
 pub(crate) fn kind_label(kind: &str) -> String {
     match kind {
-        "verify" => "무결성 검사".into(),
+        k if k == "verify" || k.starts_with("verify:") => "무결성 검사".into(),
         "gc" => "저장소 정리".into(),
         k if k.starts_with("delsnap") => "스냅샷 삭제".into(),
         k if k.starts_with("image_inc") => match k.strip_prefix("image_inc:") {

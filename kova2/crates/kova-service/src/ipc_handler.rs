@@ -248,6 +248,16 @@ impl Handler for IpcHandler {
                     "backup" => Kind::Backup,
                     "verify" => Kind::Verify,
                     "gc" => Kind::Gc,
+                    s if s.starts_with("verify:") => {
+                        let sid = s.strip_prefix("verify:").unwrap_or("");
+                        if !kova_engine::storage::valid_session_id(sid) {
+                            return Reply::Once(vec![Event::Error {
+                                message: "스냅샷 번호가 올바르지 않습니다".into(),
+                            }]);
+                        }
+                        arg = format!("{}{sid}", crate::jobs_maint::SNAPSHOT_ARG);
+                        Kind::Verify
+                    }
                     s if s.starts_with("delsnap:") => {
                         arg = s.strip_prefix("delsnap:").unwrap_or("").to_string();
                         Kind::DeleteSnapshot
