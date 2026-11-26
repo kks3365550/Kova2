@@ -1661,6 +1661,89 @@ fn job_history_records_completed_backup_and_returns_via_ipc() {
 }
 
 #[test]
+fn verify_single_snapshot_marks_only_that_snapshot() {
+    use kova_ipc::{Caller, Handler};
+    let (d, s) = setup(true);
+    s.enqueue("p1", Kind::Backup);
+    wait_idle(&s);
+    let repo = d.path().join("repo");
+    let sid = History::open(&repo).unwrap().list_snapshots().unwrap()[0]
+        .id
+        .clone();
+    // 백업이 남긴 표시·시각을 알아볼 수 있는 값으로 바꿔 둔다
+    History::open(&repo)
+        .unwrap()
+        .set_verification(&sid, false, 1, 1.0)
+        .unwrap();
+    let store = ConfigStore::new(d.path().join("cfg"));
+    let mut p = store.get("p1").unwrap();
+    p.extra.insert("last_verify_at".into(), 1.0.into());
+    store.upsert(p).unwrap();
+    let h = IpcHandler(s.clone());
+    let user = Caller { privileged: false };
+
+    let bad = first_error(h.handle(run_now("verify:../x", "p1"), user));
+    assert!(bad.is_some_and(|m| m.contains("스냅샷 번호")));
+
+    assert!(first_error(h.handle(run_now(&format!("verify:{sid}"), "p1"), user)).is_none());
+    wait_idle(&s);
+    let rec = History::open(&repo).unwrap().list_snapshots().unwrap();
+    assert!(rec[0].is_verified);
+    // 저장소 전체 검증이 아니므로 정기 검증 시각은 바꾸지 않는다
+    let p = store.get("p1").unwrap();
+    assert_eq!(
+        p.extra.get("last_verify_at").and_then(|v| v.as_f64()),
+        Some(1.0)
+    );
+}
+
+#[test]
+fn repo_verify_flags_corrupt_blob_snapshot_and_quick_verify_keeps_the_flag() {
+    let (d, s) = setup(true);
+    s.enqueue("p1", Kind::Backup);
+    wait_idle(&s);
+    let repo = d.path().join("repo");
+    let good = History::open(&repo).unwrap().list_snapshots().unwrap()[0]
+        .id
+        .clone();
+    // 파일은 있지만 내용이 해시와 다른 청크를 가리키는, 전에 "검증됨"이던 스냅샷
+    let cas = kova_engine::storage::CasStorage::new(&repo).unwrap();
+    let hash = kova_engine::hasher::hash_bytes(b"original");
+    let tampered = kova_engine::compressor::compress(b"tampered", 3).unwrap();
+    cas.save_blob(&hash, &tampered).unwrap();
+    fs::write(
+        repo.join("snapshots").join("damaged.json"),
+        format!(
+            r#"{{"id":"damaged","files":[{{"path":"b.txt","size":8,"chunks":[{{"hash":"{hash}","length":8}}]}}]}}"#
+        ),
+    )
+    .unwrap();
+    let mut h = History::open(&repo).unwrap();
+    h.sync_snapshots().unwrap();
+    assert!(h.set_verification("damaged", true, 0, 1.0).unwrap());
+    drop(h);
+    let flags = |id: &str| {
+        let r = History::open(&repo)
+            .unwrap()
+            .get_snapshot(id)
+            .unwrap()
+            .unwrap();
+        (r.is_verified, r.verify_error_count)
+    };
+
+    s.enqueue_with("p1", Kind::Verify, "deep");
+    wait_idle(&s);
+    assert_eq!(flags("damaged"), (false, 1));
+    assert_eq!(flags(&good).1, 0);
+
+    // 빠른 검증은 청크 존재만 보므로 정밀 검증이 남긴 오류 표시를 지우면 안 된다
+    s.enqueue_with("p1", Kind::Verify, "quick");
+    wait_idle(&s);
+    assert_eq!(flags("damaged"), (false, 1));
+    assert_eq!(flags(&good), (true, 0));
+}
+
+#[test]
 fn diff_snapshots_returns_added_modified_and_deleted_entries() {
     use kova_ipc::{Caller, Event, Handler, Request};
     let (d, s) = setup(true);

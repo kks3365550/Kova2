@@ -635,16 +635,17 @@ pub(crate) fn wire(w: &MainWindow, banner_gen: &Arc<AtomicU64>) {
 
         let weak = w.as_weak();
         let bg = banner_gen.clone();
-        w.on_run_verify(move |id| {
+        w.on_run_verify(move |id, snap_id| {
             bg.fetch_add(1, Ordering::SeqCst);
             if let Some(w) = weak.upgrade() {
                 w.set_job_completed_show(false);
             }
             let (weak, id) = (weak.clone(), id.to_string());
+            let kind = format!("verify:{snap_id}");
             std::thread::spawn(move || {
                 let store = ConfigStore::new(kova_service::default_config_dir());
                 let pid = resolve_profile_id(&store, &id).unwrap_or(id);
-                send_sync(weak, "verify".into(), pid);
+                send_sync(weak, kind, pid);
             });
         });
 

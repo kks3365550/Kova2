@@ -4,8 +4,10 @@ use chrono::Local;
 use kova_core::config::Profile;
 use kova_core::history::History;
 use kova_core::jobs::Job;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// 검증 작업 인자가 이 접두사로 시작하면 뒤에 붙은 번호의 스냅샷 하나만 검증한다.
+pub(crate) const SNAPSHOT_ARG: &str = "snap:";
 
 /// 저장소 안의 이력 DB 를 이미 있을 때만 연다(조회 때문에 저장소 폴더·DB 를 새로 만들지 않는다).
 fn open_history_if_exists(repo: &Path) -> Option<History> {
@@ -220,6 +222,38 @@ impl Supervisor {
         }
     }
 
+    /// 사용자가 고른 스냅샷 하나를 항상 정밀 검증하고 그 스냅샷의 표시만 갱신한다.
+    /// 저장소 전체를 본 것이 아니므로 정기 검증 시각(`last_verify_at`)과 유지보수 실패 기록은 건드리지 않는다.
+    fn verify_one_snapshot(&self, job: &Job, repo: &Path, sid: &str) -> JobOutcome {
+        self.emit(SvcEvent::Progress {
+            job_id: job.id,
+            percent: 50,
+            current: "스냅샷 정밀 검증 수행 중...".into(),
+        });
+        let r = match kova_core::verify::verify_snapshot(repo, sid, true) {
+            Ok(r) => r,
+            Err(e) => return JobOutcome::fail(e.to_string()),
+        };
+        if let Ok(h) = History::open(repo) {
+            let now = Local::now().timestamp() as f64;
+            let _ = h.set_verification(sid, r.ok(), r.problems.len() as i64, now);
+        }
+        let message = match r.problems.first() {
+            None => format!("스냅샷 {sid} 정밀 검증 통과: 파일 {}개", r.files),
+            Some(first) => format!(
+                "스냅샷 {sid} 정밀 검증 문제 {}건 (첫 항목: {first:?})",
+                r.problems.len()
+            ),
+        };
+        JobOutcome {
+            ok: r.ok(),
+            message,
+            snapshot_id: Some(sid.to_string()),
+            bytes: 0,
+            files: r.files as u64,
+        }
+    }
+
     pub(crate) fn run_verify_job(&self, job: &Job) -> JobOutcome {
         let Some(prof) = self.resolve_profile(&job.profile_id) else {
             return JobOutcome::fail(format!("프로파일 없음: {}", job.profile_id));
@@ -243,6 +277,9 @@ impl Supervisor {
                 return JobOutcome::fail(format!("저장소 잠금 실패: {e}"));
             }
         };
+        if let Some(sid) = job.arg.strip_prefix(SNAPSHOT_ARG) {
+            return self.verify_one_snapshot(job, repo, sid);
+        }
         let deep = match job.arg.as_str() {
             "deep" => true,
             "quick" => false,
@@ -294,26 +331,13 @@ impl Supervisor {
         if let Ok(r) = &verify_result {
             let now = Local::now().timestamp() as f64;
             if let Ok(h) = History::open(repo) {
-                let mut bad: HashMap<String, i64> = HashMap::new();
-                for pr in &r.problems {
-                    match pr {
-                        kova_core::verify::Problem::MissingBlob { snapshot, .. } => {
-                            *bad.entry(snapshot.clone()).or_default() += 1;
-                        }
-                        kova_core::verify::Problem::BadManifest { file, .. } => {
-                            *bad.entry(file.trim_end_matches(".json").to_string())
-                                .or_default() += 1;
-                        }
-                        // 어느 스냅샷의 문제인지 알 수 없는 손상 청크는 개별 표시를 바꾸지 않는다
-                        kova_core::verify::Problem::CorruptBlob { .. } => {}
-                    }
-                }
                 for rec in h.list_snapshots().unwrap_or_default() {
-                    match bad.get(&rec.id) {
+                    match r.snapshot_errors.get(&rec.id) {
                         Some(n) => {
                             let _ = h.set_verification(&rec.id, false, *n, now);
                         }
-                        None if r.ok() => {
+                        // 빠른 검증은 청크 존재만 보므로 이전에 남은 오류 표시는 정밀 검증만 지운다
+                        None if r.ok() && (deep || rec.verify_error_count == 0) => {
                             let _ = h.set_verification(&rec.id, true, 0, now);
                         }
                         None => {}
