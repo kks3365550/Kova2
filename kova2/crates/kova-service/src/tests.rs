@@ -1698,6 +1698,52 @@ fn verify_single_snapshot_marks_only_that_snapshot() {
 }
 
 #[test]
+fn repo_verify_flags_corrupt_blob_snapshot_and_quick_verify_keeps_the_flag() {
+    let (d, s) = setup(true);
+    s.enqueue("p1", Kind::Backup);
+    wait_idle(&s);
+    let repo = d.path().join("repo");
+    let good = History::open(&repo).unwrap().list_snapshots().unwrap()[0]
+        .id
+        .clone();
+    // 파일은 있지만 내용이 해시와 다른 청크를 가리키는, 전에 "검증됨"이던 스냅샷
+    let cas = kova_engine::storage::CasStorage::new(&repo).unwrap();
+    let hash = kova_engine::hasher::hash_bytes(b"original");
+    let tampered = kova_engine::compressor::compress(b"tampered", 3).unwrap();
+    cas.save_blob(&hash, &tampered).unwrap();
+    fs::write(
+        repo.join("snapshots").join("damaged.json"),
+        format!(
+            r#"{{"id":"damaged","files":[{{"path":"b.txt","size":8,"chunks":[{{"hash":"{hash}","length":8}}]}}]}}"#
+        ),
+    )
+    .unwrap();
+    let mut h = History::open(&repo).unwrap();
+    h.sync_snapshots().unwrap();
+    assert!(h.set_verification("damaged", true, 0, 1.0).unwrap());
+    drop(h);
+    let flags = |id: &str| {
+        let r = History::open(&repo)
+            .unwrap()
+            .get_snapshot(id)
+            .unwrap()
+            .unwrap();
+        (r.is_verified, r.verify_error_count)
+    };
+
+    s.enqueue_with("p1", Kind::Verify, "deep");
+    wait_idle(&s);
+    assert_eq!(flags("damaged"), (false, 1));
+    assert_eq!(flags(&good).1, 0);
+
+    // 빠른 검증은 청크 존재만 보므로 정밀 검증이 남긴 오류 표시를 지우면 안 된다
+    s.enqueue_with("p1", Kind::Verify, "quick");
+    wait_idle(&s);
+    assert_eq!(flags("damaged"), (false, 1));
+    assert_eq!(flags(&good), (true, 0));
+}
+
+#[test]
 fn diff_snapshots_returns_added_modified_and_deleted_entries() {
     use kova_ipc::{Caller, Event, Handler, Request};
     let (d, s) = setup(true);

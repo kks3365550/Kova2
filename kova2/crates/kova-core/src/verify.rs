@@ -5,7 +5,7 @@ use kova_engine::{
     storage::{valid_session_id, CasStorage, SnapshotManifest},
 };
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,6 +33,8 @@ pub struct VerifyReport {
     pub files: usize,
     pub unique_chunks: usize,
     pub problems: Vec<Problem>,
+    /// 문제가 있는 스냅샷(매니페스트 파일 이름) -> 문제 수. 손상 청크는 그 청크를 쓰는 모든 스냅샷에 센다.
+    pub snapshot_errors: BTreeMap<String, i64>,
 }
 
 impl VerifyReport {
@@ -76,19 +78,16 @@ fn verify_manifests(repo: &Path, paths: Vec<PathBuf>, deep: bool) -> io::Result<
     let mut rep = VerifyReport::default();
     // 해시 -> (기대 길이(0 이면 미상), 구형 blob_id/sha256 여부). 같은 청크는 한 번만 검사한다.
     let mut unique: BTreeMap<String, (usize, bool)> = BTreeMap::new();
-    for p in paths {
+    for p in &paths {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let sid_stem = p
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let manifest: SnapshotManifest = match cas
-            .read_manifest_bytes(&p, &sid_stem)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
-        {
+        let manifest = match read_manifest(&cas, p, &sid_stem) {
             Ok(m) => m,
             Err(reason) => {
+                *rep.snapshot_errors.entry(sid_stem).or_default() += 1;
                 rep.problems
                     .push(Problem::BadManifest { file: name, reason });
                 continue;
@@ -110,16 +109,20 @@ fn verify_manifests(repo: &Path, paths: Vec<PathBuf>, deep: bool) -> io::Result<
                         Some(h) => {
                             unique.entry(h).or_insert((fe.size as usize, true));
                         }
-                        None => rep.problems.push(Problem::MissingBlob {
-                            snapshot: sid.clone(),
-                            path: fe.path.clone(),
-                            hash: id,
-                        }),
+                        None => {
+                            *rep.snapshot_errors.entry(sid_stem.clone()).or_default() += 1;
+                            rep.problems.push(Problem::MissingBlob {
+                                snapshot: sid.clone(),
+                                path: fe.path.clone(),
+                                hash: id,
+                            });
+                        }
                     }
                 }
             }
             for c in fe.chunks {
                 if !cas.has_blob(&c.hash) {
+                    *rep.snapshot_errors.entry(sid_stem.clone()).or_default() += 1;
                     rep.problems.push(Problem::MissingBlob {
                         snapshot: sid.clone(),
                         path: fe.path.clone(),
@@ -179,9 +182,64 @@ fn verify_manifests(repo: &Path, paths: Vec<PathBuf>, deep: bool) -> io::Result<
                 None
             })
             .collect();
+        let corrupt: HashSet<&str> = bad
+            .iter()
+            .filter_map(|p| match p {
+                Problem::CorruptBlob { hash, .. } => Some(hash.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !corrupt.is_empty() {
+            mark_users(&cas, &paths, &corrupt, &mut rep.snapshot_errors);
+        }
         rep.problems.extend(bad);
     }
     Ok(rep)
+}
+
+fn read_manifest(cas: &CasStorage, path: &Path, stem: &str) -> Result<SnapshotManifest, String> {
+    cas.read_manifest_bytes(path, stem)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+}
+
+/// 손상 청크를 쓰는 스냅샷을 찾아 문제 수를 더한다. 손상이 있을 때만 매니페스트를 다시 읽으므로
+/// 정상 저장소에서는 "청크 -> 스냅샷" 목록을 메모리에 쌓지 않는다.
+fn mark_users(
+    cas: &CasStorage,
+    paths: &[PathBuf],
+    corrupt: &HashSet<&str>,
+    errors: &mut BTreeMap<String, i64>,
+) {
+    for p in paths {
+        let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        // 못 읽는 매니페스트는 첫 번째 순회에서 이미 BadManifest 로 셌다
+        let Ok(manifest) = read_manifest(cas, p, &stem) else {
+            continue;
+        };
+        let mut used: HashSet<String> = HashSet::new();
+        for fe in manifest.files() {
+            if fe.chunks.is_empty() && !fe.is_dir {
+                // 첫 번째 순회와 같이 실제로 있는 구형 블롭 하나만 본다
+                let found = [fe.blob_id.as_ref(), fe.sha256.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|h| cas.has_blob(h));
+                used.extend(found.filter(|h| corrupt.contains(h.as_str())).cloned());
+            }
+            used.extend(
+                fe.chunks
+                    .into_iter()
+                    .map(|c| c.hash)
+                    .filter(|h| corrupt.contains(h.as_str())),
+            );
+        }
+        if !used.is_empty() {
+            *errors.entry(stem).or_default() += used.len() as i64;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +295,44 @@ mod tests {
         assert_eq!(
             verify_snapshot(d.path(), "none", true).unwrap_err().kind(),
             io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn corrupt_blob_is_charged_to_every_snapshot_that_uses_it() {
+        let (d, hash) = make_repo(b"original content");
+        let snap = |id: &str, h: &str| {
+            fs::write(
+                d.path().join("snapshots").join(format!("{id}.json")),
+                format!(
+                    r#"{{"id":"{id}","files":[{{"path":"a","size":16,"chunks":[{{"hash":"{h}","length":16}}]}},{{"path":"copy","size":16,"chunks":[{{"hash":"{h}","length":16}}]}}]}}"#
+                ),
+            )
+            .unwrap();
+        };
+        // s2 는 같은 청크를 두 파일에서 쓰고, ok 는 멀쩡한 청크만 쓴다
+        snap("s2", &hash);
+        let other = b"another content!";
+        let other_hash = hasher::hash_bytes(other);
+        CasStorage::new(d.path())
+            .unwrap()
+            .save_blob(&other_hash, &compressor::compress(other, 3).unwrap())
+            .unwrap();
+        snap("ok", &other_hash);
+        fs::write(
+            d.path()
+                .join("blobs")
+                .join(&hash[..2])
+                .join(format!("{}.blob", hash)),
+            b"not zstd",
+        )
+        .unwrap();
+        let r = verify_repo(d.path(), true).unwrap();
+        assert_eq!(
+            r.snapshot_errors,
+            BTreeMap::from([("s1".to_string(), 1), ("s2".to_string(), 1)]),
+            "{:?}",
+            r.problems
         );
     }
 

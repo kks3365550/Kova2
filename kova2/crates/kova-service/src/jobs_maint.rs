@@ -4,7 +4,6 @@ use chrono::Local;
 use kova_core::config::Profile;
 use kova_core::history::History;
 use kova_core::jobs::Job;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// 검증 작업 인자가 이 접두사로 시작하면 뒤에 붙은 번호의 스냅샷 하나만 검증한다.
@@ -332,26 +331,13 @@ impl Supervisor {
         if let Ok(r) = &verify_result {
             let now = Local::now().timestamp() as f64;
             if let Ok(h) = History::open(repo) {
-                let mut bad: HashMap<String, i64> = HashMap::new();
-                for pr in &r.problems {
-                    match pr {
-                        kova_core::verify::Problem::MissingBlob { snapshot, .. } => {
-                            *bad.entry(snapshot.clone()).or_default() += 1;
-                        }
-                        kova_core::verify::Problem::BadManifest { file, .. } => {
-                            *bad.entry(file.trim_end_matches(".json").to_string())
-                                .or_default() += 1;
-                        }
-                        // 어느 스냅샷의 문제인지 알 수 없는 손상 청크는 개별 표시를 바꾸지 않는다
-                        kova_core::verify::Problem::CorruptBlob { .. } => {}
-                    }
-                }
                 for rec in h.list_snapshots().unwrap_or_default() {
-                    match bad.get(&rec.id) {
+                    match r.snapshot_errors.get(&rec.id) {
                         Some(n) => {
                             let _ = h.set_verification(&rec.id, false, *n, now);
                         }
-                        None if r.ok() => {
+                        // 빠른 검증은 청크 존재만 보므로 이전에 남은 오류 표시는 정밀 검증만 지운다
+                        None if r.ok() && (deep || rec.verify_error_count == 0) => {
                             let _ = h.set_verification(&rec.id, true, 0, now);
                         }
                         None => {}
