@@ -329,6 +329,19 @@ export component MainWindow inherits Window {
     out property <string> hero-pill: !service-ok ? "꺼짐" : profiles.length == 0 ? "설정 필요" : alert-text != "" ? "확인 필요" : "안전해요";
     out property <string> hero-sub: !service-ok ? "컴퓨터를 다시 시작해 보세요. 계속되면 Kova를 다시 설치하세요." : profiles.length == 0 ? "아래 세 단계만 따라 하면 끝납니다." : alert-text != "" ? "왼쪽의 '알림'을 눌러 내용을 확인하세요." : "마지막 백업: " + (snapshots.length > 0 ? snapshots[0].when : "아직 없음");
 
+    // 창이 좁거나 낮을 때 배치를 바꾸는 기준. 레이아웃 바인딩 순환을 피하려고 크기가 바뀔 때 갱신한다
+    property <bool> compact;
+    property <bool> narrow;
+    property <bool> short;
+    function update-size-class() {
+        root.compact = root.width < 1200px;
+        root.narrow = root.width < 1040px;
+        root.short = root.height < 700px;
+    }
+    init => { root.update-size-class(); }
+    changed width => { root.update-size-class(); }
+    changed height => { root.update-size-class(); }
+
     HorizontalLayout {
         // LEFT SIDEBAR (260px)
         Rectangle {
@@ -554,9 +567,9 @@ export component MainWindow inherits Window {
                         overflow: elide;
                         horizontal-stretch: 1;
                     }
-                    if root.pick-error != "": Badge { text: root.pick-error; tone: Theme.danger; y: 5px; }
                     if root.alert-text != "": Rectangle {
                         height: 28px;
+                        y: 3px;
                         border-radius: 14px;
                         background: ta-header-alert.has-hover ? Theme.danger.with-alpha(0.24) : Theme.danger.with-alpha(0.16);
                         border-width: 1px;
@@ -569,10 +582,13 @@ export component MainWindow inherits Window {
                             Rectangle {
                                 width: 6px;
                                 height: 6px;
+                                y: (parent.height - self.height) / 2;
                                 border-radius: 3px;
                                 background: Theme.danger;
                             }
                             Text {
+                                overflow: elide;
+                                min-width: min(self.preferred-width, 260px);
                                 text: root.alert-text;
                                 color: Theme.danger;
                                 font-size: 11px;
@@ -595,6 +611,26 @@ export component MainWindow inherits Window {
                 }
             }
 
+            // 오류 안내는 길 수 있어 상태 띠 아래에 창 너비에 맞춰 줄바꿈해 보여 준다
+            if root.pick-error != "": Rectangle {
+                vertical-stretch: 0;
+                background: Theme.danger-bg;
+                HorizontalLayout {
+                    padding-left: 24px;
+                    padding-right: 24px;
+                    padding-top: 7px;
+                    padding-bottom: 7px;
+                    Text {
+                        text: root.pick-error;
+                        color: Theme.danger;
+                        font-size: 12px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+
             // Main View Area
             VerticalLayout {
                 padding: 24px;
@@ -604,6 +640,7 @@ export component MainWindow inherits Window {
 
                 // Dedicated Active Running Card
                 if root.running.length > 0: Card {
+                    vertical-stretch: 0;
                     border-color: Theme.accent;
                     border-width: 1px;
                     background: Theme.dark ? #121c2e : #eff6ff;
@@ -673,6 +710,7 @@ export component MainWindow inherits Window {
 
                 // Dedicated Job Completion Banner
                 if root.job-completed-show && root.running.length == 0: Card {
+                    vertical-stretch: 0;
                     border-color: root.job-completed-ok ? Theme.ok : Theme.danger;
                     border-width: 1px;
                     background: root.job-completed-ok ? (Theme.dark ? #0f241a : #f0fdf4) : (Theme.dark ? #2a1215 : #fef2f2);
@@ -681,8 +719,8 @@ export component MainWindow inherits Window {
                         spacing: 8px;
                         HorizontalLayout {
                             spacing: 10px;
-                            alignment: center;
                             Rectangle {
+                                y: (parent.height - self.height) / 2;
                                 width: 22px;
                                 height: 22px;
                                 border-radius: 11px;
@@ -702,15 +740,18 @@ export component MainWindow inherits Window {
                                 font-size: 14px;
                                 font-weight: 800;
                                 vertical-alignment: center;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
                             }
-                            Rectangle { horizontal-stretch: 1; }
                             if !root.job-completed-ok: Btn {
+                                horizontal-stretch: 0;
                                 text: "알림 내역 보기";
                                 kind: 2;
                                 height: 28px;
                                 clicked => { root.dismiss-completed(); root.page = 3; root.history-tab = 0; }
                             }
                             Btn {
+                                horizontal-stretch: 0;
                                 text: "확인";
                                 kind: root.job-completed-ok ? 1 : 0;
                                 height: 28px;
@@ -733,91 +774,106 @@ export component MainWindow inherits Window {
                     spacing: 18px;
                     vertical-stretch: 1;
 
-                    Rectangle {
-                        height: 80px;
-                        background: transparent;
-
-                        Text {
-                            x: parent.width - 90px;
-                            y: -24px;
-                            text: "1";
-                            font-size: 130px;
-                            font-weight: 900;
-                            color: Theme.dark ? #ffffff0d : #0000000a;
-                        }
-
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 3px;
-                            Text {
-                                text: "STEP 01  •  BACKUP & PROTECTION";
-                                color: Theme.accent;
-                                font-size: 11px;
-                                font-weight: 700;
-                                letter-spacing: 0.5px;
-                            }
-                            Text {
-                                text: "Welcome";
-                                color: Theme.text;
-                                font-size: 26px;
-                                font-weight: 800;
-                            }
-                            Text {
-                                text: "원클릭으로 PC와 중요 데이터를 안전하게 보호하세요.";
-                                color: Theme.muted;
-                                font-size: 13px;
-                            }
-                        }
-                    }
-
-                    HorizontalLayout {
-                        spacing: 16px;
+                    // 낮은 창에서는 카드 영역만 스크롤하고 아래 시작 버튼 줄은 남긴다
+                    ScrollView {
                         vertical-stretch: 1;
+                        content-width: self.visible-width;
+                        VerticalLayout {
+                            spacing: 18px;
 
-                        ModeCard {
-                            horizontal-stretch: 1;
-                            badge-text: "★ 스마트 추천";
-                            icon-text: "⚡";
-                            title: "스마트 자동 백업";
-                            desc: "문서, 사진, 바탕화면 등 중요 개인 파일만 골라 실시간 증분으로 안전하게 백업합니다.";
-                            f1: "문서 · 사진 · 바탕화면 자동 감지";
-                            f2: "실시간 변경분 초고속 증분 백업";
-                            f3: "랜섬웨어 변조 차단 및 스냅샷 격리";
-                            tag: "★ 스마트 추천 • 일상 백업";
-                            selected: root.sel-mode == 0;
-                            clicked => { root.sel-mode = 0; }
-                        }
+                            Rectangle {
+                                height: 80px;
+                                background: transparent;
 
-                        ModeCard {
-                            horizontal-stretch: 1;
-                            badge-text: "전체 디스크";
-                            icon-text: "🖥️";
-                            title: "PC 전체 통백업";
-                            desc: "윈도우 OS, 프로그램, 설정까지 C: 드라이브 전체를 .qblk 이미지로 통째로 보관합니다.";
-                            f1: "Windows C: 드라이브 전체·증분 이미지";
-                            f2: "이미지 내부 NTFS 파일 직접 탐색·추출";
-                            f3: "부팅 불가 시 WinPE 비상 복원 지원";
-                            tag: "VSS 스냅샷 • 베어메탈 복구";
-                            selected: root.sel-mode == 1;
-                            clicked => { root.sel-mode = 1; }
-                        }
+                                Text {
+                                    x: parent.width - 90px;
+                                    y: -24px;
+                                    text: "1";
+                                    font-size: 130px;
+                                    font-weight: 900;
+                                    color: Theme.dark ? #ffffff0d : #0000000a;
+                                }
 
-                        ModeCard {
-                            horizontal-stretch: 1;
-                            badge-text: "커스텀";
-                            icon-text: "⚙️";
-                            title: "사용자 정의 맞춤";
-                            desc: "백업할 폴더, 제외 확장자, 자동 실행 주기(시간/매일/매주/매월)를 직접 세밀하게 구성합니다.";
-                            f1: "원하는 폴더 및 드라이브 직접 지정";
-                            f2: "제외 확장자 및 세밀한 압축 규칙";
-                            f3: "시간 / 매일 / 매주 / 매월 스케줄 관리";
-                            tag: "고급 설정 • 커스텀 보관";
-                            selected: root.sel-mode == 2;
-                            clicked => { root.sel-mode = 2; }
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 3px;
+                                    Text {
+                                        text: "STEP 01  •  BACKUP & PROTECTION";
+                                        color: Theme.accent;
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        letter-spacing: 0.5px;
+                                    }
+                                    Text {
+                                        text: "Welcome";
+                                        color: Theme.text;
+                                        font-size: 26px;
+                                        font-weight: 800;
+                                    }
+                                    Text {
+                                        text: "원클릭으로 PC와 중요 데이터를 안전하게 보호하세요.";
+                                        color: Theme.muted;
+                                        font-size: 13px;
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 16px;
+                                vertical-stretch: 1;
+
+                                ModeCard {
+                                    horizontal-stretch: 1;
+                                    badge-text: "★ 스마트 추천";
+                                    icon-text: "⚡";
+                                    title: "스마트 자동 백업";
+                                    desc: "문서, 사진, 바탕화면 등 중요 개인 파일만 골라 실시간 증분으로 안전하게 백업합니다.";
+                                    f1: "문서 · 사진 · 바탕화면 자동 감지";
+                                    f2: "실시간 변경분 초고속 증분 백업";
+                                    f3: "랜섬웨어 변조 차단 및 스냅샷 격리";
+                                    tag: "★ 스마트 추천 • 일상 백업";
+                                    tight: root.narrow;
+                                    min-height: root.compact ? 400px : 350px;
+                                    selected: root.sel-mode == 0;
+                                    clicked => { root.sel-mode = 0; }
+                                }
+
+                                ModeCard {
+                                    horizontal-stretch: 1;
+                                    badge-text: "전체 디스크";
+                                    icon-text: "🖥️";
+                                    title: "PC 전체 통백업";
+                                    desc: "윈도우 OS, 프로그램, 설정까지 C: 드라이브 전체를 .qblk 이미지로 통째로 보관합니다.";
+                                    f1: "Windows C: 드라이브 전체·증분 이미지";
+                                    f2: "이미지 내부 NTFS 파일 직접 탐색·추출";
+                                    f3: "부팅 불가 시 WinPE 비상 복원 지원";
+                                    tag: "VSS 스냅샷 • 베어메탈 복구";
+                                    tight: root.narrow;
+                                    min-height: root.compact ? 400px : 350px;
+                                    selected: root.sel-mode == 1;
+                                    clicked => { root.sel-mode = 1; }
+                                }
+
+                                ModeCard {
+                                    horizontal-stretch: 1;
+                                    badge-text: "커스텀";
+                                    icon-text: "⚙️";
+                                    title: "사용자 정의 맞춤";
+                                    desc: "백업할 폴더, 제외 확장자, 자동 실행 주기(시간/매일/매주/매월)를 직접 세밀하게 구성합니다.";
+                                    f1: "원하는 폴더 및 드라이브 직접 지정";
+                                    f2: "제외 확장자 및 세밀한 압축 규칙";
+                                    f3: "시간 / 매일 / 매주 / 매월 스케줄 관리";
+                                    tag: "고급 설정 • 커스텀 보관";
+                                    tight: root.narrow;
+                                    min-height: root.compact ? 400px : 350px;
+                                    selected: root.sel-mode == 2;
+                                    clicked => { root.sel-mode = 2; }
+                                }
+                            }
+
+                            Rectangle { vertical-stretch: 1; }
                         }
                     }
-
-                    Rectangle { vertical-stretch: 1; }
 
                     if root.wz-text != "": Text { text: root.wz-text; color: Theme.warn; font-size: 13px; wrap: word-wrap; }
 
@@ -895,9 +951,10 @@ export component MainWindow inherits Window {
                 // PAGE 1: PROFILES & SCHEDULE (CUSTOM)
                 // ═══════════════════════════════════════════════════════════
                 if root.page == 1: ScrollView {
-                    content-width: self.width;
+                    content-width: self.visible-width;
                     VerticalLayout {
                         spacing: 14px;
+                        alignment: start;
 
                         HorizontalLayout {
                             spacing: 12px;
@@ -1010,8 +1067,8 @@ export component MainWindow inherits Window {
                                                 padding-left: 12px;
                                                 padding-right: 12px;
                                                 spacing: 8px;
-                                                Text { text: p.name; color: Theme.text; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                                                Text { text: p.checked ? "선택됨" : p.sub; color: p.checked ? Theme.accent : Theme.muted; font-size: 12px; vertical-alignment: center; }
+                                                Text { text: p.name; color: Theme.text; font-size: 13px; vertical-alignment: center; overflow: elide; min-width: min(self.preferred-width, 220px); }
+                                                Text { text: p.checked ? "선택됨" : p.sub; color: p.checked ? Theme.accent : Theme.muted; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; overflow: elide; horizontal-stretch: 1; }
                                             }
                                             TouchArea { clicked => { root.prog-toggle(i); } }
                                         }
@@ -1109,22 +1166,26 @@ export component MainWindow inherits Window {
                                     background: Theme.bg-subtle;
                                     VerticalLayout {
                                         padding: 12px;
-                                        spacing: 10px;
-                                        HorizontalLayout {
+                                        GridLayout {
                                             spacing: 10px;
-                                            Text { text: "보관 개수"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
-                                            Field { text <=> root.form-count; width: 70px; }
-                                            Text { text: "보관 일수"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
-                                            Field { text <=> root.form-days; width: 70px; }
-                                            Text { text: "일 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
-                                            Field { text <=> root.form-daily; width: 60px; }
-                                            Text { text: "주 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
-                                            Field { text <=> root.form-weekly; width: 60px; }
-                                            Text { text: "월 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
-                                            Field { text <=> root.form-monthly; width: 60px; }
-                                            Text { text: "연 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
-                                            Field { text <=> root.form-yearly; width: 60px; }
-                                            Rectangle { horizontal-stretch: 1; }
+                                            Row {
+                                                Text { text: "보관 개수"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+                                                Field { text <=> root.form-count; width: 70px; }
+                                                Text { text: "보관 일수"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+                                                Field { text <=> root.form-days; width: 70px; }
+                                                Text { text: "일 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+                                                Field { text <=> root.form-daily; width: 70px; }
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
+                                            Row {
+                                                Text { text: "주 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+                                                Field { text <=> root.form-weekly; width: 70px; }
+                                                Text { text: "월 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+                                                Field { text <=> root.form-monthly; width: 70px; }
+                                                Text { text: "연 단위 보존"; color: Theme.text-sub; font-size: 12px; vertical-alignment: center; }
+                                                Field { text <=> root.form-yearly; width: 70px; }
+                                                Rectangle { horizontal-stretch: 1; }
+                                            }
                                         }
                                     }
                                 }
@@ -1170,296 +1231,420 @@ export component MainWindow inherits Window {
                 // ═══════════════════════════════════════════════════════════
                 // PAGE 2: RESTORE, SEARCH & SNAPSHOT DIFF
                 // ═══════════════════════════════════════════════════════════
-                if root.page == 2: VerticalLayout {
-                    spacing: 12px;
+                if root.page == 2: ScrollView {
+                    content-width: self.visible-width;
+                    VerticalLayout {
+                        spacing: 12px;
 
-                    Rectangle {
-                        height: 76px;
-                        background: transparent;
+                        if !root.short: Rectangle {
+                            height: 76px;
+                            background: transparent;
 
-                        Text {
-                            x: parent.width - 90px;
-                            y: -24px;
-                            text: "2";
-                            font-size: 130px;
-                            font-weight: 900;
-                            color: Theme.dark ? #ffffff0d : #0000000a;
-                        }
-
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 3px;
                             Text {
-                                text: "STEP 02  •  POINT-IN-TIME RESTORE";
-                                color: Theme.accent;
-                                font-size: 11px;
-                                font-weight: 700;
-                                letter-spacing: 0.5px;
+                                x: parent.width - 90px;
+                                y: -24px;
+                                text: "2";
+                                font-size: 130px;
+                                font-weight: 900;
+                                color: Theme.dark ? #ffffff0d : #0000000a;
                             }
-                            Text {
-                                text: "Restore";
-                                color: Theme.text;
-                                font-size: 26px;
-                                font-weight: 800;
-                            }
-                            Text {
-                                text: "보관된 시점별 스냅샷에서 필요한 파일과 폴더를 비교하고 안전하게 되돌립니다.";
-                                color: Theme.muted;
-                                font-size: 13px;
-                            }
-                        }
-                    }
 
-                    // Destination Mode & Optional Recovery Code Card
-                    Card {
-                        VerticalLayout {
-                            padding: 16px;
-                            spacing: 10px;
-                            HorizontalLayout {
-                                Heading { text: "파일 되돌리기 (복원 모드)"; }
-                                Rectangle { horizontal-stretch: 1; }
-                                Btn {
-                                    text: "저장소 정리 (GC / 조각 모음)";
-                                    height: 32px;
-                                    clicked => { root.run-gc(root.form-id); }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 3px;
+                                Text {
+                                    text: "STEP 02  •  POINT-IN-TIME RESTORE";
+                                    color: Theme.accent;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    letter-spacing: 0.5px;
+                                }
+                                Text {
+                                    text: "Restore";
+                                    color: Theme.text;
+                                    font-size: 26px;
+                                    font-weight: 800;
+                                }
+                                Text {
+                                    text: "보관된 시점별 스냅샷에서 필요한 파일과 폴더를 비교하고 안전하게 되돌립니다.";
+                                    color: Theme.muted;
+                                    font-size: 13px;
                                 }
                             }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                Btn {
-                                    text: "📂 원래 자리에 되돌리기 (기본)";
-                                    kind: root.restore-orig ? 1 : 0;
-                                    clicked => { root.restore-orig = true; root.snap-pending = ""; root.browse-confirm = false; }
+                        }
+
+                        // Destination Mode & Optional Recovery Code Card
+                        Card {
+                            vertical-stretch: 0;
+                            VerticalLayout {
+                                padding: root.short ? 12px : 16px;
+                                spacing: root.short ? 8px : 10px;
+                                HorizontalLayout {
+                                    Heading { text: "파일 되돌리기 (복원 모드)"; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Btn {
+                                        text: "저장소 정리 (GC / 조각 모음)";
+                                        height: 32px;
+                                        clicked => { root.run-gc(root.form-id); }
+                                    }
                                 }
-                                Btn {
-                                    text: "📁 다른 폴더에 따로 꺼내기";
-                                    kind: root.restore-orig ? 0 : 1;
-                                    clicked => { root.restore-orig = false; root.snap-pending = ""; root.browse-confirm = false; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Btn {
+                                        text: "📂 원래 자리에 되돌리기 (기본)";
+                                        kind: root.restore-orig ? 1 : 0;
+                                        clicked => { root.restore-orig = true; root.snap-pending = ""; root.browse-confirm = false; }
+                                    }
+                                    Btn {
+                                        text: "📁 다른 폴더에 따로 꺼내기";
+                                        kind: root.restore-orig ? 0 : 1;
+                                        clicked => { root.restore-orig = false; root.snap-pending = ""; root.browse-confirm = false; }
+                                    }
                                 }
                                 Field {
                                     text <=> root.restore-recovery-code;
                                     secret: true;
                                     placeholder: "암호화 저장소 복구 코드 (일반 사용자 복원 시 선택 입력)";
-                                    horizontal-stretch: 1;
                                 }
-                            }
-                            if root.restore-orig: Hint { text: "백업했던 원래 경로로 파일을 복원합니다. 동일한 파일이 존재하는 경우 덮어쓰기 전에 최종 확인합니다."; }
-                            if !root.restore-orig: PathField { text <=> root.restore-folder; target: "restore-folder"; placeholder: "복원할 파일을 안전하게 보관할 새 폴더 경로"; pick(k, t) => { root.browse(k, t); } }
-                        }
-                    }
-
-                    // Snapshot Diff Viewer (Sub-view)
-                    if root.diff-open: VerticalLayout {
-                        spacing: 10px;
-                        vertical-stretch: 1;
-
-                        Card {
-                            height: 52px;
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                spacing: 10px;
-                                Btn { text: "← 목록으로"; y: 10px; clicked => { root.diff-open = false; } }
-                                Text {
-                                    text: "변경 내역(Diff): " + root.diff-title;
-                                    color: Theme.text;
-                                    font-size: 13px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                if root.diff-summary != "": Badge { text: root.diff-summary; tone: Theme.accent; y: 14px; }
+                                if root.restore-orig: Hint { text: "백업했던 원래 경로로 파일을 복원합니다. 동일한 파일이 존재하는 경우 덮어쓰기 전에 최종 확인합니다."; }
+                                if !root.restore-orig: PathField { text <=> root.restore-folder; target: "restore-folder"; placeholder: "복원할 파일을 안전하게 보관할 새 폴더 경로"; pick(k, t) => { root.browse(k, t); } }
                             }
                         }
 
-                        Card {
+                        // Snapshot Diff Viewer (Sub-view)
+                        if root.diff-open: VerticalLayout {
+                            spacing: 10px;
                             vertical-stretch: 1;
-                            if root.diff-items.length == 0: Text {
-                                text: root.diff-status != "" ? root.diff-status : "이전 스냅샷과 달라진 항목이 없습니다.";
+
+                            Card {
+                                height: 52px;
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 10px;
+                                    Btn { text: "← 목록으로"; y: 10px; clicked => { root.diff-open = false; } }
+                                    Text {
+                                        text: "변경 내역(Diff): " + root.diff-title;
+                                        color: Theme.text;
+                                        font-size: 13px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    if root.diff-summary != "": Badge { text: root.diff-summary; tone: Theme.accent; y: 14px; }
+                                }
+                            }
+
+                            Card {
+                                vertical-stretch: 1;
+                                min-height: 160px;
+                                if root.diff-items.length == 0: Text {
+                                    text: root.diff-status != "" ? root.diff-status : "이전 스냅샷과 달라진 항목이 없습니다.";
+                                    color: Theme.muted;
+                                    font-size: 13px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                if root.diff-items.length > 0: ListView {
+                                    for d in root.diff-items: Rectangle {
+                                        height: 36px;
+                                        HorizontalLayout {
+                                            padding-left: 14px;
+                                            padding-right: 14px;
+                                            spacing: 10px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Badge {
+                                                    text: d.kind == "+" ? "+ 추가" : (d.kind == "~" ? "~ 수정" : "- 삭제");
+                                                    tone: d.kind == "+" ? Theme.ok : (d.kind == "~" ? Theme.warn : Theme.danger);
+                                                }
+                                            }
+                                            Text {
+                                                text: d.path;
+                                                color: d.kind == "+" ? Theme.ok : (d.kind == "~" ? Theme.warn : Theme.danger);
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            Text {
+                                                text: d.detail;
+                                                color: Theme.muted;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: right;
+                                                width: 150px;
+                                            }
+                                        }
+                                        Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                                    }
+                                }
+                            }
+
+                            if root.diff-status != "": Hint { text: root.diff-status; }
+                        }
+
+                        // File Browser View (Sub-view)
+                        if root.browse-open && !root.diff-open: VerticalLayout {
+                            spacing: 10px;
+                            vertical-stretch: 1;
+
+                            Card {
+                                height: 48px;
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 8px;
+                                    Btn { text: "← 목록으로"; clicked => { root.browse-open = false; root.browse-confirm = false; } }
+                                    Btn { text: "상위 폴더"; clicked => { root.browse-up(); } }
+                                    Text { text: root.browse-title + "  /  " + root.browse-dir; color: Theme.text; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                    bq := Field { placeholder: "파일 검색"; width: 180px; }
+                                    Btn { text: "검색"; clicked => { root.browse-search(bq.text); } }
+                                }
+                            }
+
+                            Card {
+                                vertical-stretch: 1;
+                                min-height: 160px;
+                                ListView {
+                                    for it in root.browse-items: Rectangle {
+                                        height: 38px;
+                                        HorizontalLayout {
+                                            padding-left: 14px;
+                                            padding-right: 14px;
+                                            spacing: 10px;
+
+                                            Rectangle {
+                                                width: 18px;
+                                                height: 18px;
+                                                y: 10px;
+                                                border-radius: 4px;
+                                                border-width: 1px;
+                                                border-color: it.selected ? Theme.accent : Theme.line;
+                                                background: it.selected ? Theme.accent : transparent;
+                                                Text { text: it.selected ? "●" : ""; color: #ffffff; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                                                TouchArea { clicked => { root.browse-toggle(it.path); } }
+                                            }
+
+                                            Rectangle {
+                                                horizontal-stretch: 1;
+                                                Text {
+                                                    text: (it.is-dir ? "📁 " : "📄 ") + it.name;
+                                                    color: it.is-dir ? Theme.accent : Theme.text;
+                                                    font-size: 13px;
+                                                    font-weight: it.is-dir ? 700 : 400;
+                                                    vertical-alignment: center;
+                                                    overflow: elide;
+                                                    width: parent.width;
+                                                }
+                                                TouchArea { clicked => { if (it.is-dir) { root.browse-go(it.path); } else { root.browse-toggle(it.path); } } }
+                                            }
+
+                                            Text { text: it.info; color: Theme.muted; font-size: 12px; width: 140px; horizontal-alignment: right; vertical-alignment: center; }
+                                        }
+                                        Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                                    }
+                                }
+                            }
+
+                            Card {
+                                height: 50px;
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 16px;
+                                    spacing: 12px;
+                                    Text {
+                                        text: root.browse-status != "" ? root.browse-status : "폴더를 클릭하면 탐색하며, 복원할 항목을 체크박스로 선택하세요.";
+                                        color: Theme.muted;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    Badge { text: root.browse-selected + "개 선택됨"; tone: Theme.accent; y: 13px; }
+                                    Btn {
+                                        text: !root.restore-orig ? "체크한 파일 꺼내기" : root.browse-confirm ? "⚠️ 최종 덮어쓰기 확인" : "선택 파일 되돌리기";
+                                        kind: root.restore-orig && root.browse-confirm ? 2 : 1;
+                                        y: 9px;
+                                        clicked => {
+                                            if (!root.restore-orig) {
+                                                root.browse-restore(root.restore-folder);
+                                            } else if (root.browse-confirm) {
+                                                root.browse-confirm = false;
+                                                root.browse-restore("@원래자리");
+                                            } else {
+                                                root.browse-confirm = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Cross-Snapshot Global Search
+                        if !root.browse-open && !root.diff-open: Card {
+                            vertical-stretch: 0;
+                            VerticalLayout {
+                                padding: root.short ? 10px : 14px;
+                                spacing: 8px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Field { text <=> root.global-query; placeholder: "전체 스냅샷 통합 파일 검색 (파일명·초성 지원, 예: 보고서 / ㅂㄱㅅ)"; horizontal-stretch: 1; }
+                                    Btn { text: "전체 검색"; kind: 1; clicked => { root.global-search(root.global-query); } }
+                                }
+                                if root.global-status != "": Hint { text: root.global-status; }
+                                if root.global-results.length > 0: ListView {
+                                    height: min(root.global-results.length * 46px, root.short ? 92px : 210px);
+                                    for g in root.global-results: Rectangle {
+                                        height: 46px;
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 8px;
+                                            spacing: 10px;
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                alignment: center;
+                                                spacing: 2px;
+                                                Text { text: "📄 " + g.filename; color: Theme.text; font-size: 13px; font-weight: 600; overflow: elide; }
+                                                Text { text: g.rel-path + " · " + g.info; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                            }
+                                            Badge { text: g.versions; tone: Theme.accent; y: 11px; }
+                                            Btn { text: "이 시점 열기"; height: 28px; y: 9px; clicked => { root.browse-confirm = false; root.diff-open = false; root.browse-open = true; root.open-browse(g.repo, g.snapshot-id, g.snapshot-id); } }
+                                            Btn {
+                                                text: !root.restore-orig ? "꺼내기" : root.snap-pending == "G" + g.repo + g.snapshot-id + g.rel-path ? "정말 덮어쓰기" : "원래 자리 복원";
+                                                kind: root.restore-orig && root.snap-pending == "G" + g.repo + g.snapshot-id + g.rel-path ? 2 : 1;
+                                                height: 28px;
+                                                y: 9px;
+                                                clicked => {
+                                                    if (!root.restore-orig) {
+                                                        root.snap-pending = "";
+                                                        root.global-restore(g.repo, g.snapshot-id, g.rel-path, root.restore-folder);
+                                                    } else if (root.snap-pending == "G" + g.repo + g.snapshot-id + g.rel-path) {
+                                                        root.snap-pending = "";
+                                                        root.global-restore(g.repo, g.snapshot-id, g.rel-path, "@원래자리");
+                                                    } else {
+                                                        root.snap-pending = "G" + g.repo + g.snapshot-id + g.rel-path;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Snapshots List
+                        if !root.browse-open && !root.diff-open: Card {
+                            vertical-stretch: 1;
+                            min-height: 180px;
+                            if root.snapshots.length == 0: Text {
+                                text: "보관된 백업 스냅샷이 없습니다. 홈 화면에서 먼저 백업을 생성하세요.";
                                 color: Theme.muted;
                                 font-size: 13px;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            if root.diff-items.length > 0: ListView {
-                                for d in root.diff-items: Rectangle {
-                                    height: 36px;
-                                    HorizontalLayout {
-                                        padding-left: 14px;
-                                        padding-right: 14px;
-                                        spacing: 10px;
-                                        VerticalLayout {
-                                            alignment: center;
-                                            Badge {
-                                                text: d.kind == "+" ? "+ 추가" : (d.kind == "~" ? "~ 수정" : "- 삭제");
-                                                tone: d.kind == "+" ? Theme.ok : (d.kind == "~" ? Theme.warn : Theme.danger);
-                                            }
-                                        }
-                                        Text {
-                                            text: d.path;
-                                            color: d.kind == "+" ? Theme.ok : (d.kind == "~" ? Theme.warn : Theme.danger);
-                                            font-size: 13px;
-                                            vertical-alignment: center;
-                                            overflow: elide;
-                                            horizontal-stretch: 1;
-                                        }
-                                        Text {
-                                            text: d.detail;
-                                            color: Theme.muted;
-                                            font-size: 12px;
-                                            vertical-alignment: center;
-                                            horizontal-alignment: right;
-                                            width: 150px;
-                                        }
-                                    }
-                                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
-                                }
-                            }
-                        }
-
-                        if root.diff-status != "": Hint { text: root.diff-status; }
-                    }
-
-                    // File Browser View (Sub-view)
-                    if root.browse-open && !root.diff-open: VerticalLayout {
-                        spacing: 10px;
-                        vertical-stretch: 1;
-
-                        Card {
-                            height: 48px;
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                spacing: 8px;
-                                Btn { text: "← 목록으로"; clicked => { root.browse-open = false; root.browse-confirm = false; } }
-                                Btn { text: "상위 폴더"; clicked => { root.browse-up(); } }
-                                Text { text: root.browse-title + "  /  " + root.browse-dir; color: Theme.text; font-size: 13px; font-weight: 600; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                                bq := Field { placeholder: "파일 검색"; width: 180px; }
-                                Btn { text: "검색"; clicked => { root.browse-search(bq.text); } }
-                            }
-                        }
-
-                        Card {
-                            vertical-stretch: 1;
                             ListView {
-                                for it in root.browse-items: Rectangle {
-                                    height: 38px;
+                                for s in root.snapshots: Rectangle {
+                                    height: root.compact ? 88px : 52px;
+                                    // 넓은 창: 버튼 왼쪽 / 좁은 창: 버튼 윗줄
                                     HorizontalLayout {
-                                        padding-left: 14px;
-                                        padding-right: 14px;
+                                        x: 0px;
+                                        y: 0px;
+                                        width: root.compact ? parent.width : parent.width - snap-tools.preferred-width;
+                                        height: root.compact ? 44px : parent.height;
+                                        padding-left: 16px;
+                                        padding-right: root.compact ? 16px : 10px;
                                         spacing: 10px;
 
-                                        Rectangle {
-                                            width: 18px;
-                                            height: 18px;
-                                            y: 10px;
-                                            border-radius: 4px;
-                                            border-width: 1px;
-                                            border-color: it.selected ? Theme.accent : Theme.line;
-                                            background: it.selected ? Theme.accent : transparent;
-                                            Text { text: it.selected ? "●" : ""; color: #ffffff; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
-                                            TouchArea { clicked => { root.browse-toggle(it.path); } }
-                                        }
+                                        Text { text: s.when; color: Theme.text; width: 84px; font-size: 13px; font-weight: 600; vertical-alignment: center; }
 
-                                        Rectangle {
-                                            horizontal-stretch: 1;
-                                            Text {
-                                                text: (it.is-dir ? "📁 " : "📄 ") + it.name;
-                                                color: it.is-dir ? Theme.accent : Theme.text;
-                                                font-size: 13px;
-                                                font-weight: it.is-dir ? 700 : 400;
-                                                vertical-alignment: center;
-                                                overflow: elide;
-                                                width: parent.width;
-                                            }
-                                            TouchArea { clicked => { if (it.is-dir) { root.browse-go(it.path); } else { root.browse-toggle(it.path); } } }
-                                        }
-
-                                        Text { text: it.info; color: Theme.muted; font-size: 12px; width: 140px; horizontal-alignment: right; vertical-alignment: center; }
-                                    }
-                                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
-                                }
-                            }
-                        }
-
-                        Card {
-                            height: 50px;
-                            HorizontalLayout {
-                                padding-left: 16px;
-                                padding-right: 16px;
-                                spacing: 12px;
-                                Text {
-                                    text: root.browse-status != "" ? root.browse-status : "폴더를 클릭하면 탐색하며, 복원할 항목을 체크박스로 선택하세요.";
-                                    color: Theme.muted;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                    overflow: elide;
-                                }
-                                Badge { text: root.browse-selected + "개 선택됨"; tone: Theme.accent; y: 13px; }
-                                Btn {
-                                    text: !root.restore-orig ? "체크한 파일 꺼내기" : root.browse-confirm ? "⚠️ 최종 덮어쓰기 확인" : "선택 파일 되돌리기";
-                                    kind: root.restore-orig && root.browse-confirm ? 2 : 1;
-                                    y: 9px;
-                                    clicked => {
-                                        if (!root.restore-orig) {
-                                            root.browse-restore(root.restore-folder);
-                                        } else if (root.browse-confirm) {
-                                            root.browse-confirm = false;
-                                            root.browse-restore("@원래자리");
-                                        } else {
-                                            root.browse-confirm = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Cross-Snapshot Global Search
-                    if !root.browse-open && !root.diff-open: Card {
-                        VerticalLayout {
-                            padding: 14px;
-                            spacing: 8px;
-                            HorizontalLayout {
-                                spacing: 8px;
-                                Field { text <=> root.global-query; placeholder: "전체 스냅샷 통합 파일 검색 (파일명·초성 지원, 예: 보고서 / ㅂㄱㅅ)"; horizontal-stretch: 1; }
-                                Btn { text: "전체 검색"; kind: 1; clicked => { root.global-search(root.global-query); } }
-                            }
-                            if root.global-status != "": Hint { text: root.global-status; }
-                            if root.global-results.length > 0: ListView {
-                                height: min(root.global-results.length * 46px, 210px);
-                                for g in root.global-results: Rectangle {
-                                    height: 46px;
-                                    HorizontalLayout {
-                                        padding-left: 8px;
-                                        padding-right: 8px;
-                                        spacing: 10px;
                                         VerticalLayout {
                                             horizontal-stretch: 1;
                                             alignment: center;
                                             spacing: 2px;
-                                            Text { text: "📄 " + g.filename; color: Theme.text; font-size: 13px; font-weight: 600; overflow: elide; }
-                                            Text { text: g.rel-path + " · " + g.info; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                            Text { text: s.name; color: Theme.text; font-size: 13px; font-weight: 700; overflow: elide; }
+                                            Text { text: s.summary; color: Theme.muted; font-size: 12px; overflow: elide; }
                                         }
-                                        Badge { text: g.versions; tone: Theme.accent; y: 11px; }
-                                        Btn { text: "이 시점 열기"; height: 28px; y: 9px; clicked => { root.browse-confirm = false; root.diff-open = false; root.browse-open = true; root.open-browse(g.repo, g.snapshot-id, g.snapshot-id); } }
-                                        Btn {
-                                            text: !root.restore-orig ? "꺼내기" : root.snap-pending == "G" + g.repo + g.snapshot-id + g.rel-path ? "정말 덮어쓰기" : "원래 자리 복원";
-                                            kind: root.restore-orig && root.snap-pending == "G" + g.repo + g.snapshot-id + g.rel-path ? 2 : 1;
-                                            height: 28px;
-                                            y: 9px;
-                                            clicked => {
-                                                if (!root.restore-orig) {
-                                                    root.snap-pending = "";
-                                                    root.global-restore(g.repo, g.snapshot-id, g.rel-path, root.restore-folder);
-                                                } else if (root.snap-pending == "G" + g.repo + g.snapshot-id + g.rel-path) {
-                                                    root.snap-pending = "";
-                                                    root.global-restore(g.repo, g.snapshot-id, g.rel-path, "@원래자리");
-                                                } else {
-                                                    root.snap-pending = "G" + g.repo + g.snapshot-id + g.rel-path;
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            horizontal-stretch: 0;
+                                            Badge {
+                                                text: s.verified == "오류 있음" ? "오류 있음" : s.verified == "미검증" || s.verified == "" ? "미검증" : "무결성 검증";
+                                                tone: s.verified == "오류 있음" ? Theme.danger : s.verified == "미검증" || s.verified == "" ? Theme.muted : Theme.ok;
+                                            }
+                                        }
+
+                                    }
+
+                                    snap-tools := HorizontalLayout {
+                                        x: parent.width - self.width;
+                                        y: root.compact ? 40px : 0px;
+                                        width: self.preferred-width;
+                                        height: root.compact ? 44px : parent.height;
+                                        padding-right: 16px;
+                                        spacing: 10px;
+
+                                        if s.verified == "미검증" || s.verified == "" || s.verified == "오류 있음": VerticalLayout {
+                                            alignment: center;
+                                            Btn {
+                                                text: s.verified == "오류 있음" ? "🔍 다시 검사" : "🔍 검사";
+                                                height: 32px;
+                                                clicked => { root.run-verify(s.profile-id != "" ? s.profile-id : s.id, s.id); }
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Btn {
+                                                text: "변경 내역(Diff)";
+                                                height: 32px;
+                                                clicked => { root.diff-snapshot(s.repo, s.id, s.when); }
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Btn { text: "파일 탐색"; height: 32px; clicked => { root.browse-confirm = false; root.diff-open = false; root.browse-open = true; root.open-browse(s.repo, s.id, s.when); } }
+                                        }
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Btn {
+                                                text: !root.restore-orig ? "전부 꺼내기" : root.snap-pending == "R" + s.repo + s.id ? "정말 덮어쓰기" : "전체 되돌리기";
+                                                kind: root.restore-orig && root.snap-pending == "R" + s.repo + s.id ? 2 : 1;
+                                                height: 32px;
+                                                clicked => {
+                                                    if (!root.restore-orig) {
+                                                        root.snap-pending = "";
+                                                        root.restore-snapshot(s.repo, s.id, root.restore-folder);
+                                                    } else if (root.snap-pending == "R" + s.repo + s.id) {
+                                                        root.snap-pending = "";
+                                                        root.restore-inplace(s.repo, s.id);
+                                                    } else {
+                                                        root.snap-pending = "R" + s.repo + s.id;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Btn {
+                                                text: root.snap-pending == "D" + s.repo + s.id ? "삭제 확인" : "삭제";
+                                                kind: 2;
+                                                height: 32px;
+                                                clicked => {
+                                                    if (root.snap-pending == "D" + s.repo + s.id) {
+                                                        root.snap-pending = "";
+                                                        root.delete-snapshot(s.repo, s.id);
+                                                    } else {
+                                                        root.snap-pending = "D" + s.repo + s.id;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1468,110 +1653,8 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
+                        if root.restore-text != "": Text { text: root.restore-text; color: Theme.warn; font-size: 13px; wrap: word-wrap; }
                     }
-
-                    // Snapshots List
-                    if !root.browse-open && !root.diff-open: Card {
-                        vertical-stretch: 1;
-                        if root.snapshots.length == 0: Text {
-                            text: "보관된 백업 스냅샷이 없습니다. 홈 화면에서 먼저 백업을 생성하세요.";
-                            color: Theme.muted;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                        ListView {
-                            for s in root.snapshots: Rectangle {
-                                height: 52px;
-                                HorizontalLayout {
-                                    padding-left: 16px;
-                                    padding-right: 16px;
-                                    spacing: 10px;
-
-                                    Text { text: s.when; color: Theme.text; width: 84px; font-size: 13px; font-weight: 600; vertical-alignment: center; }
-
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        alignment: center;
-                                        spacing: 2px;
-                                        Text { text: s.name; color: Theme.text; font-size: 13px; font-weight: 700; overflow: elide; }
-                                        Text { text: s.summary; color: Theme.muted; font-size: 12px; overflow: elide; }
-                                    }
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        horizontal-stretch: 0;
-                                        Badge {
-                                            text: s.verified == "오류 있음" ? "오류 있음" : s.verified == "미검증" || s.verified == "" ? "미검증" : "무결성 검증";
-                                            tone: s.verified == "오류 있음" ? Theme.danger : s.verified == "미검증" || s.verified == "" ? Theme.muted : Theme.ok;
-                                        }
-                                    }
-
-                                    if s.verified == "미검증" || s.verified == "" || s.verified == "오류 있음": VerticalLayout {
-                                        alignment: center;
-                                        Btn {
-                                            text: s.verified == "오류 있음" ? "🔍 다시 검사" : "🔍 검사";
-                                            height: 32px;
-                                            clicked => { root.run-verify(s.profile-id != "" ? s.profile-id : s.id, s.id); }
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Btn {
-                                            text: "변경 내역(Diff)";
-                                            height: 32px;
-                                            clicked => { root.diff-snapshot(s.repo, s.id, s.when); }
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Btn { text: "파일 탐색"; height: 32px; clicked => { root.browse-confirm = false; root.diff-open = false; root.browse-open = true; root.open-browse(s.repo, s.id, s.when); } }
-                                    }
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Btn {
-                                            text: !root.restore-orig ? "전부 꺼내기" : root.snap-pending == "R" + s.repo + s.id ? "정말 덮어쓰기" : "전체 되돌리기";
-                                            kind: root.restore-orig && root.snap-pending == "R" + s.repo + s.id ? 2 : 1;
-                                            height: 32px;
-                                            clicked => {
-                                                if (!root.restore-orig) {
-                                                    root.snap-pending = "";
-                                                    root.restore-snapshot(s.repo, s.id, root.restore-folder);
-                                                } else if (root.snap-pending == "R" + s.repo + s.id) {
-                                                    root.snap-pending = "";
-                                                    root.restore-inplace(s.repo, s.id);
-                                                } else {
-                                                    root.snap-pending = "R" + s.repo + s.id;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Btn {
-                                            text: root.snap-pending == "D" + s.repo + s.id ? "삭제 확인" : "삭제";
-                                            kind: 2;
-                                            height: 32px;
-                                            clicked => {
-                                                if (root.snap-pending == "D" + s.repo + s.id) {
-                                                    root.snap-pending = "";
-                                                    root.delete-snapshot(s.repo, s.id);
-                                                } else {
-                                                    root.snap-pending = "D" + s.repo + s.id;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
-                            }
-                        }
-                    }
-                    if root.restore-text != "": Text { text: root.restore-text; color: Theme.warn; font-size: 13px; wrap: word-wrap; }
                 }
 
                 // ═══════════════════════════════════════════════════════════
@@ -1580,27 +1663,43 @@ export component MainWindow inherits Window {
                 if root.page == 3: VerticalLayout {
                     spacing: 12px;
 
-                    HorizontalLayout {
-                        spacing: 10px;
-                        alignment: start;
-                        Btn { text: "← 돌아가기"; clicked => { root.page = 0; } }
-                        Heading { text: "알림 및 작업 실행 이력"; vertical-alignment: center; }
-                        Rectangle { horizontal-stretch: 1; }
-                        Btn {
-                            text: "알림 내역";
-                            kind: root.history-tab == 0 ? 1 : 0;
-                            clicked => { root.history-tab = 0; }
+                    // 좁은 창에서는 보기 전환 버튼을 둘째 줄로 내린다
+                    Rectangle {
+                        vertical-stretch: 0;
+                        height: root.compact ? 72px : 32px;
+
+                        history-title := HorizontalLayout {
+                            x: 0px;
+                            y: 0px;
+                            width: self.preferred-width;
+                            height: 32px;
+                            spacing: 10px;
+                            Btn { text: "← 돌아가기"; clicked => { root.page = 0; } }
+                            Heading { text: "알림 및 작업 실행 이력"; vertical-alignment: center; }
                         }
-                        Btn {
-                            text: "작업 실행 이력";
-                            kind: root.history-tab == 1 ? 1 : 0;
-                            clicked => {
-                                root.history-tab = 1;
-                                root.load-job-history();
+
+                        HorizontalLayout {
+                            x: root.compact ? 0px : history-title.width + 10px;
+                            y: root.compact ? 40px : 0px;
+                            width: self.preferred-width;
+                            height: 32px;
+                            spacing: 10px;
+                            Btn {
+                                text: "알림 내역";
+                                kind: root.history-tab == 0 ? 1 : 0;
+                                clicked => { root.history-tab = 0; }
                             }
+                            Btn {
+                                text: "작업 실행 이력";
+                                kind: root.history-tab == 1 ? 1 : 0;
+                                clicked => {
+                                    root.history-tab = 1;
+                                    root.load-job-history();
+                                }
+                            }
+                            if root.history-tab == 0: Btn { text: "알림 모두 확인 완료"; kind: 1; clicked => { root.ack-alerts(); } }
+                            if root.history-tab == 1: Btn { text: "새로고침"; clicked => { root.load-job-history(); } }
                         }
-                        if root.history-tab == 0: Btn { text: "알림 모두 확인 완료"; kind: 1; clicked => { root.ack-alerts(); } }
-                        if root.history-tab == 1: Btn { text: "새로고침"; clicked => { root.load-job-history(); } }
                     }
 
                     // Tab 0: Alerts
@@ -1674,7 +1773,28 @@ export component MainWindow inherits Window {
                         if root.job-history.length > 0: ListView {
                             for j in root.job-history: Rectangle {
                                 height: 52px;
-                                HorizontalLayout {
+                                if root.compact: HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    spacing: 12px;
+                                    Text { text: j.when; color: Theme.muted; width: 120px; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Badge { text: j.ok ? "성공" : "실패"; tone: j.ok ? Theme.ok : Theme.danger; }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text { text: j.profile; color: Theme.text; font-size: 13px; font-weight: 700; overflow: elide; horizontal-stretch: 1; }
+                                            Text { text: j.kind; color: Theme.accent; font-size: 12px; font-weight: 600; }
+                                        }
+                                        Text { text: j.message == "" ? j.summary : j.summary + " · " + j.message; color: Theme.muted; font-size: 12px; overflow: elide; }
+                                    }
+                                }
+                                if !root.compact: HorizontalLayout {
                                     padding-left: 14px;
                                     padding-right: 14px;
                                     spacing: 12px;
@@ -1699,9 +1819,10 @@ export component MainWindow inherits Window {
                 // PAGE 4: DISK IMAGE / BARE METAL BACKUP & NTFS BROWSER
                 // ═══════════════════════════════════════════════════════════
                 if root.page == 4: ScrollView {
-                    content-width: self.width;
+                    content-width: self.visible-width;
                     VerticalLayout {
                         spacing: 14px;
+                        alignment: start;
 
                         HorizontalLayout {
                             spacing: 12px;
@@ -1734,7 +1855,7 @@ export component MainWindow inherits Window {
                                     spacing: 10px;
                                     for d in root.drives: Rectangle {
                                         height: 56px;
-                                        min-width: 96px;
+                                        min-width: 52px;
                                         max-width: 200px;
                                         horizontal-stretch: 1;
                                         border-radius: 8px;
@@ -1782,11 +1903,11 @@ export component MainWindow inherits Window {
                                         padding-right: 8px;
                                         spacing: 8px;
                                         Text { text: im.name; color: Theme.text; font-size: 13px; font-weight: 600; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                                        if im.encrypted: VerticalLayout { alignment: center; Badge { text: "암호화"; tone: Theme.warn; } }
-                                        if im.chained: VerticalLayout { alignment: center; Badge { text: "증분 체인"; tone: Theme.accent; } }
-                                        Text { text: im.size; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
-                                        Text { text: im.when; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
-                                        Text { text: im.verified ? "✔ 검증됨" : "미검증"; color: im.verified ? Theme.accent : Theme.muted; font-size: 12px; font-weight: im.verified ? 700 : 400; vertical-alignment: center; }
+                                        if !(root.compact && root.confirm-del == im.path) && im.encrypted: VerticalLayout { alignment: center; Badge { text: "암호화"; tone: Theme.warn; } }
+                                        if !(root.compact && root.confirm-del == im.path) && im.chained: VerticalLayout { alignment: center; Badge { text: "증분 체인"; tone: Theme.accent; } }
+                                        if !(root.compact && root.confirm-del == im.path): Text { text: im.size; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+                                        if !(root.compact && root.confirm-del == im.path): Text { text: im.when; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+                                        if !(root.compact && root.confirm-del == im.path): Text { text: im.verified ? "✔ 검증됨" : "미검증"; color: im.verified ? Theme.accent : Theme.muted; font-size: 12px; font-weight: im.verified ? 700 : 400; vertical-alignment: center; }
                                         if root.confirm-del != im.path: VerticalLayout { alignment: center; Btn { text: "삭제"; kind: 2; height: 26px; clicked => { root.confirm-del = im.path; root.img-path = im.path; } } }
                                         if root.confirm-del == im.path: Text { text: "되돌릴 수 없음!"; color: Theme.danger; font-size: 12px; vertical-alignment: center; font-weight: 700; }
                                         if root.confirm-del == im.path: VerticalLayout { alignment: center; Btn { text: "정말 삭제"; kind: 2; height: 26px; clicked => { root.delete-image(im.path); root.confirm-del = ""; } } }
@@ -1955,7 +2076,7 @@ export component MainWindow inherits Window {
                                     for d in root.drives: Rectangle {
                                         visible: !d.repo && !d.sys;
                                         height: (d.repo || d.sys) ? 0px : 44px;
-                                        min-width: (d.repo || d.sys) ? 0px : 70px;
+                                        min-width: (d.repo || d.sys) ? 0px : 44px;
                                         max-width: (d.repo || d.sys) ? 0px : 160px;
                                         horizontal-stretch: (d.repo || d.sys) ? 0 : 1;
                                         border-radius: 8px;
@@ -2021,7 +2142,7 @@ export component MainWindow inherits Window {
                 // PAGE 5: PROTECTION & SETTINGS
                 // ═══════════════════════════════════════════════════════════
                 if root.page == 5: ScrollView {
-                    content-width: self.width;
+                    content-width: self.visible-width;
                     VerticalLayout {
                         spacing: 16px;
                         alignment: start;
@@ -2161,6 +2282,11 @@ export component MainWindow inherits Window {
                                     Text { text: "CPU 스레드 / 전송 속도(MB/s)"; color: Theme.text; font-size: 13px; width: 210px; vertical-alignment: center; }
                                     Field { text <=> root.form-max-threads; width: 70px; placeholder: "0"; }
                                     Field { text <=> root.form-bw-limit; width: 70px; placeholder: "0"; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Rectangle { width: 210px; }
                                     Toggle { checked <=> root.form-pause-battery; on-text: "배터리 일시정지: 켜짐"; off-text: "배터리 일시정지: 꺼짐"; }
                                     Btn { text: "운영 설정 저장"; kind: 1; clicked => { root.save-ops-settings(root.form-webhook, root.form-max-threads, root.form-bw-limit, root.form-pause-battery, root.form-fleet-endpoint); } }
                                     Rectangle { horizontal-stretch: 1; }
